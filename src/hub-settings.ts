@@ -640,7 +640,7 @@ export function resolveRootRedirectDetailed(
      * (app installed → `/app`). Omitted → the historical `/admin` default, so
      * every existing caller behaves exactly as before.
      */
-     manifest?: { services: { name: string }[] };
+    manifest?: { services: { name: string }[] };
   } = {},
 ): ResolvedRootRedirect {
   const env = opts.env ?? process.env;
@@ -764,9 +764,48 @@ export interface ResolvedRootMode {
  * skipped and resolution starts from env. The `env` / `warn` knobs are test
  * seams (production uses `process.env` + `console.warn`).
  */
+/**
+ * The default root mode for a box, given what's installed.
+ *
+ * `serve-app` when the app is present, `redirect` otherwise.
+ *
+ * hub#791 (mine) made `/` REDIRECT to `/app` when the app was installed. That
+ * was the wrong half of a choice hub already offered, and it produced a steady
+ * stream of bugs — every one traceable to the same mismatch:
+ *
+ *   - `/app` served HTML asking for `/assets/…` → unstyled blank page (#796)
+ *   - a PWA manifest scoped `/` while mounted at `/app` → the installed app
+ *     would have claimed the whole origin (#796)
+ *   - CSS preloads for lazy chunks 404ing on *some* routes, because Vite's
+ *     base is compiled in as `/`
+ *   - note URLs coming out `/n/<id>` instead of `/app/n/<id>`, because the
+ *     bundle's mount detection never learned about `/app` (#800)
+ *
+ * None of those are independent bugs. `root-serve.ts` states the cause
+ * directly: "the app expects to be served at the origin root (absolute
+ * `/assets/*`, PWA scope `/`, OAuth redirect URIs at the origin root)". The
+ * redirect asked a bundle built for `/` to live at `/app`, and every symptom
+ * followed.
+ *
+ * Serving at the root also makes self-host match the hosted door exactly — a
+ * note is `/n/<id>` on both, so links, docs, and screenshots are portable
+ * between them instead of needing two versions.
+ *
+ * DEFAULT layer only: an operator's stored row or env override still wins, so
+ * anyone who deliberately chose `redirect` keeps it.
+ */
+export function defaultRootModeFor(manifest: { services: { name: string }[] }): RootMode {
+  return manifest.services.some((s) => s.name === "parachute-app") ? "serve-app" : "redirect";
+}
+
 export function resolveRootModeDetailed(
   db: Database | null,
-  opts: { env?: NodeJS.ProcessEnv; warn?: (msg: string) => void } = {},
+  opts: {
+    env?: NodeJS.ProcessEnv;
+    warn?: (msg: string) => void;
+    /** Installed services — only consulted for the DEFAULT layer. */
+    manifest?: { services: { name: string }[] };
+  } = {},
 ): ResolvedRootMode {
   const env = opts.env ?? process.env;
   const warn = opts.warn ?? ((msg: string) => console.warn(msg));
@@ -791,14 +830,20 @@ export function resolveRootModeDetailed(
     );
   }
 
-  // 3. Default — historical redirect behavior.
-  return { value: DEFAULT_ROOT_MODE, source: "default" };
+  // 3. Default — serve-app when the app is installed (see defaultRootModeFor),
+  // otherwise the historical redirect.
+  const fallback = opts.manifest ? defaultRootModeFor(opts.manifest) : DEFAULT_ROOT_MODE;
+  return { value: fallback, source: "default" };
 }
 
 /** Convenience: just the resolved mode (see `resolveRootModeDetailed`). */
 export function resolveRootMode(
   db: Database | null,
-  opts: { env?: NodeJS.ProcessEnv; warn?: (msg: string) => void } = {},
+  opts: {
+    env?: NodeJS.ProcessEnv;
+    warn?: (msg: string) => void;
+    manifest?: { services: { name: string }[] };
+  } = {},
 ): RootMode {
   return resolveRootModeDetailed(db, opts).value;
 }

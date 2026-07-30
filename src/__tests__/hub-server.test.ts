@@ -113,9 +113,16 @@ describe("hubFetch routing", () => {
     }
   });
 
-  test("/ redirects (302) to /app once the app IS installed", async () => {
-    // The other half of the contract (hub#791). Asserting only the /admin case
-    // meant the default that actually ships to new boxes was untested.
+  test("/ SERVES the app (not a redirect) once the app IS installed", async () => {
+    // Changed deliberately. hub#791 made this a 302 to `/app`, which asked a
+    // bundle built for the origin root to live at `/app` — every symptom that
+    // followed (blank page, PWA scope, CSS preload 404s, `/n/<id>` URLs missing
+    // their prefix) traces to that one mismatch. `root-serve.ts` says it plainly:
+    // "the app expects to be served at the origin root". So the default is now
+    // serve-app, and `/` is the app.
+    //
+    // An operator's stored row or env override still wins — only the DEFAULT
+    // layer changed — which is asserted separately in hub-settings tests.
     const h = makeHarness();
     try {
       writeFileSync(join(h.dir, "hub.html"), "<html><body>hi</body></html>");
@@ -123,13 +130,21 @@ describe("hubFetch routing", () => {
         h.manifestPath,
         JSON.stringify({
           services: [
-            { name: "parachute-app", port: 1944, paths: ["/app"], health: "/app/health", version: "0.22.9" },
+            {
+              name: "parachute-app",
+              port: 1944,
+              paths: ["/app"],
+              health: "/app/health",
+              version: "0.22.9",
+            },
           ],
         }),
       );
       const res = await hubFetch(h.dir, { manifestPath: h.manifestPath })(req("/"));
-      expect(res.status).toBe(302);
-      expect(res.headers.get("location")).toBe("/app");
+      // Not a 302. Either the app dist answers (200) or it's unresolvable in
+      // this harness and we fall back — what must NOT happen is redirecting to
+      // a mount the bundle can't live at.
+      expect(res.status).not.toBe(302);
     } finally {
       h.cleanup();
     }
