@@ -6,6 +6,36 @@ All notable changes to `@openparachute/hub` are documented here. The format foll
 >
 > This backfill covers the 0.6.x line only. Two pre-existing gaps remain undocumented and are **not** addressed here: the `0.5.13` stable itself (the file's newest entry is `0.5.13-rc.48`, never the stable) and the entire `0.5.14-rc` chain (rc.1–rc.21 on npm), which never promoted to a `0.5.14` stable — its work folded forward into 0.6.0.
 
+## [0.7.12-rc.1] - 2026-07-30
+
+**The app is served AT the root, not redirected to `/app` (#801).** hub#791 made
+`/` redirect to `/app`, which asked a bundle built for the origin root to live
+somewhere else. Four bugs followed from that one mismatch: an unstyled blank
+page, a PWA manifest that would have claimed the whole origin, CSS preloads
+404ing on some routes, and note URLs missing their `/app` prefix. `root-serve.ts`
+had stated the cause all along -- "the app expects to be served at the origin
+root". `serve-app` mode already existed; it is now the default when the app is
+installed. Default layer only: a stored row or env override still wins.
+
+Self-host now matches the hosted door exactly -- a note is `/n/<id>` on both, so
+links and docs are portable instead of needing two versions. `/app` remains a
+valid secondary mount, so existing bookmarks keep working.
+
+Ships with a collision guard: if the app ever adds a top-level route named like
+a hub prefix, hub dispatches first and that route becomes silently unreachable.
+The guard fails CI instead.
+
+**The mounted app is told where it lives (#800).** `@openparachute/app` resolves
+its router basename from `<meta name="parachute-mount">` -- its own documented
+contract -- and nothing injected one. Its pathname fallback knew
+`/surface/<slug>` and `/notes/` but not `/app`. Now injected when serving under
+a mount, which fixes routing for already-published bundles.
+
+**First rc since 0.7.11.** Cut as an rc rather than a stable per the governance
+rule: deploying is not a reason to promote. This also puts `@rc` ahead of
+`@latest` again, so a box can safely track the channel -- it had gone stale
+behind stable, and switching to it was a downgrade.
+
 ## [0.7.11] - 2026-07-30
 
 **Account scopes are OAuth-requestable, tiered by blast radius, and capped to
