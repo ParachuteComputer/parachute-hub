@@ -6,6 +6,26 @@ All notable changes to `@openparachute/hub` are documented here. The format foll
 >
 > This backfill covers the 0.6.x line only. Two pre-existing gaps remain undocumented and are **not** addressed here: the `0.5.13` stable itself (the file's newest entry is `0.5.13-rc.48`, never the stable) and the entire `0.5.14-rc` chain (rc.1–rc.21 on npm), which never promoted to a `0.5.14` stable — its work folded forward into 0.6.0.
 
+## [0.7.10] - 2026-07-30
+
+**The app renders when it's mounted (#796).** 0.7.9 made `/` land on the app and
+shipped that front door broken: `@openparachute/app` is built with an absolute
+Vite base, so its HTML asks for `/assets/index-*.js` while the bundle is served
+at `/app/assets/...`. Every mounted install got an unstyled blank page with two
+404s. The mount was always correct -- the HTML simply never pointed at it.
+
+Hub now re-roots root-absolute `src`/`href` URLs onto the mount at serve time,
+which is the only place the mount is known: one published package is served at
+`/app`, `/notes`, `/surface/<name>`, and the origin root, so no single
+build-time base is right for all of them. The origin-root case is untouched.
+
+Also re-roots the PWA manifest's `start_url` + `scope`. A manifest declaring
+`scope: "/"` while the app is served at `/app` claims the whole origin for the
+installed PWA -- it would capture `/admin` and every vault URL alongside its own.
+
+This is a same-day follow-up to 0.7.9 because that release is what put the app
+in front of people: without it, `/` redirects to a blank page.
+
 ## [0.7.9] - 2026-07-30
 
 **Stable promotion of the 0.7.9 line (7 commits over 0.7.8).** Promotes rc.1-rc.6
