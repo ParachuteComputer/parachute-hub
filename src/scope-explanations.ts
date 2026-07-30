@@ -72,12 +72,21 @@ export const SCOPE_EXPLANATIONS: Record<string, ScopeExplanation> = {
     level: "read",
   },
   "vault:write": {
-    label: "Create, edit, and delete notes, tags, and attachments.",
+    // "tags" used to be listed flatly here, which overpromised: write can APPLY
+    // tags to notes, but tag SCHEMA/taxonomy mutation (update-tag, delete-tag,
+    // rename-tag, merge-tags) was re-tiered write → admin on both doors —
+    // structure vs content, the same line that keeps create/update/delete-note
+    // at write. A user reading the old label approved write expecting to manage
+    // their taxonomy and then hit refusals the consent screen never warned of.
+    label: "Create, edit, and delete notes and attachments, and apply existing tags to them.",
     level: "write",
   },
   "vault:admin": {
+    // Names tag-schema management FIRST: it's the most common reason an MCP
+    // client legitimately needs admin, and leaving it unstated made admin look
+    // like a purely operational scope nobody should grant an app.
     label:
-      "Read and write everything, plus admin: config & settings, triggers & automation, GitHub backup, and minting access tokens.",
+      "Read and write everything, plus: manage the tag schema (create, rename, merge, and delete tag definitions), config & settings, triggers & automation, GitHub backup, and minting access tokens.",
     level: "admin",
   },
   // Optional-module scopes (scribe / surface). These are in

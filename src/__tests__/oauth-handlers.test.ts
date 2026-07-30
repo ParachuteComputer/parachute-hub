@@ -1199,7 +1199,11 @@ describe("handleAuthorizeGet — RFC 8707 resource binding drops foreign scopes 
       const html = await res.text();
       // Vault scopes survive, narrowed to the bound vault → picker is gone.
       expect(html).not.toContain("Pick a vault");
-      expect(html).toContain("Create, edit, and delete notes, tags, and attachments."); // vault:write
+      // vault:write. The label deliberately says "apply existing tags" rather
+      // than "tags": tag SCHEMA mutation (update/delete/rename/merge-tag) is
+      // admin-tier on both doors, so the old wording promised an authority
+      // this scope doesn't carry.
+      expect(html).toContain("Create, edit, and delete notes and attachments");
       // The foreign scopes are gone.
       expect(html).not.toContain("Send audio to Scribe for transcription."); // scribe:transcribe
       expect(html).not.toContain("Manage Scribe configuration"); // scribe:admin

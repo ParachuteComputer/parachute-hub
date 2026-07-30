@@ -116,8 +116,11 @@ describe("renderConsent", () => {
     expect(html).toContain("vault:admin");
     // Scope explanations from the registry
     expect(html).toContain("Read your notes");
-    // hub#689 Leg 1: the admin label now enumerates the concrete grants.
-    expect(html).toContain("Read and write everything, plus admin");
+    // hub#689 Leg 1: the admin label enumerates the concrete grants — and
+    // leads with tag-schema management, which is the most common legitimate
+    // reason an MCP client needs admin at all.
+    expect(html).toContain("Read and write everything, plus");
+    expect(html).toMatch(/manage the tag schema/i);
   });
 
   test("highlights admin scopes with a danger color and badge", () => {
@@ -145,7 +148,11 @@ describe("renderConsent", () => {
     expect(html).toContain("no built-in description");
   });
 
-  test("renders a placeholder when no scopes are requested", () => {
+  test("a no-scope request says the token would do nothing, and points at the picker", () => {
+    // A client may legally omit `scope` (RFC 6749 §3.3) and MCP clients often
+    // do. This used to read "the app gets a session token only", which
+    // described a ZERO-SCOPE token as though it were a normal outcome — the
+    // user approved, got a credential, and nothing worked.
     const html = renderConsent({
       params: PARAMS,
       csrfToken: CSRF,
@@ -154,7 +161,62 @@ describe("renderConsent", () => {
       scopes: [],
     });
     expect(html).toContain("scope-empty");
-    expect(html).toContain("No scopes requested");
+    expect(html).toMatch(/won't be able to do anything/i);
+  });
+
+  test("a no-scope request opens the additional-access picker by default", () => {
+    // When the client asked for nothing, the checklist is the ONLY path to a
+    // working token — so it starts expanded rather than collapsed.
+    const html = renderConsent({
+      params: PARAMS,
+      csrfToken: CSRF,
+      clientId: "c",
+      clientName: "App",
+      scopes: [],
+      grantableExtras: ["vault:read", "account:self:admin"],
+    });
+    expect(html).toMatch(/<details class="extras" open/);
+    expect(html).toContain('name="extra_scope"');
+  });
+
+  test("extras are COLLAPSED and never pre-checked when the client did request scopes", () => {
+    // Pre-ticking a permission isn't consent, and the section exists mainly to
+    // make high-risk scopes reachable — so nothing is selected for the user.
+    const html = renderConsent({
+      params: PARAMS,
+      csrfToken: CSRF,
+      clientId: "c",
+      clientName: "App",
+      scopes: ["vault:read"],
+      grantableExtras: ["vault:admin", "account:self:admin"],
+    });
+    expect(html).toContain('<details class="extras" >');
+    expect(html).not.toMatch(/name="extra_scope"[^>]*checked/);
+  });
+
+  test("a high-risk extra carries its consequence, not just a colour", () => {
+    const html = renderConsent({
+      params: PARAMS,
+      csrfToken: CSRF,
+      clientId: "c",
+      clientName: "App",
+      scopes: ["vault:read"],
+      grantableExtras: ["account:self:admin"],
+    });
+    expect(html).toContain("risk-high");
+    expect(html).toMatch(/keep working even after you disconnect/i);
+  });
+
+  test("no grantable extras → no section at all", () => {
+    const html = renderConsent({
+      params: PARAMS,
+      csrfToken: CSRF,
+      clientId: "c",
+      clientName: "App",
+      scopes: ["vault:read"],
+      grantableExtras: [],
+    });
+    expect(html).not.toContain('class="extras"');
   });
 
   test("includes Approve and Deny buttons posting __action=consent", () => {
