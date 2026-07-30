@@ -6,6 +6,47 @@ All notable changes to `@openparachute/hub` are documented here. The format foll
 >
 > This backfill covers the 0.6.x line only. Two pre-existing gaps remain undocumented and are **not** addressed here: the `0.5.13` stable itself (the file's newest entry is `0.5.13-rc.48`, never the stable) and the entire `0.5.14-rc` chain (rc.1–rc.21 on npm), which never promoted to a `0.5.14` stable — its work folded forward into 0.6.0.
 
+## [0.7.11] - 2026-07-30
+
+**Account scopes are OAuth-requestable, tiered by blast radius, and capped to
+the account holder (#798).** `account:self:read` / `account:self:admin` were
+cookie-minted only. Blocking them outright conflated *dangerous* with
+*forbidden* and made a legitimate capability -- an agent that manages your
+vaults -- impossible to build over OAuth.
+
+They are grantable now, under the guardrail the naive change would have
+missed: account scopes are account-WIDE, and on self-host the account IS the
+box, so a non-admin assigned to one vault could otherwise have consented their
+way to authority over every vault. Non-admins now have `account:*` dropped at
+the same mint choke-point that caps vault verbs.
+
+The consent screen gained a `risk` axis orthogonal to `level`, because a
+scope's verb and its blast radius are different things. `vault:<name>:admin`
+and `account:self:admin` were both level `admin` and both rendered in danger
+red -- so the loudest signal landed on the scope most MCP clients legitimately
+need. Now: neutral / amber (full control of ONE vault) / red (account-wide).
+
+**Consent is a picker, not approve-or-deny (#798).** A client may legally omit
+`scope`, and MCP clients often do; approving that minted a ZERO-SCOPE token
+while the screen called it "a session token only" -- a credential that looks
+like success and can do nothing. And a client that never requests
+`account:self:*` made that authority unreachable no matter who was consenting.
+An "additional access" checklist now offers what the consenting user may
+actually grant, built by running candidates through the SAME cap the mint uses,
+so the menu cannot drift into offering something that would be dropped.
+
+**Two consent labels were lying (#798).** `vault:write` claimed it could
+"create, edit, and delete notes, TAGS, and attachments", but tag schema
+mutation (update/delete/rename/merge-tag) is admin-tier on both doors -- write
+can apply tags, not redefine them. And `vault:admin` never mentioned tags at
+all, which is the most common legitimate reason an MCP client needs it.
+
+**Publish-on-merge now reports unpublished drift.** The skip path was silent,
+which is indistinguishable from "everything is shipped" -- three fixes in a row
+(#794, #796, #798) sat unpublished on main, one of them leaving `@latest` with
+an app front door that couldn't render. It now warns with the exact commit list.
+Advisory only: it never fails a run, since an uncut release is a normal state.
+
 ## [0.7.10] - 2026-07-30
 
 **The app renders when it's mounted (#796).** 0.7.9 made `/` land on the app and
