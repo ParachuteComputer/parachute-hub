@@ -6,6 +6,39 @@ All notable changes to `@openparachute/hub` are documented here. The format foll
 >
 > This backfill covers the 0.6.x line only. Two pre-existing gaps remain undocumented and are **not** addressed here: the `0.5.13` stable itself (the file's newest entry is `0.5.13-rc.48`, never the stable) and the entire `0.5.14-rc` chain (rc.1–rc.21 on npm), which never promoted to a `0.5.14` stable — its work folded forward into 0.6.0.
 
+## [0.7.9] - 2026-07-30
+
+**Stable promotion of the 0.7.9 line (7 commits over 0.7.8).** Promotes rc.1-rc.6
+plus #793 to `@latest`. The theme is the self-hosted front door: what a new box
+shows you, what it advertises to an AI client, and what it stops offering.
+
+- **`/` lands on the app (#791).** A fresh self-hosted box put its operator on a
+  directory page; the hosted door puts them in the product. `parachute init` now
+  installs `@openparachute/app`, and `/` redirects to it -- a redirect, not a
+  mount, so the target stays operator-selectable (`/admin`, a surface, anything)
+  rather than being frozen by whatever we picked.
+- **The root `/mcp` advertises `vault:admin` (#789).** The protected-resource
+  metadata offered only `vault:read` / `vault:write`, so an AI client walking
+  OAuth could never request the scope that edits tags -- the thing much of the
+  product is for. Hub now authors that document itself instead of proxying
+  vault's, which is why it could omit scopes hub knows about.
+- **Notes is retired (#788).** Invisible to anyone new -- not offered, not
+  installable, not discoverable -- and completely intact on boxes already
+  serving it. `@openparachute/app` is the front door now.
+- **`parachute uninstall` exists (#793).** The retirement note told operators to
+  run it; the CLI answered `unknown command`. It drives the same endpoint the
+  admin UI does, so removal is one implementation, and it accepts retired
+  modules -- which are exactly the ones people need to remove.
+- **Publish-on-merge (#790, #792).** A merged version bump ships itself. #792
+  fixes a bug shipped in #790: the publish steps re-derived the dist-tag from
+  `GITHUB_REF_NAME`, which is `main` on a merge, so `0.7.9-rc.3` went out as
+  `@latest`. The tag now comes from the published version itself.
+- **scope-guard follows `jwksOrigin` and stops failing closed in silence
+  (#787).** A hub reached at a different origin than its canonical one couldn't
+  fetch its revocation list, so it rejected every token it had just issued --
+  and swallowed the reason. Found live: an operator was told they weren't
+  signed in while holding a valid session.
+
 ## [0.7.9-rc.6] - 2026-07-29
 
 **`/` lands on the app when the app is installed, and `parachute init`
