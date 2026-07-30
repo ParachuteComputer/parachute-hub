@@ -99,3 +99,39 @@ describe("the account:self:admin label states what can't be undone", () => {
     expect(label).toMatch(/keep working even after you disconnect/i);
   });
 });
+
+describe("requestable is NOT the same as advertised", () => {
+  test("account scopes stay requestable", () => {
+    // A client that genuinely manages vaults must still be able to ask.
+    expect(isRequestableScope(ACCOUNT_SELF_ADMIN_SCOPE)).toBe(true);
+    expect(isRequestableScope(ACCOUNT_SELF_READ_SCOPE)).toBe(true);
+  });
+
+  test("but they are NOT in the advertised catalog", async () => {
+    // Advertising a scope tells every discovery client "ask for this", and
+    // clients routinely request the whole catalog. With account scopes listed,
+    // a plain note-taking integration asked for PERMANENT DELETE across every
+    // vault — observed live on a self-hosted box, where the consent screen led
+    // with account-wide admin for a client that only wanted notes.
+    const { rootMcpProtectedResourceMetadata } = await import("../oauth-handlers.ts");
+    const res = rootMcpProtectedResourceMetadata({
+      issuer: "https://hub.example",
+      loadDeclaredScopes: () =>
+        new Set([
+          "vault:read",
+          "vault:write",
+          "vault:admin",
+          ACCOUNT_SELF_READ_SCOPE,
+          ACCOUNT_SELF_ADMIN_SCOPE,
+        ]),
+      loadServicesManifest: () => ({ services: [{ name: "parachute-vault", port: 1940 }] }),
+    } as never);
+    const body = (await res.json()) as { scopes_supported: string[] };
+    // The ordinary surface is advertised…
+    expect(body.scopes_supported).toContain("vault:read");
+    expect(body.scopes_supported).toContain("vault:admin");
+    // …account-wide authority is not.
+    expect(body.scopes_supported).not.toContain(ACCOUNT_SELF_ADMIN_SCOPE);
+    expect(body.scopes_supported).not.toContain(ACCOUNT_SELF_READ_SCOPE);
+  });
+});

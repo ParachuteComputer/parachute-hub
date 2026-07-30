@@ -447,14 +447,31 @@ function advertisedScopes(declared: ReadonlySet<string>, manifest: ServicesManif
   const installedShorts = new Set(
     manifest.services.map((s) => shortNameForManifest(s.name) ?? s.name),
   );
-  return Array.from(declared)
-    .filter(isRequestableScope)
-    .filter((scope) => {
-      for (const [prefix, short] of OPTIONAL_MODULE_SCOPES) {
-        if (scope.startsWith(prefix) && !installedShorts.has(short)) return false;
-      }
-      return true;
-    });
+  return (
+    Array.from(declared)
+      .filter(isRequestableScope)
+      // REQUESTABLE is not the same as ADVERTISED, and conflating them was a
+      // mistake. Advertising a scope tells every discovery client "ask for this"
+      // — and clients routinely request the whole advertised catalog. With
+      // `account:self:*` in the list, a plain note-taking integration asked for
+      // PERMANENT DELETE over every vault, so the scariest grant on the box
+      // became the default ask. Observed live: a consent screen listing six
+      // scopes topped by account-wide admin, for a client that only wanted to
+      // read and write notes.
+      //
+      // Account scopes stay fully requestable — a client that genuinely manages
+      // vaults asks for them explicitly and the consent screen renders them at
+      // risk tier "high". They just aren't in the menu that teaches clients what
+      // to ask for. Discovery advertises the ordinary surface; account-wide
+      // authority is opt-in by intent, not by catalog-copying.
+      .filter((scope) => !scope.toLowerCase().startsWith("account:"))
+      .filter((scope) => {
+        for (const [prefix, short] of OPTIONAL_MODULE_SCOPES) {
+          if (scope.startsWith(prefix) && !installedShorts.has(short)) return false;
+        }
+        return true;
+      })
+  );
 }
 
 /**
