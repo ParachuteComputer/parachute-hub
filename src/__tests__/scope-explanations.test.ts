@@ -158,12 +158,16 @@ describe("NON_REQUESTABLE_SCOPES (#96)", () => {
     expect(NON_REQUESTABLE_SCOPES.has("scribe:admin")).toBe(true);
   });
 
-  test("contains the account scopes (App campaign Phase 2 — cookie-minted only)", () => {
-    // account:self:{admin,read} are minted exclusively by POST /account/token
-    // (cookie→bearer), never via /oauth/authorize — a third-party app pointed at
-    // the hub AS must not be able to consent its way to account authority.
-    expect(NON_REQUESTABLE_SCOPES.has("account:self:admin")).toBe(true);
-    expect(NON_REQUESTABLE_SCOPES.has("account:self:read")).toBe(true);
+  test("does NOT contain the account scopes — they're requestable now (2026-07-30)", () => {
+    // Previously cookie-minted only. Blocking them outright conflated
+    // "dangerous" with "forbidden" and made a legitimate capability (an agent
+    // that manages your vaults) impossible to build. They're requestable, and
+    // the protection moved to where it belongs: the mint choke-point caps them
+    // to the account holder, and the consent screen renders them at risk tier
+    // "high" with the consequences named. See the [9b]/[9c] cap tests in
+    // oauth-handlers.test.ts — those are what keep this safe.
+    expect(NON_REQUESTABLE_SCOPES.has("account:self:admin")).toBe(false);
+    expect(NON_REQUESTABLE_SCOPES.has("account:self:read")).toBe(false);
   });
 
   test("every non-requestable scope is a known first-party scope", () => {
@@ -204,9 +208,9 @@ describe("isRequestableScope", () => {
     expect(isRequestableScope("vault:my-techne_2:admin")).toBe(true);
   });
 
-  test("account scopes are non-requestable (cookie-minted only, App campaign)", () => {
-    expect(isRequestableScope("account:self:admin")).toBe(false);
-    expect(isRequestableScope("account:self:read")).toBe(false);
+  test("account scopes ARE requestable, and still read as admin for the consent gates", () => {
+    expect(isRequestableScope("account:self:admin")).toBe(true);
+    expect(isRequestableScope("account:self:read")).toBe(true);
     // explainScope resolves them (direct SCOPE_EXPLANATIONS keys) with the
     // right levels, so scopeIsAdmin recognizes the admin form.
     expect(explainScope("account:self:admin")?.level).toBe("admin");

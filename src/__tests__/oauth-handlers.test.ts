@@ -9814,6 +9814,76 @@ describe("single OAuth consent + grantable vault admin + delegate-only cap (2026
     }
   });
 
+  // Account scopes became OAuth-requestable (2026-07-30). They are ACCOUNT-WIDE
+  // and, on self-host, the account IS the box — so they get their own cap rule.
+  // Without it a non-admin assigned to ONE vault could consent their way to
+  // authority over EVERY vault, because the vault-verb branch only inspects
+  // `vault:<name>:<verb>` and passed everything else through.
+  test("[9b] non-admin requesting account:self:admin → DROPPED, vault scope still granted", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      await createUser(db, "owner", "pw"); // first user = the admin/account holder
+      const friend = await createUser(db, "friend", "pw", { allowMulti: true });
+      setUserVaults(db, friend.id, ["work"]);
+      const session = createSession(db, { userId: friend.id });
+      const reg = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        status: "approved",
+      });
+      const { verifier, challenge } = makePkce();
+      const consentRes = await submitConsent(
+        db,
+        session.id,
+        reg.client.clientId,
+        "account:self:admin vault:work:write",
+        challenge,
+      );
+      expect(consentRes.status).toBe(302);
+      const code = new URL(consentRes.headers.get("location") ?? "").searchParams.get("code");
+      const { scope } = await redeemToScopeAud(db, code ?? "", reg.client.clientId, verifier);
+      // The vault verb they DO hold survives; the account-wide scope does not.
+      expect(scope.split(" ")).toContain("vault:work:write");
+      expect(scope).not.toContain("account:self:admin");
+      // And it never reaches the recorded grant, so a later skip-consent flow
+      // can't replay it either.
+      const grant = findGrant(db, friend.id, reg.client.clientId);
+      expect(grant?.scopes ?? "").not.toContain("account:self:admin");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("[9c] non-admin requesting account:self:read → also DROPPED", async () => {
+    // `read` is low-risk to DISPLAY, but it still enumerates every vault on the
+    // account. The cap is about account-wide reach, not about the verb.
+    const { db, cleanup } = await makeDb();
+    try {
+      await createUser(db, "owner", "pw");
+      const friend = await createUser(db, "friend", "pw", { allowMulti: true });
+      setUserVaults(db, friend.id, ["work"]);
+      const session = createSession(db, { userId: friend.id });
+      const reg = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        status: "approved",
+      });
+      const { verifier, challenge } = makePkce();
+      const consentRes = await submitConsent(
+        db,
+        session.id,
+        reg.client.clientId,
+        "account:self:read vault:work:read",
+        challenge,
+      );
+      expect(consentRes.status).toBe(302);
+      const code = new URL(consentRes.headers.get("location") ?? "").searchParams.get("code");
+      const { scope } = await redeemToScopeAud(db, code ?? "", reg.client.clientId, verifier);
+      expect(scope).not.toContain("account:self");
+      expect(scope.split(" ")).toContain("vault:work:read");
+    } finally {
+      cleanup();
+    }
+  });
+
   // Test 10 — non-owner admin-ONLY request → REFUSED (clear error), no token.
   test("[10] non-owner assigned, admin-only request → GRANTED (holds admin on their vault)", async () => {
     const { db, cleanup } = await makeDb();

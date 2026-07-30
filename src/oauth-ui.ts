@@ -22,7 +22,7 @@
  */
 import { WORDMARK_TEXT, brandMarkSvg } from "./brand.ts";
 import { renderCsrfHiddenInput } from "./csrf.ts";
-import { type ScopeExplanation, explainScope } from "./scope-explanations.ts";
+import { type ScopeExplanation, explainScope, riskForExplanation } from "./scope-explanations.ts";
 
 /** Brand palette — kept in sync with parachute.computer/style.css. */
 const PALETTE = {
@@ -39,6 +39,12 @@ const PALETTE = {
   cardBg: "#ffffff",
   danger: "#a3392b",
   dangerSoft: "rgba(163, 57, 43, 0.08)",
+  // Amber for "full control of ONE vault" — previously this rendered in
+  // `danger` red, the same as account-wide authority, so the consent screen
+  // gave its loudest signal to the scope most integrations legitimately need.
+  // When everything urgent is red, nothing is.
+  caution: "#8a6414",
+  cautionSoft: "rgba(138, 100, 20, 0.09)",
 } as const;
 
 const FONT_SERIF = `Georgia, "Times New Roman", serif`;
@@ -1038,7 +1044,12 @@ function renderScopeRow(scope: string): string {
       <span class="scope-label scope-label-muted">Defined by the requesting app — no built-in description.</span>
     </li>`;
   }
-  const cls = `scope scope-${explanation.level}`;
+  const risk = riskForExplanation(explanation);
+  // Two classes: `scope-<level>` keeps every existing style working, and
+  // `risk-<tier>` carries the colour. They're separate because a scope's verb
+  // and its blast radius aren't the same axis — `vault:<name>:admin` and
+  // `account:self:admin` share a level and differ enormously in consequence.
+  const cls = `scope scope-${explanation.level} risk-${risk}`;
   const badge = badgeForLevel(explanation);
   // Pending-vault hint surfaces the silent-narrowing semantics for admin
   // operators who land on the consent screen before touching the picker.
@@ -1048,17 +1059,31 @@ function renderScopeRow(scope: string): string {
   const pendingNote = tbdMatch
     ? `<span class="scope-pending-note">A specific vault is picked below before approving.</span>`
     : "";
+  // A high-risk scope gets an explicit consequence line, not just a colour.
+  // Colour alone is invisible to a screen reader and to anyone who doesn't
+  // know the convention, and this is the decision most worth slowing down.
+  const riskNote =
+    risk === "high"
+      ? `<span class="scope-risk-note"><strong>Account-wide.</strong> This is not limited to one vault, and tokens this app creates keep working even after you disconnect it.</span>`
+      : "";
   return `<li class="${cls}">
       <div class="scope-head">
         <code class="scope-name">${escapeHtml(scope)}</code>
         ${badge}
       </div>
       <span class="scope-label">${escapeHtml(explanation.label)}</span>
+      ${riskNote}
       ${pendingNote}
     </li>`;
 }
 
 function badgeForLevel(explanation: ScopeExplanation): string {
+  // A high-risk scope is badged for its BLAST RADIUS, not its verb: "admin"
+  // next to `account:self:admin` reads like the vault-admin row two lines up,
+  // which is the confusion this whole tier exists to prevent.
+  if (riskForExplanation(explanation) === "high") {
+    return `<span class="badge badge-danger">account-wide</span>`;
+  }
   switch (explanation.level) {
     case "admin":
       return `<span class="badge badge-admin">admin</span>`;
@@ -1349,11 +1374,34 @@ const STYLES = `
     display: block;
   }
   .scope-label-muted { color: ${PALETTE.fgDim}; font-style: italic; }
+  /* Risk tiers carry the colour. .scope-admin is kept (the vault-verb radio
+     picker references it directly) and now matches the elevated tier, so the
+     two can never disagree about how one vault's admin looks. */
   .scope-admin {
+    border-color: ${PALETTE.caution};
+    background: ${PALETTE.cautionSoft};
+  }
+  .scope-admin .scope-name { color: ${PALETTE.caution}; }
+
+  .risk-elevated {
+    border-color: ${PALETTE.caution};
+    background: ${PALETTE.cautionSoft};
+  }
+  .risk-elevated .scope-name { color: ${PALETTE.caution}; }
+
+  /* Account-wide: red, a heavier border, and a spelled-out consequence. */
+  .risk-high {
     border-color: ${PALETTE.danger};
+    border-left-width: 4px;
     background: ${PALETTE.dangerSoft};
   }
-  .scope-admin .scope-name { color: ${PALETTE.danger}; }
+  .risk-high .scope-name { color: ${PALETTE.danger}; }
+  .scope-risk-note {
+    display: block;
+    margin-top: 0.35rem;
+    font-size: 0.85em;
+    color: ${PALETTE.danger};
+  }
 
   .vault-picker {
     margin: 0 0 1.25rem;
@@ -1612,7 +1660,14 @@ const STYLES = `
   .badge-read { background: ${PALETTE.bgSoft}; color: ${PALETTE.fgMuted}; }
   .badge-write { background: ${PALETTE.accentSoft}; color: ${PALETTE.accent}; }
   .badge-send { background: ${PALETTE.accentSoft}; color: ${PALETTE.accent}; }
-  .badge-admin { background: ${PALETTE.danger}; color: ${PALETTE.cardBg}; }
+  /* admin = full control of ONE vault → caution amber. Account-wide authority
+     is the only thing that gets danger red, so red keeps meaning one thing. */
+  .badge-admin { background: ${PALETTE.caution}; color: ${PALETTE.cardBg}; }
+  .badge-danger {
+    background: ${PALETTE.danger};
+    color: ${PALETTE.cardBg};
+    text-transform: none;
+  }
 
   /* hub#314 — same-hub vs external trust marker on the consent header. The
      first-party badge uses the accent (calm/trusted); external uses the danger

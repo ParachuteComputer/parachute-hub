@@ -1337,6 +1337,24 @@ function capScopesToUserAuthority(
 ): string[] {
   if (opts.userIsAdmin) return [...scopes];
   return scopes.filter((s) => {
+    // Account scopes are ACCOUNT-WIDE, and on self-host the account IS the box
+    // (`account-api.ts`: "operator ≡ account ≡ box… the operator owns every
+    // vault, so the ownership gate the cloud twin runs per-vault is trivially
+    // satisfied here"). So `account:self:admin` reaches every vault with no
+    // per-vault gate behind it.
+    //
+    // That makes it the one scope a non-admin must never be able to consent
+    // into: an assigned user holding exactly one vault could otherwise walk
+    // the public OAuth flow and mint a token with authority over ALL of them.
+    // The vault-verb branch below can't catch it — it only inspects
+    // `vault:<name>:<verb>` and passes everything else through — so it needs
+    // its own rule, here, at the same choke-point every mint path funnels
+    // through.
+    //
+    // Admins are unaffected: they returned above, and on self-host the admin
+    // IS the account holder, so they're delegating authority they actually
+    // have.
+    if (s.toLowerCase().startsWith("account:")) return false;
     const parts = s.split(":");
     if (parts.length !== 3 || parts[0] !== "vault") return true; // non-named — pass through
     const name = parts[1];
