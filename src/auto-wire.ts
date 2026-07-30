@@ -2,7 +2,7 @@ import { randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { restart as lifecycleRestart } from "./commands/lifecycle.ts";
-import { parseEnvFile, upsertEnvLine, writeEnvFile } from "./env-file.ts";
+import { parseEnvFile, removeEnvLine, upsertEnvLine, writeEnvFile } from "./env-file.ts";
 import { type AliveFn, defaultAlive, processState } from "./process-state.ts";
 import { PORT_RESERVATIONS } from "./service-spec.ts";
 
@@ -124,6 +124,69 @@ function readScribeAuthToken(path: string): string | undefined {
  * pin SCRIBE_URL on vault's side. Caller has already confirmed both services
  * are installed. Restarts vault if it's running so the worker re-reads .env.
  */
+/** What {@link unwireScribeAuth} actually changed. */
+export interface UnwireResult {
+  /** Keys removed from vault's .env (empty when there was nothing to remove). */
+  readonly removed: string[];
+  /** Whether the .env file was rewritten. */
+  readonly changed: boolean;
+}
+
+/**
+ * The counterpart to {@link autoWireScribeAuth}: drop the auto-wired scribe
+ * keys from vault's `.env` when scribe is uninstalled.
+ *
+ * ## Why this has to exist
+ *
+ * Install wires `SCRIBE_URL` + `SCRIBE_AUTH_TOKEN` into vault's env *for* the
+ * operator. Uninstall didn't unwire them, so removing scribe left vault
+ * pointing its transcription worker at a port with nothing behind it —
+ * `[transcribe] worker started → http://127.0.0.1:1943` on a box where 1943 is
+ * dead. Nothing errors at boot; audio just stops being transcribed.
+ *
+ * It also defeats vault's own recovery. Vault#640 made `whisper-cpp` the
+ * default provider unless a scribe is configured — and a stale `SCRIBE_URL`
+ * reads as "configured", so the box that most needs the local default is
+ * exactly the one that doesn't get it. Machine-written config has to be
+ * machine-removed; leaving it is asymmetry that reads as an operator's
+ * deliberate choice.
+ *
+ * Removes ONLY the two keys install writes, never the whole file, and is a
+ * no-op when they're absent (uninstall must stay idempotent).
+ */
+export function unwireScribeAuth(opts: {
+  configDir: string;
+  log?: (line: string) => void;
+}): UnwireResult {
+  const log = opts.log ?? (() => {});
+  const vaultEnvPath = join(opts.configDir, "vault", ".env");
+
+  // Vault may not be installed at all — nothing to unwire, not an error.
+  if (!existsSync(vaultEnvPath)) return { removed: [], changed: false };
+
+  const parsed = parseEnvFile(vaultEnvPath);
+  let lines = parsed.lines;
+  const removed: string[] = [];
+
+  for (const key of [SCRIBE_URL_ENV_KEY, SCRIBE_AUTH_ENV_KEY]) {
+    const existing = parsed.values[key];
+    if (existing !== undefined) {
+      lines = removeEnvLine(lines, key);
+      removed.push(key);
+    }
+  }
+
+  if (removed.length === 0) return { removed: [], changed: false };
+
+  writeEnvFile(vaultEnvPath, lines);
+  log(
+    `removed ${removed.join(" + ")} from vault .env — vault falls back to its ` +
+      `default transcription provider (run \`parachute-vault transcription install\` ` +
+      `to set up local transcription).`,
+  );
+  return { removed, changed: true };
+}
+
 export async function autoWireScribeAuth(opts: AutoWireOpts): Promise<AutoWireResult> {
   const random = opts.randomToken ?? defaultRandomToken;
   const log = opts.log ?? (() => {});
