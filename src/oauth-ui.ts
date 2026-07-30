@@ -399,7 +399,7 @@ export function renderConsent(props: ConsentViewProps): string {
         // actually happening and point at the checklist below, which is the
         // only way this flow can produce a useful token.
         `<li class="scope scope-empty">This app didn't ask for any specific access. Choose what to grant below — without a selection its token won't be able to do anything.</li>`
-      : displayedScopes.map(renderScopeRow).join("\n");
+      : scopes.map((wire, i) => renderScopeRow(wire, displayedScopes[i] ?? wire)).join("\n");
   const extrasSection = renderGrantableExtras(grantableExtras ?? [], displayedScopes.length === 0);
   const pickerSection = vaultPicker ? renderVaultPicker(vaultPicker) : "";
   const verbSelectorSection = ownerVerbSelector ? renderOwnerVerbSelector(ownerVerbSelector) : "";
@@ -670,7 +670,9 @@ export function renderApprovePending(props: ApprovePendingViewProps): string {
   const scopeRows =
     displayedScopes.length === 0
       ? `<li class="scope scope-empty">No scopes requested — the app gets a session token only.</li>`
-      : displayedScopes.map(renderScopeRow).join("\n");
+      : requestedScopes
+          .map((wire, i) => renderScopeRow(wire, displayedScopes[i] ?? wire))
+          .join("\n");
   // Wildcard explanation: surface the "the asterisk means the vault is
   // picked later" hint below the scope list when at least one row carries
   // `vault:*:<verb>`. Mirrors the SPA's inline note on
@@ -1045,18 +1047,31 @@ export function renderUnknownClient(props: UnknownClientViewProps): string {
   return baseDocument("Unknown application", body);
 }
 
-function renderScopeRow(scope: string): string {
+/**
+ * One consent row.
+ *
+ * Takes the WIRE scope and the DISPLAY scope separately, and that separation is
+ * load-bearing. The checkbox `value` must be the wire form, because
+ * `handleConsentSubmit` filters the requested set — which is wire-form — against
+ * what the browser posts. Posting the display form (`vault:unforced:read`
+ * against a requested `vault:read`) intersects to nothing, so every unnamed
+ * vault scope is silently dropped and the user gets `access_denied` for a
+ * consent they actually granted. Shipped that way in #804; the render test
+ * missed it by omitting `displayVault`, so no substitution occurred and the two
+ * forms happened to coincide.
+ */
+function renderScopeRow(scope: string, displayScope: string = scope): string {
   // Special-case the `<TBD>` placeholder substituted by `substituteVaultDisplay`
   // when the consent picker hasn't bound a vault yet — `explainScope` doesn't
   // match it because `<` / `>` aren't in the vault-name charset, but the
   // canonical verb-form does. Look up by the unnamed verb form so the
   // explanation + level styling are still correct.
-  const tbdMatch = scope.match(/^vault:<TBD>:(read|write)$/);
-  const lookup = tbdMatch ? `vault:${tbdMatch[1]}` : scope;
+  const tbdMatch = displayScope.match(/^vault:<TBD>:(read|write)$/);
+  const lookup = tbdMatch ? `vault:${tbdMatch[1]}` : displayScope;
   const explanation = explainScope(lookup);
   if (!explanation) {
     return `<li class="scope scope-unknown">
-      <code class="scope-name">${escapeHtml(scope)}</code>
+      <code class="scope-name">${escapeHtml(displayScope)}</code>
       <span class="scope-label scope-label-muted">Defined by the requesting app — no built-in description.</span>
     </li>`;
   }
@@ -1093,7 +1108,7 @@ function renderScopeRow(scope: string): string {
         <input type="checkbox" name="granted_scope" value="${escapeHtml(scope)}"${preChecked} />
         <span class="scope-choice-body">
           <span class="scope-head">
-            <code class="scope-name">${escapeHtml(scope)}</code>
+            <code class="scope-name">${escapeHtml(displayScope)}</code>
             ${badge}
           </span>
           <span class="scope-label">${escapeHtml(explanation.label)}</span>

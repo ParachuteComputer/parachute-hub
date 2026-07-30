@@ -165,3 +165,42 @@ describe("per-scope consent (granular approval)", () => {
     expect(acct.slice(0, 40)).not.toContain("checked");
   });
 });
+
+describe("consent checkbox posts the WIRE scope, not the display scope", () => {
+  test("an unnamed vault scope shown as named still posts unnamed", async () => {
+    // The bug this pins, shipped in #804 and caught by review: the checkbox
+    // carried the DISPLAY form while `handleConsentSubmit` filters the
+    // requested set, which is the WIRE form. `vault:unforced:read` posted
+    // against a requested `vault:read` intersects to nothing — so every
+    // unnamed vault scope was silently dropped and the user got
+    // `access_denied` for a consent they had actually granted.
+    //
+    // My original test passed because it omitted `displayVault`: with no
+    // substitution the two forms coincided, and the mismatch was invisible.
+    // Setting displayVault is the whole point of this test.
+    const { renderConsent } = await import("../oauth-ui.ts");
+    const html = renderConsent({
+      params: {
+        clientId: "c",
+        redirectUri: "https://app.example/cb",
+        responseType: "code",
+        scope: "vault:read vault:write",
+        codeChallenge: "x",
+        codeChallengeMethod: "S256",
+        state: null,
+        resource: null,
+      },
+      csrfToken: "t",
+      clientId: "c",
+      clientName: "App",
+      scopes: ["vault:read", "vault:write"],
+      displayVault: "unforced",
+    });
+    // Posted values are the wire forms the server will filter against.
+    expect(html).toContain('name="granted_scope" value="vault:read"');
+    expect(html).toContain('name="granted_scope" value="vault:write"');
+    // …while the operator still reads the resolved, named form.
+    expect(html).toContain("vault:unforced:read");
+    expect(html).not.toContain('value="vault:unforced:read"');
+  });
+});
