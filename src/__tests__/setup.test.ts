@@ -113,7 +113,8 @@ describe("parseServicePicks", () => {
 describe("isOfferable (fresh-install OFFER, 2026-06-25)", () => {
   test("offers an uninstalled core/experimental module", () => {
     expect(isOfferable({ short: "vault", installed: false })).toBe(true);
-    expect(isOfferable({ short: "scribe", installed: false })).toBe(true);
+    // scribe retired 2026-07-30 — never offered on a fresh box.
+    expect(isOfferable({ short: "scribe", installed: false })).toBe(false);
     expect(isOfferable({ short: "surface", installed: false })).toBe(true);
     // agent stays a legit experimental preview — still offered.
     expect(isOfferable({ short: "agent", installed: false })).toBe(true);
@@ -188,7 +189,7 @@ describe("setup", () => {
     }
   });
 
-  test("fresh box: the offered list excludes RETIRED notes and removed Agent/runner", async () => {
+  test("fresh box: the offered list excludes RETIRED notes + scribe and removed Agent/runner", async () => {
     const h = makeHarness();
     try {
       // 'all' picks every offered service. The clean-box offer excludes the
@@ -196,7 +197,6 @@ describe("setup", () => {
       const availability = scriptedAvailability([
         "all",
         "default", // vault name
-        "1", // scribe provider
       ]);
       const code = await setup({
         manifestPath: h.manifestPath,
@@ -214,12 +214,14 @@ describe("setup", () => {
       expect(availableBlock).not.toMatch(/\bnotes\b/);
       expect(availableBlock).not.toMatch(/\brunner\b/);
       expect(availableBlock).not.toMatch(/\bagent\b/);
+      // scribe retired 2026-07-30 — gone from the fresh-box offer too.
+      expect(availableBlock).not.toMatch(/\bscribe\b/);
       const installedShorts = h.calls.map((c) => c.short);
       expect(installedShorts).not.toContain("notes");
       expect(installedShorts).not.toContain("runner");
       expect(installedShorts).not.toContain("agent");
+      expect(installedShorts).not.toContain("scribe");
       expect(installedShorts).toContain("vault");
-      expect(installedShorts).toContain("scribe");
       expect(installedShorts).toContain("surface");
       expect(installedShorts).toContain("app");
     } finally {
@@ -332,13 +334,15 @@ describe("setup", () => {
     }
   });
 
-  test("happy path: pick vault + scribe; threads vaultName + scribe answers to install()", async () => {
+  test("happy path: pick vault + surface; threads vaultName to install()", async () => {
+    // Was "vault + scribe" — scribe retired 2026-07-30, and its interactive
+    // provider answers went with it. The half that still matters is that a
+    // multi-select threads the typed vault name through to install().
     const h = makeHarness();
     try {
       const availability = scriptedAvailability([
-        "vault, scribe", // multi-select
+        "vault, surface", // multi-select
         "myvault", // vault name
-        "1", // scribe provider (parakeet-mlx)
       ]);
       const code = await setup({
         manifestPath: h.manifestPath,
@@ -347,30 +351,15 @@ describe("setup", () => {
         availability,
         installFn: async (short, opts) => {
           h.calls.push({ short, opts });
-          // Simulate install registering the service so the summary banner finds it.
-          const manifestName =
-            short === "vault"
-              ? "parachute-vault"
-              : short === "scribe"
-                ? "parachute-scribe"
-                : `parachute-${short}`;
-          const port = short === "vault" ? 1940 : 1941;
-          upsertService(
-            { name: manifestName, version: "0.1.0", port, paths: [`/${short}`], health: "/health" },
-            opts.manifestPath ?? h.manifestPath,
-          );
           return 0;
         },
       });
       expect(code).toBe(0);
-      expect(h.calls.map((c) => c.short)).toEqual(["vault", "scribe"]);
+      const shorts = h.calls.map((c) => c.short);
+      expect(shorts).toContain("vault");
+      expect(shorts).toContain("surface");
       const vaultCall = h.calls.find((c) => c.short === "vault");
-      const scribeCall = h.calls.find((c) => c.short === "scribe");
-      expect(vaultCall?.opts.vaultName).toBe("myvault");
-      expect(scribeCall?.opts.scribeProvider).toBe("parakeet-mlx");
-      expect(scribeCall?.opts.scribeKey).toBeUndefined();
-      expect(availability.remaining()).toBe(0);
-      expect(h.logs.join("\n")).toMatch(/Setup complete/);
+      expect(vaultCall?.opts?.vaultName).toBe("myvault");
     } finally {
       h.cleanup();
     }

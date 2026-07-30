@@ -7,12 +7,12 @@ import {
   discoverableShorts,
   findServiceByShort,
   focusForShort,
+  getSpec,
   isInstallableShort,
   isKnownModuleShort,
   isRetiredShort,
   retirementNote,
   shortNameForManifest,
-  getSpec,
 } from "../service-spec.ts";
 
 // 2026-06-09 modular-UI architecture (P2): discovery is driven by the union of
@@ -34,12 +34,14 @@ describe("discoverableShorts", () => {
 
   test("includes the supported set; excludes removed Agent and retired notes", () => {
     const shorts = discoverableShorts();
-    for (const s of ["vault", "scribe", "surface", "app"]) {
+    for (const s of ["vault", "surface", "app"]) {
       expect(shorts).toContain(s);
     }
     expect(shorts).not.toContain("agent");
     // hub#788 — notes is retired. It resolves, but it is not discovered.
     expect(shorts).not.toContain("notes");
+    // scribe retired 2026-07-30 — vault transcribes locally now.
+    expect(shorts).not.toContain("scribe");
   });
 
   test("FIRST_PARTY_FALLBACKS shorts lead KNOWN_MODULES shorts (registry order)", () => {
@@ -73,7 +75,6 @@ describe("focusForShort", () => {
     // A module can self-declare `deprecated` in its module.json.
     expect(focusForShort("agent", "deprecated")).toBe("deprecated");
   });
-
 });
 
 // hub#788 — notes + scribe retirement. Graceful by design: an operator who
@@ -105,10 +106,20 @@ describe("retired modules (hub#788)", () => {
   }
 
   test("live modules stay installable", () => {
-    for (const short of ["vault", "scribe", "surface", "app"]) {
+    for (const short of ["vault", "surface", "app"]) {
       expect(isInstallableShort(short)).toBe(true);
       expect(isRetiredShort(short)).toBe(false);
     }
+  });
+
+  test("scribe is retired: not installable, but still RESOLVABLE", () => {
+    // Graceful, exactly like notes. A box already running scribe keeps being
+    // supervised and keeps transcribing — only NEW installs are refused. That's
+    // why the gate is `isInstallableShort`, not removal from the registry:
+    // deleting the entry would strand an existing row with no spec to start it.
+    expect(isInstallableShort("scribe")).toBe(false);
+    expect(isRetiredShort("scribe")).toBe(true);
+    expect(isKnownModuleShort("scribe")).toBe(true);
   });
 });
 

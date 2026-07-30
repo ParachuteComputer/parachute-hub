@@ -233,7 +233,7 @@ describe("GET /api/modules", () => {
     // yet. Post-2026-06-09 (modular-UI architecture, P2) discovery is driven
     // by the UNION of the bootstrap registries (KNOWN_MODULES ∪
     // FIRST_PARTY_FALLBACKS), NOT a curated whitelist. Every known module
-    // surfaces — core (vault/scribe/surface) in the headline tier, agent as
+    // surfaces — core (vault/surface) in the headline tier, agent as
     // `experimental`, and notes as `deprecated` (2026-06-25, still
     // resolvable but not offered for fresh installs) — so the agent-not-installed
     // class (running but invisible) can't recur while deprecated modules stop
@@ -261,8 +261,11 @@ describe("GET /api/modules", () => {
     const shorts = body.modules.map((m) => m.short);
     // The core tier leads, in the recommended install order, ahead of every
     // experimental module.
-    expect(shorts.indexOf("vault")).toBeLessThan(shorts.indexOf("scribe"));
-    for (const s of ["vault", "scribe", "surface", "app"]) {
+    // scribe left the catalog on retirement (2026-07-30); surface is the
+    // remaining core module the ordering is asserted against.
+    expect(shorts).not.toContain("scribe");
+    expect(shorts.indexOf("vault")).toBeLessThan(shorts.indexOf("surface"));
+    for (const s of ["vault", "surface", "app"]) {
       expect(shorts).toContain(s);
     }
     expect(shorts).not.toContain("agent");
@@ -275,8 +278,7 @@ describe("GET /api/modules", () => {
     // Focus tier resolves from the default map.
     const byShort = new Map(body.modules.map((m) => [m.short, m]));
     expect(byShort.get("vault")?.focus).toBe("core");
-    expect(byShort.get("scribe")?.focus).toBe("core");
-    expect(byShort.get("scribe")?.focus).toBe("core");
+    expect(byShort.get("surface")?.focus).toBe("core");
     expect(byShort.get("app")?.focus).toBe("core");
     expect(byShort.get("agent")).toBeUndefined();
     // `available` stays true for every known module (re-installable), but the
@@ -284,8 +286,7 @@ describe("GET /api/modules", () => {
     // notes isn't pushed on a fresh box; agent (experimental) still is.
     expect(body.modules.every((m) => m.available)).toBe(true);
     expect(byShort.get("vault")?.available_to_install).toBe(true);
-    expect(byShort.get("scribe")?.available_to_install).toBe(true);
-    expect(byShort.get("scribe")?.available_to_install).toBe(true);
+    expect(byShort.get("surface")?.available_to_install).toBe(true);
     expect(byShort.get("app")?.available_to_install).toBe(true);
     // hub#788 — notes has no row at all now, so there is nothing to mark
     // un-installable. Absence IS the assertion.
@@ -344,8 +345,8 @@ describe("GET /api/modules", () => {
     expect(runner?.available_to_install).toBe(false);
   });
 
-  test("scribe row carries package + display props from KNOWN_MODULES", async () => {
-    // Spot-check the wire shape resolves scribe-specific fields
+  test("surface row carries package + display props from KNOWN_MODULES", async () => {
+    // Spot-check the wire shape resolves a curated module's fields
     // (package, displayName, tagline) from KNOWN_MODULES rather than a
     // stale default. Vault is exercised via the install-state test below;
     // this pins the other curated row's KNOWN_MODULES round-trip.
@@ -374,12 +375,15 @@ describe("GET /api/modules", () => {
         available: boolean;
       }>;
     };
-    const scribe = body.modules.find((m) => m.short === "scribe");
-    expect(scribe).toBeDefined();
-    expect(scribe?.package).toBe("@openparachute/scribe");
-    expect(scribe?.display_name).toBe("Scribe");
-    expect(scribe?.tagline).toContain("transcription");
-    expect(scribe?.available).toBe(true);
+    // Was `scribe` until it retired 2026-07-30; the test is about the
+    // KNOWN_MODULES round-trip, not about any one module, so it moves to a
+    // live curated row.
+    const surface = body.modules.find((m) => m.short === "surface");
+    expect(surface).toBeDefined();
+    expect(surface?.package).toBe("@openparachute/surface");
+    expect(surface?.display_name).toBeTruthy();
+    expect(surface?.tagline).toBeTruthy();
+    expect(surface?.available).toBe(true);
     // hub#788 — notes is retired and no longer carries a catalog row at all.
     expect(body.modules.find((m) => m.short === "notes")).toBeUndefined();
   });

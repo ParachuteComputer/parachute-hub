@@ -25,7 +25,11 @@ describe("insufficient-scope challenge", () => {
   test("names the missing scope in the RFC 6750 `scope` parameter", () => {
     // The whole point: a client parses `scope=`, not the prose description.
     const c = challengeOf(
-      new AdminAuthError(403, "token missing required scope: account:self:admin", "account:self:admin"),
+      new AdminAuthError(
+        403,
+        "token missing required scope: account:self:admin",
+        "account:self:admin",
+      ),
     );
     expect(c).toContain('error="insufficient_scope"');
     expect(c).toContain('scope="account:self:admin"');
