@@ -1720,7 +1720,9 @@ describe("handleSetupVaultPost", () => {
       await new Promise((r) => setTimeout(r, 50));
       const cmds = runCalls.map((c) => c.join(" "));
       expect(cmds.some((c) => c.includes("bun add -g @openparachute/vault"))).toBe(true);
-      expect(cmds.some((c) => c.includes("bun add -g @openparachute/scribe"))).toBe(true);
+      // scribe is retired (hub#809). runInstall now refuses at the choke-point,
+      // so the wizard's sub-form no longer installs it — that bypass was the bug.
+      expect(cmds.some((c) => c.includes("bun add -g @openparachute/scribe"))).toBe(false);
     } finally {
       db.close();
     }
@@ -2321,7 +2323,8 @@ describe("handleSetupVaultPost", () => {
     expect(response.status).toBe(303);
     const location = response.headers.get("location") ?? "";
     expect(location).toMatch(/op_scribe=/);
-    expect(runCmds.some((c) => c.includes("bun add -g @openparachute/scribe"))).toBe(true);
+    // Retired (hub#809) — the cleanup path must not resurrect the install either.
+    expect(runCmds.some((c) => c.includes("bun add -g @openparachute/scribe"))).toBe(false);
     const cfg = readScribeConfig(h.dir);
     expect(cfg?.transcribe).toBeUndefined();
     expect(cfg?.cleanup).toEqual({ provider: "anthropic", default: true });
@@ -3216,8 +3219,9 @@ describe("done screen install tiles (hub#272 Item B)", () => {
       const location = post.headers.get("location") ?? "";
       expect(location).toMatch(/^\/admin\/setup\?just_finished=1&op_scribe=/);
       await new Promise((r) => setTimeout(r, 50));
-      expect(runCalls.length).toBeGreaterThan(0);
-      expect(runCalls[0]?.join(" ")).toContain("bun add -g @openparachute/scribe@latest");
+      // The op is still enqueued (the POST accepts, the refusal is async), but
+      // no install command runs — runInstall refuses retired shorts.
+      expect(runCalls.length).toBe(0);
     } finally {
       db.close();
     }
