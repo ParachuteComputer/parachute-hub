@@ -81,7 +81,13 @@ import {
 } from "./rate-limit.ts";
 import { isHttpsRequest } from "./request-protocol.ts";
 import { narrowResourceVaultScopes, resolveResourceVault } from "./resource-binding.ts";
-import { isNonRequestableScope, isRequestableScope, scopeIsAdmin } from "./scope-explanations.ts";
+import {
+  ACCOUNT_SELF_ADMIN_SCOPE,
+  ACCOUNT_SELF_READ_SCOPE,
+  isNonRequestableScope,
+  isRequestableScope,
+  scopeIsAdmin,
+} from "./scope-explanations.ts";
 import { findUnknownScopes, loadDeclaredScopes } from "./scope-registry.ts";
 import { shortNameForManifest } from "./service-spec.ts";
 import {
@@ -1285,6 +1291,11 @@ export function handleAuthorizeGet(db: Database, req: Request, deps: OAuthDeps):
         assignedVaults,
         userIsAdmin,
         userHoldsAdminOnPickable,
+        grantableExtraScopes(db, session.userId, {
+          userIsAdmin,
+          requested: parsed.scope.split(" ").filter((s) => s.length > 0),
+          vaultName: assignedVaults.length === 1 ? assignedVaults[0] : undefined,
+        }),
       ),
     ),
     200,
@@ -1337,6 +1348,24 @@ function capScopesToUserAuthority(
 ): string[] {
   if (opts.userIsAdmin) return [...scopes];
   return scopes.filter((s) => {
+    // Account scopes are ACCOUNT-WIDE, and on self-host the account IS the box
+    // (`account-api.ts`: "operator ≡ account ≡ box… the operator owns every
+    // vault, so the ownership gate the cloud twin runs per-vault is trivially
+    // satisfied here"). So `account:self:admin` reaches every vault with no
+    // per-vault gate behind it.
+    //
+    // That makes it the one scope a non-admin must never be able to consent
+    // into: an assigned user holding exactly one vault could otherwise walk
+    // the public OAuth flow and mint a token with authority over ALL of them.
+    // The vault-verb branch below can't catch it — it only inspects
+    // `vault:<name>:<verb>` and passes everything else through — so it needs
+    // its own rule, here, at the same choke-point every mint path funnels
+    // through.
+    //
+    // Admins are unaffected: they returned above, and on self-host the admin
+    // IS the account holder, so they're delegating authority they actually
+    // have.
+    if (s.toLowerCase().startsWith("account:")) return false;
     const parts = s.split(":");
     if (parts.length !== 3 || parts[0] !== "vault") return true; // non-named — pass through
     const name = parts[1];
@@ -1349,6 +1378,55 @@ function capScopesToUserAuthority(
     const held = vaultVerbsForUserVault(db, userId, name);
     return held !== null && (held as readonly string[]).includes(verb);
   });
+}
+
+/**
+ * The scopes this user could ADD to what the client asked for — the menu behind
+ * the consent screen's "additional access" section.
+ *
+ * ## Why the consent screen offers anything at all
+ *
+ * Consent used to be approve/deny on exactly the client's request, which left
+ * two dead ends. A client that requests NOTHING (scope omitted — legal in RFC
+ * 6749, and common among MCP clients) got a zero-scope token: a credential that
+ * looks like success and can do nothing. And a client that doesn't know to ask
+ * for `account:self:*` made that authority unreachable through OAuth entirely,
+ * no matter who was consenting.
+ *
+ * So the user picks. There's precedent — the vault verb radio picker already
+ * lets an owner grant a level the client didn't request.
+ *
+ * ## The menu IS the cap
+ *
+ * Built by running the full candidate set through `capScopesToUserAuthority`,
+ * the same function the mint choke-point uses, rather than by re-deriving "what
+ * may this user grant". Two different answers to that question would eventually
+ * disagree, and the failure mode of disagreement is offering a checkbox that
+ * escalates — or one that silently does nothing when ticked.
+ *
+ * Nothing here is trusted at submit time regardless: the choke-point re-caps
+ * whatever comes back, so a hand-crafted form gains nothing.
+ */
+export function grantableExtraScopes(
+  db: Database,
+  userId: string,
+  opts: { userIsAdmin: boolean; requested: readonly string[]; vaultName?: string | undefined },
+): string[] {
+  const v = opts.vaultName;
+  const candidates = [
+    ...(v
+      ? [`vault:${v}:read`, `vault:${v}:write`, `vault:${v}:admin`]
+      : ["vault:read", "vault:write", "vault:admin"]),
+    ACCOUNT_SELF_READ_SCOPE,
+    ACCOUNT_SELF_ADMIN_SCOPE,
+  ];
+  const already = new Set(opts.requested);
+  return capScopesToUserAuthority(
+    db,
+    userId,
+    candidates.filter((c) => !already.has(c)),
+    { userIsAdmin: opts.userIsAdmin },
+  );
 }
 
 /**
@@ -1646,6 +1724,21 @@ async function handleConsentSubmit(
     );
   }
   let scopes = params.scope.split(" ").filter((s) => s.length > 0);
+  // Scopes the USER ticked in the "additional access" section — access the
+  // client didn't request but the consenting user chose to grant. Unioned in
+  // here so everything downstream (the non-requestable check just below, the
+  // named-scope narrowing, and the cap at the mint choke-point) treats them
+  // exactly like requested scopes. They get no special trust: a hand-crafted
+  // POST can name anything it likes and `capScopesToUserAuthority` still drops
+  // whatever the user doesn't hold.
+  const extraScopes = form
+    .getAll("extra_scope")
+    .map((v) => String(v))
+    .filter((v) => v.length > 0);
+  if (extraScopes.length > 0) {
+    scopes = [...new Set([...scopes, ...extraScopes])];
+    params.scope = scopes.join(" ");
+  }
   // Defense-in-depth (#96). The GET handler already rejects non-requestable
   // scopes before consent renders, but a hand-crafted POST could carry one
   // anyway — block it here too.
@@ -2864,6 +2957,10 @@ function consentProps(
   // (admin owns the hub; an assigned non-admin only if their role grants admin
   // on each assigned vault). Gates whether the owner-verb-selector renders.
   userHoldsAdminOnPickable = userIsAdmin,
+  // The additional-access menu, already capped to this user's authority.
+  // Passed IN rather than computed here because it needs the db + userId,
+  // which this pure props builder deliberately doesn't take.
+  grantableExtras: readonly string[] = [],
 ) {
   const scopes = params.scope.split(" ").filter((s) => s.length > 0);
   const unnamedVerbs = unnamedVaultVerbs(scopes);
@@ -3035,6 +3132,7 @@ function consentProps(
     // consent screen. Clean DB-backed signal: the `same_hub` column written
     // at DCR time (bearer hub:admin / same-origin session → true).
     sameHub: client.sameHub,
+    grantableExtras,
   };
 }
 

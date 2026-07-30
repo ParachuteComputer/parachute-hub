@@ -22,7 +22,7 @@
  */
 import { WORDMARK_TEXT, brandMarkSvg } from "./brand.ts";
 import { renderCsrfHiddenInput } from "./csrf.ts";
-import { type ScopeExplanation, explainScope } from "./scope-explanations.ts";
+import { type ScopeExplanation, explainScope, riskForExplanation } from "./scope-explanations.ts";
 
 /** Brand palette — kept in sync with parachute.computer/style.css. */
 const PALETTE = {
@@ -39,6 +39,12 @@ const PALETTE = {
   cardBg: "#ffffff",
   danger: "#a3392b",
   dangerSoft: "rgba(163, 57, 43, 0.08)",
+  // Amber for "full control of ONE vault" — previously this rendered in
+  // `danger` red, the same as account-wide authority, so the consent screen
+  // gave its loudest signal to the scope most integrations legitimately need.
+  // When everything urgent is red, nothing is.
+  caution: "#8a6414",
+  cautionSoft: "rgba(138, 100, 20, 0.09)",
 } as const;
 
 const FONT_SERIF = `Georgia, "Times New Roman", serif`;
@@ -162,6 +168,14 @@ export interface ConsentViewProps {
    * the unnamed verb(s) on the picked vault; it never touches any other scope.
    */
   ownerVerbSelector?: OwnerVerbSelector;
+  /**
+   * Scopes the consenting user MAY grant beyond what the client requested,
+   * already capped to their authority by `grantableExtraScopes`. Rendered as
+   * an opt-in checklist so a user can grant access the client didn't know to
+   * ask for — notably `account:self:*`, which no third-party client requests
+   * but an operator may well want to delegate. Empty/absent → section hidden.
+   */
+  grantableExtras?: readonly string[];
   /**
    * hub#314 — same-hub vs external trust marker. True when the requesting
    * client was registered through this hub's own flow / first-party install
@@ -369,6 +383,7 @@ export function renderConsent(props: ConsentViewProps): string {
     blockApproveForStaleAssignment,
     userCanAuthorizeRequest,
     ownerVerbSelector,
+    grantableExtras,
     sameHub,
   } = props;
   // Substitute unnamed `vault:<verb>` rows with the resolved named form so
@@ -378,8 +393,14 @@ export function renderConsent(props: ConsentViewProps): string {
   const displayedScopes = scopes.map((s) => substituteVaultDisplay(s, displayVault));
   const scopeRows =
     displayedScopes.length === 0
-      ? `<li class="scope scope-empty">No scopes requested — the app gets a session token only.</li>`
+      ? // A client may legally omit `scope` (RFC 6749 §3.3), and MCP clients
+        // often do. Approving that used to mint a ZERO-SCOPE token: a
+        // credential that looks like success and can do nothing. Say what's
+        // actually happening and point at the checklist below, which is the
+        // only way this flow can produce a useful token.
+        `<li class="scope scope-empty">This app didn't ask for any specific access. Choose what to grant below — without a selection its token won't be able to do anything.</li>`
       : displayedScopes.map(renderScopeRow).join("\n");
+  const extrasSection = renderGrantableExtras(grantableExtras ?? [], displayedScopes.length === 0);
   const pickerSection = vaultPicker ? renderVaultPicker(vaultPicker) : "";
   const verbSelectorSection = ownerVerbSelector ? renderOwnerVerbSelector(ownerVerbSelector) : "";
   // Approve is disabled when the picker can't yield a valid vault. The
@@ -481,6 +502,7 @@ export function renderConsent(props: ConsentViewProps): string {
         ${renderHiddenInputs(params)}
         ${pickerSection}
         ${verbSelectorSection}
+        ${extrasSection}
         <div class="button-row">
           <button type="submit" name="approve" value="yes" class="btn btn-primary"${approveDisabled}>Approve</button>
           <button type="submit" name="approve" value="no" class="btn btn-secondary">Deny</button>
@@ -1038,7 +1060,12 @@ function renderScopeRow(scope: string): string {
       <span class="scope-label scope-label-muted">Defined by the requesting app — no built-in description.</span>
     </li>`;
   }
-  const cls = `scope scope-${explanation.level}`;
+  const risk = riskForExplanation(explanation);
+  // Two classes: `scope-<level>` keeps every existing style working, and
+  // `risk-<tier>` carries the colour. They're separate because a scope's verb
+  // and its blast radius aren't the same axis — `vault:<name>:admin` and
+  // `account:self:admin` share a level and differ enormously in consequence.
+  const cls = `scope scope-${explanation.level} risk-${risk}`;
   const badge = badgeForLevel(explanation);
   // Pending-vault hint surfaces the silent-narrowing semantics for admin
   // operators who land on the consent screen before touching the picker.
@@ -1048,17 +1075,78 @@ function renderScopeRow(scope: string): string {
   const pendingNote = tbdMatch
     ? `<span class="scope-pending-note">A specific vault is picked below before approving.</span>`
     : "";
+  // A high-risk scope gets an explicit consequence line, not just a colour.
+  // Colour alone is invisible to a screen reader and to anyone who doesn't
+  // know the convention, and this is the decision most worth slowing down.
+  const riskNote =
+    risk === "high"
+      ? `<span class="scope-risk-note"><strong>Account-wide.</strong> This is not limited to one vault, and tokens this app creates keep working even after you disconnect it.</span>`
+      : "";
   return `<li class="${cls}">
       <div class="scope-head">
         <code class="scope-name">${escapeHtml(scope)}</code>
         ${badge}
       </div>
       <span class="scope-label">${escapeHtml(explanation.label)}</span>
+      ${riskNote}
       ${pendingNote}
     </li>`;
 }
 
+/**
+ * The "additional access" checklist — scopes the user may grant beyond what the
+ * client asked for.
+ *
+ * Collapsed by default when the client DID request scopes: the common case is
+ * approving what was asked, and an expanded list of extra permissions invites
+ * absent-minded ticking. Expanded when the client requested nothing, because
+ * then it's the only path to a token that works.
+ *
+ * Unchecked by default in both cases — always. A pre-ticked permission is not
+ * consent, and that matters most for the `high` tier this section exists to
+ * make reachable.
+ */
+function renderGrantableExtras(extras: readonly string[], expanded: boolean): string {
+  if (extras.length === 0) return "";
+  const rows = extras
+    .map((scope) => {
+      const e = explainScope(scope);
+      const risk = e ? riskForExplanation(e) : "low";
+      const label = e ? e.label : "Defined by the requesting app — no built-in description.";
+      const badge = e ? badgeForLevel(e) : "";
+      return `<li class="scope risk-${risk} extra-scope">
+          <label class="extra-scope-label">
+            <input type="checkbox" name="extra_scope" value="${escapeHtml(scope)}" />
+            <span class="extra-scope-body">
+              <span class="scope-head">
+                <code class="scope-name">${escapeHtml(scope)}</code>
+                ${badge}
+              </span>
+              <span class="scope-label">${escapeHtml(label)}</span>
+              ${
+                risk === "high"
+                  ? `<span class="scope-risk-note"><strong>Account-wide.</strong> This is not limited to one vault, and tokens this app creates keep working even after you disconnect it.</span>`
+                  : ""
+              }
+            </span>
+          </label>
+        </li>`;
+    })
+    .join("\n");
+  return `<details class="extras" ${expanded ? "open" : ""}>
+      <summary class="extras-summary">Grant additional access${expanded ? "" : " (optional)"}</summary>
+      <p class="extras-note">The app didn't request these. Only grant what you actually want it to have.</p>
+      <ul class="scopes-list">${rows}</ul>
+    </details>`;
+}
+
 function badgeForLevel(explanation: ScopeExplanation): string {
+  // A high-risk scope is badged for its BLAST RADIUS, not its verb: "admin"
+  // next to `account:self:admin` reads like the vault-admin row two lines up,
+  // which is the confusion this whole tier exists to prevent.
+  if (riskForExplanation(explanation) === "high") {
+    return `<span class="badge badge-danger">account-wide</span>`;
+  }
   switch (explanation.level) {
     case "admin":
       return `<span class="badge badge-admin">admin</span>`;
@@ -1349,11 +1437,61 @@ const STYLES = `
     display: block;
   }
   .scope-label-muted { color: ${PALETTE.fgDim}; font-style: italic; }
+  /* Risk tiers carry the colour. .scope-admin is kept (the vault-verb radio
+     picker references it directly) and now matches the elevated tier, so the
+     two can never disagree about how one vault's admin looks. */
   .scope-admin {
+    border-color: ${PALETTE.caution};
+    background: ${PALETTE.cautionSoft};
+  }
+  .scope-admin .scope-name { color: ${PALETTE.caution}; }
+
+  .risk-elevated {
+    border-color: ${PALETTE.caution};
+    background: ${PALETTE.cautionSoft};
+  }
+  .risk-elevated .scope-name { color: ${PALETTE.caution}; }
+
+  /* Account-wide: red, a heavier border, and a spelled-out consequence. */
+  .risk-high {
     border-color: ${PALETTE.danger};
+    border-left-width: 4px;
     background: ${PALETTE.dangerSoft};
   }
-  .scope-admin .scope-name { color: ${PALETTE.danger}; }
+  .risk-high .scope-name { color: ${PALETTE.danger}; }
+  .extras {
+    margin: 0 0 1.25rem;
+    border: 1px solid ${PALETTE.borderLight};
+    border-radius: 6px;
+    padding: 0.6rem 0.8rem;
+    background: ${PALETTE.bgSoft};
+  }
+  .extras-summary {
+    cursor: pointer;
+    font-size: 0.9rem;
+    font-weight: 600;
+    color: ${PALETTE.fgMuted};
+  }
+  .extras-note {
+    margin: 0.5rem 0 0.6rem;
+    font-size: 0.85rem;
+    color: ${PALETTE.fgMuted};
+  }
+  .extra-scope-label {
+    display: flex;
+    gap: 0.6rem;
+    align-items: flex-start;
+    cursor: pointer;
+  }
+  .extra-scope-label input { margin-top: 0.3rem; flex: none; }
+  .extra-scope-body { display: block; }
+
+  .scope-risk-note {
+    display: block;
+    margin-top: 0.35rem;
+    font-size: 0.85em;
+    color: ${PALETTE.danger};
+  }
 
   .vault-picker {
     margin: 0 0 1.25rem;
@@ -1612,7 +1750,14 @@ const STYLES = `
   .badge-read { background: ${PALETTE.bgSoft}; color: ${PALETTE.fgMuted}; }
   .badge-write { background: ${PALETTE.accentSoft}; color: ${PALETTE.accent}; }
   .badge-send { background: ${PALETTE.accentSoft}; color: ${PALETTE.accent}; }
-  .badge-admin { background: ${PALETTE.danger}; color: ${PALETTE.cardBg}; }
+  /* admin = full control of ONE vault → caution amber. Account-wide authority
+     is the only thing that gets danger red, so red keeps meaning one thing. */
+  .badge-admin { background: ${PALETTE.caution}; color: ${PALETTE.cardBg}; }
+  .badge-danger {
+    background: ${PALETTE.danger};
+    color: ${PALETTE.cardBg};
+    text-transform: none;
+  }
 
   /* hub#314 — same-hub vs external trust marker on the consent header. The
      first-party badge uses the accent (calm/trusted); external uses the danger

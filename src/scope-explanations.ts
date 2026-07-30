@@ -30,6 +30,40 @@ export interface ScopeExplanation {
    * operator look at them twice.
    */
   level: "read" | "write" | "admin" | "send";
+  /**
+   * How much damage a compromised holder of this scope could do — orthogonal
+   * to `level`, which describes the VERB.
+   *
+   * The two come apart at exactly one place, which is why this field exists:
+   * `vault:<name>:admin` and `account:self:admin` are both level `"admin"`,
+   * but one can reshape a single vault while the other can delete every vault
+   * on the account and mint credentials for all of them. Rendering both with
+   * the same badge asks the user to make a much bigger decision with the same
+   * visual weight.
+   *
+   *   - `"low"`      — reads, and writes bounded to one vault's content.
+   *   - `"elevated"` — full control of ONE vault (yellow). Risky but ordinary;
+   *                    this is what an MCP client needs to manage tag schemas.
+   *   - `"high"`     — account-wide authority (red). Reaches every vault, and
+   *                    can mint credentials that OUTLIVE this grant.
+   *
+   * Defaults to a level-derived value when absent (see `riskForExplanation`),
+   * so existing entries keep their behaviour without restating it.
+   */
+  risk?: "low" | "elevated" | "high";
+}
+
+/**
+ * The risk tier to render a scope at. Explicit `risk` wins; otherwise `admin`
+ * is elevated and everything else is low.
+ *
+ * A default rather than a required field on purpose: the only scopes needing
+ * `high` are the account-wide ones, and forcing every entry to restate a tier
+ * it shares with its level invites drift between the two.
+ */
+export function riskForExplanation(e: ScopeExplanation): "low" | "elevated" | "high" {
+  if (e.risk) return e.risk;
+  return e.level === "admin" ? "elevated" : "low";
 }
 
 export const SCOPE_EXPLANATIONS: Record<string, ScopeExplanation> = {
@@ -38,12 +72,21 @@ export const SCOPE_EXPLANATIONS: Record<string, ScopeExplanation> = {
     level: "read",
   },
   "vault:write": {
-    label: "Create, edit, and delete notes, tags, and attachments.",
+    // "tags" used to be listed flatly here, which overpromised: write can APPLY
+    // tags to notes, but tag SCHEMA/taxonomy mutation (update-tag, delete-tag,
+    // rename-tag, merge-tags) was re-tiered write → admin on both doors —
+    // structure vs content, the same line that keeps create/update/delete-note
+    // at write. A user reading the old label approved write expecting to manage
+    // their taxonomy and then hit refusals the consent screen never warned of.
+    label: "Create, edit, and delete notes and attachments, and apply existing tags to them.",
     level: "write",
   },
   "vault:admin": {
+    // Names tag-schema management FIRST: it's the most common reason an MCP
+    // client legitimately needs admin, and leaving it unstated made admin look
+    // like a purely operational scope nobody should grant an app.
     label:
-      "Read and write everything, plus admin: config & settings, triggers & automation, GitHub backup, and minting access tokens.",
+      "Read and write everything, plus: manage the tag schema (create, rename, merge, and delete tag definitions), config & settings, triggers & automation, GitHub backup, and minting access tokens.",
     level: "admin",
   },
   // Optional-module scopes (scribe / surface). These are in
@@ -120,13 +163,19 @@ export const SCOPE_EXPLANATIONS: Record<string, ScopeExplanation> = {
   // (b) so scope-guard's `admin ⊇ read` inheritance recognizes the grammar
   // (`account:self:admin` satisfies `account:self:read`).
   "account:self:admin": {
+    // Names DELETE and the token-minting explicitly. Minting is the part a
+    // user cannot walk back: revoking this grant does not revoke tokens the
+    // app already minted with it, so "you can always disconnect it later" is
+    // not true here the way it is for every other scope.
     label:
-      "Manage your Parachute account — create, delete, and configure your vaults, and mint access tokens for them.",
+      "Full control of your Parachute account — create and PERMANENTLY DELETE any of your vaults, change their settings, and mint access tokens for them. Tokens it creates keep working even after you disconnect this app.",
     level: "admin",
+    risk: "high",
   },
   "account:self:read": {
     label: "View your Parachute account — list your vaults and read their settings and usage.",
     level: "read",
+    risk: "low",
   },
 };
 
@@ -193,13 +242,24 @@ export const NON_REQUESTABLE_SCOPES: ReadonlySet<string> = new Set([
   // Service-admin scopes: operator-only, never requestable via /oauth/authorize.
   "hub:admin",
   "scribe:admin",
-  // Account scopes (Parachute App campaign, Phase 2): cookie-minted only via
-  // `POST /account/token`, NEVER OAuth-requestable. A third-party app pointed
-  // at the hub AS must not be able to consent its way to account authority
-  // (create/delete vaults, mint per-vault tokens) — the account credential is
-  // exclusively the same-origin app's cookie→bearer exchange.
-  ACCOUNT_SELF_ADMIN_SCOPE,
-  ACCOUNT_SELF_READ_SCOPE,
+  // NOTE: the `account:self:*` scopes used to be listed here — cookie-minted
+  // only, never OAuth-requestable — on the reasoning that a third-party app
+  // must not be able to consent its way to account authority.
+  //
+  // That reasoning conflated "dangerous" with "forbidden". The same argument
+  // applied to `vault:<name>:admin` until the 2026-05-29 single-consent change,
+  // which made it requestable under one guardrail: a user may only delegate
+  // authority they already hold, enforced at the mint choke-point. Account
+  // scopes sit under that same guardrail — `capScopesToUserAuthority` caps an
+  // OAuth flow to the consenting user's own authority, and `self` IS that
+  // user's own account, so a consenting user can only ever delegate their own.
+  //
+  // Blocking them outright meant a real capability was unreachable: an agent
+  // that manages vaults for you couldn't be built at all, because the only
+  // path to account authority was the first-party app's cookie exchange.
+  // The answer to a dangerous-but-legitimate permission is informed consent,
+  // not prohibition — so these are requestable, and render at risk tier
+  // `"high"` with the consequences spelled out (see SCOPE_EXPLANATIONS).
 ]);
 
 /**
