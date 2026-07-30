@@ -718,12 +718,12 @@ describe("install", () => {
     }
   });
 
-  test("skips init when spec has none (scribe)", async () => {
+  test("skips init when spec has none (app)", async () => {
     const { path, configDir, cleanup } = makeTempPath();
     try {
       const calls: string[][] = [];
       const logs: string[] = [];
-      const code = await install("scribe", {
+      const code = await install("surface", {
         runner: async (cmd) => {
           calls.push([...cmd]);
           return 0;
@@ -737,11 +737,11 @@ describe("install", () => {
       });
       expect(code).toBe(0);
       expect(calls).toHaveLength(1);
-      expect(calls[0]).toEqual(["bun", "add", "-g", "@openparachute/scribe"]);
+      expect(calls[0]).toEqual(["bun", "add", "-g", "@openparachute/surface"]);
       // scribe has no init, so seedEntry fires — no authoritative entry to defer to.
-      const seeded = findService("parachute-scribe", path);
-      expect(seeded?.port).toBe(1943);
-      expect(logs.join("\n")).toMatch(/Seeded services\.json entry for parachute-scribe/);
+      const seeded = findService("parachute-surface", path);
+      expect(seeded?.port).toBe(1946);
+      expect(logs.join("\n")).toMatch(/Seeded services\.json entry for parachute-surface/);
     } finally {
       cleanup();
     }
@@ -755,7 +755,7 @@ describe("install", () => {
     try {
       const calls: string[][] = [];
       const logs: string[] = [];
-      const code = await install("scribe", {
+      const code = await install("surface", {
         runner: async (cmd) => {
           calls.push([...cmd]);
           return 0;
@@ -763,16 +763,16 @@ describe("install", () => {
         manifestPath: path,
         configDir,
         startService: async () => 0,
-        isLinked: (pkg) => pkg === "@openparachute/scribe",
+        isLinked: (pkg) => pkg === "@openparachute/surface",
         portProbe: async () => false,
         log: (l) => logs.push(l),
       });
       expect(code).toBe(0);
       expect(calls).toHaveLength(0);
       expect(logs.join("\n")).toMatch(/already linked globally/);
-      const seeded = findService("parachute-scribe", path);
-      expect(seeded?.port).toBe(1943);
-      expect(seeded?.paths).toEqual(["/scribe"]);
+      const seeded = findService("parachute-surface", path);
+      expect(seeded?.port).toBe(1946);
+      expect(seeded?.paths).toEqual(["/surface", "/.parachute"]);
     } finally {
       cleanup();
     }
@@ -835,7 +835,7 @@ describe("install", () => {
     try {
       const calls: string[][] = [];
       const logs: string[] = [];
-      const code = await install("scribe", {
+      const code = await install("surface", {
         runner: async (cmd) => {
           calls.push([...cmd]);
           return 0;
@@ -1057,7 +1057,7 @@ describe("install", () => {
     try {
       const calls: string[][] = [];
       const logs: string[] = [];
-      const code = await install("scribe", {
+      const code = await install("surface", {
         runner: async (cmd) => {
           calls.push([...cmd]);
           return 0;
@@ -1159,151 +1159,9 @@ describe("install", () => {
   // vault↔scribe pair, generate a shared secret and persist to both sides.
   // Covered in detail by auto-wire.test.ts; these tests assert the install
   // command actually invokes the helper at the right moment.
-  test("installing scribe with vault already present auto-wires the shared secret", async () => {
-    const { path, cleanup } = makeTempPath();
-    const configDir = join(path, "..");
-    try {
-      // Pretend vault was installed previously — entry already in services.json.
-      upsertService(
-        {
-          name: "parachute-vault",
-          port: 1940,
-          paths: ["/vault/default"],
-          health: "/vault/default/health",
-          version: "0.2.4",
-        },
-        path,
-      );
-      const logs: string[] = [];
-      const code = await install("scribe", {
-        runner: async () => 0,
-        manifestPath: path,
-        configDir,
-        startService: async () => 0,
-        isLinked: () => false,
-        portProbe: async () => false,
-        log: (l) => logs.push(l),
-        randomToken: () => "test-token-value",
-      });
-      expect(code).toBe(0);
 
-      const envPath = join(configDir, "vault", ".env");
-      const scribeCfgPath = join(configDir, "scribe", "config.json");
-      expect(existsSync(envPath)).toBe(true);
-      expect(existsSync(scribeCfgPath)).toBe(true);
 
-      const envText = readFileSync(envPath, "utf8");
-      expect(envText).toContain("SCRIBE_AUTH_TOKEN=test-token-value");
-      const cfg = JSON.parse(readFileSync(scribeCfgPath, "utf8"));
-      expect(cfg.auth.required_token).toBe("test-token-value");
 
-      expect(logs.join("\n")).toMatch(/Auto-wired shared secret \+ SCRIBE_URL/);
-    } finally {
-      cleanup();
-    }
-  });
-
-  test("installing scribe without vault does NOT auto-wire (nothing to wire against)", async () => {
-    const { path, cleanup } = makeTempPath();
-    const configDir = join(path, "..");
-    try {
-      const logs: string[] = [];
-      const code = await install("scribe", {
-        runner: async () => 0,
-        manifestPath: path,
-        configDir,
-        startService: async () => 0,
-        isLinked: () => false,
-        portProbe: async () => false,
-        log: (l) => logs.push(l),
-        randomToken: () => "should-not-fire",
-      });
-      expect(code).toBe(0);
-      // No vault/.env, no scribe/config.json written by auto-wire.
-      expect(existsSync(join(configDir, "vault", ".env"))).toBe(false);
-      expect(existsSync(join(configDir, "scribe", "config.json"))).toBe(false);
-      expect(logs.join("\n")).not.toMatch(/Auto-wired shared secret/);
-    } finally {
-      cleanup();
-    }
-  });
-
-  test("installing vault with scribe already present auto-wires (either-order)", async () => {
-    const { path, cleanup } = makeTempPath();
-    const configDir = join(path, "..");
-    try {
-      upsertService(
-        {
-          name: "parachute-scribe",
-          port: 1943,
-          paths: ["/scribe"],
-          health: "/scribe/health",
-          version: "0.1.0",
-        },
-        path,
-      );
-      const code = await install("vault", {
-        runner: async () => 0,
-        manifestPath: path,
-        configDir,
-        startService: async () => 0,
-        isLinked: () => false,
-        portProbe: async () => false,
-        log: () => {},
-        randomToken: () => "install-vault-side-token",
-      });
-      expect(code).toBe(0);
-      const envText = readFileSync(join(configDir, "vault", ".env"), "utf8");
-      expect(envText).toContain("SCRIBE_AUTH_TOKEN=install-vault-side-token");
-    } finally {
-      cleanup();
-    }
-  });
-
-  test("repeat install preserves an existing SCRIBE_AUTH_TOKEN (idempotent)", async () => {
-    const { path, cleanup } = makeTempPath();
-    const configDir = join(path, "..");
-    try {
-      upsertService(
-        {
-          name: "parachute-vault",
-          port: 1940,
-          paths: ["/vault/default"],
-          health: "/vault/default/health",
-          version: "0.2.4",
-        },
-        path,
-      );
-      // First install: mints a token.
-      await install("scribe", {
-        runner: async () => 0,
-        manifestPath: path,
-        configDir,
-        startService: async () => 0,
-        isLinked: () => false,
-        portProbe: async () => false,
-        log: () => {},
-        randomToken: () => "first-token",
-      });
-      // Second install: must preserve the first token — churning it would
-      // break an already-running vault worker that's holding the old one.
-      await install("scribe", {
-        runner: async () => 0,
-        manifestPath: path,
-        configDir,
-        startService: async () => 0,
-        isLinked: () => false,
-        portProbe: async () => false,
-        log: () => {},
-        randomToken: () => "should-not-replace",
-      });
-      const envText = readFileSync(join(configDir, "vault", ".env"), "utf8");
-      expect(envText).toContain("SCRIBE_AUTH_TOKEN=first-token");
-      expect(envText).not.toContain("should-not-replace");
-    } finally {
-      cleanup();
-    }
-  });
 
   test("installing notes doesn't trigger auto-wire even if vault + scribe are present", async () => {
     // Defense: auto-wire should only fire from the scribe or vault install
@@ -1324,8 +1182,8 @@ describe("install", () => {
       );
       upsertService(
         {
-          name: "parachute-scribe",
-          port: 1943,
+          name: "parachute-surface",
+          port: 1946,
           paths: ["/scribe"],
           health: "/scribe/health",
           version: "0.1.0",
@@ -1343,7 +1201,7 @@ describe("install", () => {
         randomToken: () => "should-not-fire",
       });
       expect(existsSync(join(configDir, "vault", ".env"))).toBe(false);
-      expect(existsSync(join(configDir, "scribe", "config.json"))).toBe(false);
+      expect(existsSync(join(configDir, "surface", "config.json"))).toBe(false);
     } finally {
       cleanup();
     }
@@ -1356,7 +1214,7 @@ describe("install", () => {
     const { path, cleanup } = makeTempPath();
     try {
       const startCalls: string[] = [];
-      const code = await install("scribe", {
+      const code = await install("surface", {
         runner: async () => 0,
         manifestPath: path,
         startService: async (short) => {
@@ -1368,7 +1226,7 @@ describe("install", () => {
         log: () => {},
       });
       expect(code).toBe(0);
-      expect(startCalls).toEqual(["scribe"]);
+      expect(startCalls).toEqual(["surface"]);
     } finally {
       cleanup();
     }
@@ -1380,7 +1238,7 @@ describe("install", () => {
     const { path, cleanup } = makeTempPath();
     try {
       const startCalls: string[] = [];
-      const code = await install("scribe", {
+      const code = await install("surface", {
         runner: async () => 0,
         manifestPath: path,
         startService: async (short) => {
@@ -1429,7 +1287,7 @@ describe("install", () => {
     const { path, cleanup } = makeTempPath();
     try {
       const logs: string[] = [];
-      const code = await install("scribe", {
+      const code = await install("surface", {
         runner: async () => 0,
         manifestPath: path,
         startService: async () => 1,
@@ -1438,33 +1296,12 @@ describe("install", () => {
         log: (l) => logs.push(l),
       });
       expect(code).toBe(0);
-      expect(logs.join("\n")).toMatch(/scribe didn't start cleanly.*parachute start scribe/);
+      expect(logs.join("\n")).toMatch(/surface didn't start cleanly.*parachute start surface/);
     } finally {
       cleanup();
     }
   });
 
-  test("scribe install emits the post-install footer with provider hints", async () => {
-    const { path, cleanup } = makeTempPath();
-    try {
-      const logs: string[] = [];
-      const code = await install("scribe", {
-        runner: async () => 0,
-        manifestPath: path,
-        startService: async () => 0,
-        isLinked: () => false,
-        portProbe: async () => false,
-        log: (l) => logs.push(l),
-      });
-      expect(code).toBe(0);
-      const joined = logs.join("\n");
-      expect(joined).toMatch(/Scribe is listening on http:\/\/127\.0\.0\.1:1943/);
-      expect(joined).toMatch(/parakeet-mlx/);
-      expect(joined).toMatch(/groq.*openai/);
-    } finally {
-      cleanup();
-    }
-  });
 
   // hub#788 — notes + scribe are retired. The install path refuses them
   // BEFORE `bun add -g`, so a retired package is never pulled down. (An
@@ -1517,82 +1354,8 @@ describe("install", () => {
     }
   });
 
-  test("scribe install with --scribe-provider/--scribe-key writes config + .env non-interactively", async () => {
-    const { path, cleanup } = makeTempPath();
-    const configDir = join(path, "..");
-    try {
-      const code = await install("scribe", {
-        runner: async () => 0,
-        manifestPath: path,
-        configDir,
-        startService: async () => 0,
-        isLinked: () => false,
-        portProbe: async () => false,
-        log: () => {},
-        scribeProvider: "groq",
-        scribeKey: "gsk_test_value",
-        scribeAvailability: { kind: "not-tty" },
-      });
-      expect(code).toBe(0);
-      const cfg = JSON.parse(readFileSync(join(configDir, "scribe", "config.json"), "utf8"));
-      expect(cfg.transcribe).toEqual({ provider: "groq" });
-      const envText = readFileSync(join(configDir, "scribe", ".env"), "utf8");
-      expect(envText).toContain("GROQ_API_KEY=gsk_test_value");
-    } finally {
-      cleanup();
-    }
-  });
 
-  test("scribe install drives interactive prompt via the availability seam", async () => {
-    const { path, cleanup } = makeTempPath();
-    const configDir = join(path, "..");
-    try {
-      const answers = ["openai", "sk-from-prompt"];
-      let i = 0;
-      const code = await install("scribe", {
-        runner: async () => 0,
-        manifestPath: path,
-        configDir,
-        startService: async () => 0,
-        isLinked: () => false,
-        portProbe: async () => false,
-        log: () => {},
-        scribeAvailability: {
-          kind: "available",
-          prompt: async () => answers[i++] ?? "",
-        },
-      });
-      expect(code).toBe(0);
-      const cfg = JSON.parse(readFileSync(join(configDir, "scribe", "config.json"), "utf8"));
-      expect(cfg.transcribe).toEqual({ provider: "openai" });
-      const envText = readFileSync(join(configDir, "scribe", ".env"), "utf8");
-      expect(envText).toContain("OPENAI_API_KEY=sk-from-prompt");
-    } finally {
-      cleanup();
-    }
-  });
 
-  test("scribe install in non-TTY without flags leaves config untouched", async () => {
-    const { path, cleanup } = makeTempPath();
-    const configDir = join(path, "..");
-    try {
-      const code = await install("scribe", {
-        runner: async () => 0,
-        manifestPath: path,
-        configDir,
-        startService: async () => 0,
-        isLinked: () => false,
-        portProbe: async () => false,
-        log: () => {},
-        scribeAvailability: { kind: "not-tty" },
-      });
-      expect(code).toBe(0);
-      // Auto-wire didn't run (no vault), so config.json is never created.
-      expect(existsSync(join(configDir, "scribe", "config.json"))).toBe(false);
-    } finally {
-      cleanup();
-    }
-  });
 
   test("non-scribe service install does not invoke the provider setup", async () => {
     const { path, cleanup } = makeTempPath();
@@ -1612,7 +1375,7 @@ describe("install", () => {
         // scribe config materialized.
       });
       expect(code).toBe(0);
-      expect(existsSync(join(configDir, "scribe", "config.json"))).toBe(false);
+      expect(existsSync(join(configDir, "surface", "config.json"))).toBe(false);
     } finally {
       cleanup();
     }
@@ -2240,12 +2003,12 @@ describe("#579 / #580 item 1 — light manual install + guidance", () => {
     }
   });
 
-  test("scribe (no interactive init) is unaffected — no skip log, no vault guidance", async () => {
+  test("surface (no interactive init) is unaffected — no skip log, no vault guidance", async () => {
     const { path, cleanup } = makeTempPath();
     const configDir = join(path, "..");
     try {
       const logs: string[] = [];
-      const code = await install("scribe", {
+      const code = await install("surface", {
         runner: async () => 0,
         manifestPath: path,
         configDir,
@@ -2555,7 +2318,7 @@ describe("app-only serve-app set-if-unset default", () => {
     try {
       const db = openHubDb(hubDbPath(configDir));
       try {
-        const code = await install("scribe", {
+        const code = await install("surface", {
           runner: async () => 0,
           manifestPath: path,
           configDir,
