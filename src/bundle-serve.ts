@@ -223,6 +223,38 @@ function mimeFor(path: string): string | undefined {
  * alone, and nothing outside those two attributes is touched, so inline styles
  * and scripts are untouched. A no-op when `mount` is empty.
  */
+/**
+ * Tell the bundle where it's mounted, via the contract the bundle already has.
+ *
+ * `@openparachute/app` resolves its React Router basename at runtime through
+ * `detectMountBase()`, whose HIGHEST-priority source is
+ * `<meta name="parachute-mount" content="...">` — documented as "the canonical
+ * contract: … once the host injects one". Nothing injected one.
+ *
+ * Its fallback is a list of recognised mount shapes: `/surface/<slug>` and the
+ * legacy `/notes/`. `/app` is not among them — it became the front door in
+ * hub#791, long after that list was written — so a bundle served at `/app` fell
+ * through to `ROOT_FALLBACK` (`""`) and believed it lived at the origin root.
+ * Every route it generated came out origin-rooted: opening a note produced
+ * `https://host/n/<id>` instead of `https://host/app/n/<id>`, which hub doesn't
+ * route to the app at all.
+ *
+ * Injecting the meta tag fixes it for ALREADY-PUBLISHED bundles, and does so
+ * through the app's own documented contract rather than by teaching hub to
+ * rewrite router internals. The host knows the mount; this is how it says so.
+ *
+ * Idempotent: a bundle that already carries the tag (a surface host that
+ * injects its own) is left alone, so the host's contract still wins.
+ */
+export function injectMountMeta(html: string, mount: string): string {
+  if (!mount) return html;
+  if (/<meta\s+name=["']parachute-mount["']/i.test(html)) return html;
+  const tag = `<meta name="parachute-mount" content="${mount}">`;
+  // Must land inside <head>, before the module script that reads it.
+  if (/<head[^>]*>/i.test(html)) return html.replace(/(<head[^>]*>)/i, `$1\n    ${tag}`);
+  return `${tag}\n${html}`;
+}
+
 export function rewriteRootAbsoluteUrls(html: string, mount: string): string {
   if (!mount) return html;
   return html.replace(
@@ -272,7 +304,10 @@ export function notesFetch(dist: string, mount: string): (req: Request) => Respo
   const spaShell = () => {
     if (shellHtml === undefined) {
       try {
-        shellHtml = rewriteRootAbsoluteUrls(readFileSync(indexHtml, "utf8"), mount);
+        shellHtml = injectMountMeta(
+          rewriteRootAbsoluteUrls(readFileSync(indexHtml, "utf8"), mount),
+          mount,
+        );
       } catch {
         // Missing/unreadable index.html — fall back to streaming the file so
         // the existing 404/500 behaviour is unchanged rather than throwing here.
