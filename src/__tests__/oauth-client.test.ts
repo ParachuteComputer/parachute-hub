@@ -157,7 +157,9 @@ describe("discover", () => {
     expect(d.scopesSupported).toEqual(["mcp:execute", "meeting:read"]);
     // proves the path-inserted PRM probe was used (host-root PRM isn't defined)
     expect(
-      calls.some((c) => c.url === "https://api.example.ai/.well-known/oauth-protected-resource/mcp"),
+      calls.some(
+        (c) => c.url === "https://api.example.ai/.well-known/oauth-protected-resource/mcp",
+      ),
     ).toBe(true);
   });
 
@@ -182,7 +184,9 @@ describe("discover", () => {
       "https://api.example.ai/.well-known/oauth-protected-resource/mcp": () =>
         json({ authorization_servers: ["not-a-url"] }),
     });
-    await expect(discover("https://api.example.ai/mcp", fn)).rejects.toBeInstanceOf(OAuthClientError);
+    await expect(discover("https://api.example.ai/mcp", fn)).rejects.toBeInstanceOf(
+      OAuthClientError,
+    );
   });
 
   test("AS discovery uses the OIDC-append form for a path-ful issuer", async () => {

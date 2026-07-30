@@ -874,7 +874,11 @@ describe("POST /admin/connections — channel-backed (the #624 flow as a connect
       baseDeps(fetchImpl, modulesOf(VAULT_MANIFEST, CHANNEL_MANIFEST)),
     );
     expect(res.status).toBe(200);
-    const out = (await res.json()) as { ok: boolean; connection: { id: string }; connect?: unknown };
+    const out = (await res.json()) as {
+      ok: boolean;
+      connection: { id: string };
+      connect?: unknown;
+    };
     expect(out.ok).toBe(true);
     expect(out.connection.id).toBe("agentdefs-create-default");
     // No channel → no connect lines (those are message-delivery-specific).
@@ -1099,7 +1103,9 @@ describe("DELETE /admin/connections/:id — teardown", () => {
     );
     expect(res.status).toBe(200);
     // NO channel delete (the channel-reply path was never created).
-    expect(calls.some((c) => c.method === "DELETE" && c.url.includes("/api/channels/"))).toBe(false);
+    expect(calls.some((c) => c.method === "DELETE" && c.url.includes("/api/channels/"))).toBe(
+      false,
+    );
     // The vault trigger WAS torn down.
     expect(
       calls.some(

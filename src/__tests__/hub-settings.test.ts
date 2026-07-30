@@ -11,6 +11,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
 import {
+  APP_ROOT_REDIRECT,
   DEFAULT_MODULE_INSTALL_CHANNEL,
   DEFAULT_ROOT_MODE,
   DEFAULT_ROOT_REDIRECT,
@@ -23,6 +24,7 @@ import {
   ROOT_MODES,
   SETUP_EXPOSE_MODES,
   consumeFirstClientAutoApproveWindow,
+  defaultRootRedirectFor,
   deleteSetting,
   getHubOrigin,
   getModuleInstallChannel,
@@ -32,8 +34,6 @@ import {
   isFirstClientAutoApproveWindowOpen,
   isModuleInstallChannel,
   isNotesRedirectDisabled,
-  APP_ROOT_REDIRECT,
-  defaultRootRedirectFor,
   isRootMode,
   isSafeRedirectPath,
   isSetupExposeMode,

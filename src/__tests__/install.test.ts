@@ -1160,9 +1160,6 @@ describe("install", () => {
   // Covered in detail by auto-wire.test.ts; these tests assert the install
   // command actually invokes the helper at the right moment.
 
-
-
-
   test("installing notes doesn't trigger auto-wire even if vault + scribe are present", async () => {
     // Defense: auto-wire should only fire from the scribe or vault install
     // path. A parallel install of a different service shouldn't touch the
@@ -1302,7 +1299,6 @@ describe("install", () => {
     }
   });
 
-
   // hub#788 — notes + scribe are retired. The install path refuses them
   // BEFORE `bun add -g`, so a retired package is never pulled down. (An
   // existing services.json row keeps working; see the retirement tests in
@@ -1353,9 +1349,6 @@ describe("install", () => {
       cleanup();
     }
   });
-
-
-
 
   test("non-scribe service install does not invoke the provider setup", async () => {
     const { path, cleanup } = makeTempPath();

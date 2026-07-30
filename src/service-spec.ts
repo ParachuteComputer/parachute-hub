@@ -367,7 +367,6 @@ const NOTES_FALLBACK: FirstPartyFallback = {
         "@openparachute/notes",
       ];
     },
-
   },
 };
 
