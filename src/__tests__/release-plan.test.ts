@@ -12,6 +12,7 @@ import {
   decidePublish,
   distTagFor,
   readRegistry,
+  unpublishedDrift,
 } from "../../scripts/release-plan.ts";
 
 describe("distTagFor", () => {
@@ -45,7 +46,10 @@ describe("compareVersions", () => {
 
 describe("decidePublish", () => {
   test("a fresh version publishes", () => {
-    const d = decidePublish("0.7.9-rc.2", { versionExists: false, currentDistTagVersion: "0.7.9-rc.1" });
+    const d = decidePublish("0.7.9-rc.2", {
+      versionExists: false,
+      currentDistTagVersion: "0.7.9-rc.1",
+    });
     expect(d).toMatchObject({ publish: true });
   });
 
@@ -92,10 +96,14 @@ describe("decidePublish", () => {
   });
 
   test("an explicit tag push overrides every check — a human said release this", () => {
-    const d = decidePublish("0.7.0-rc.1", {
-      versionExists: false,
-      currentDistTagVersion: "0.9.0",
-    }, { isTagPush: true });
+    const d = decidePublish(
+      "0.7.0-rc.1",
+      {
+        versionExists: false,
+        currentDistTagVersion: "0.9.0",
+      },
+      { isTagPush: true },
+    );
     expect(d).toMatchObject({ publish: true });
   });
 
@@ -120,7 +128,10 @@ describe("readRegistry", () => {
 
   test("picks the dist-tag matching the version's channel", async () => {
     const v = await readRegistry("@openparachute/hub", "0.7.9", (() =>
-      json({ versions: {}, "dist-tags": { rc: "0.7.9-rc.2", latest: "0.7.8" } })) as unknown as typeof fetch);
+      json({
+        versions: {},
+        "dist-tags": { rc: "0.7.9-rc.2", latest: "0.7.8" },
+      })) as unknown as typeof fetch);
     // A stable version compares against `latest`, not `rc`.
     expect(v).toMatchObject({ currentDistTagVersion: "0.7.8" });
   });
@@ -141,5 +152,27 @@ describe("readRegistry", () => {
     const v = await readRegistry("@openparachute/hub", "1.0.0", (() =>
       Promise.reject(new Error("ECONNRESET"))) as unknown as typeof fetch);
     expect(v).toMatchObject({ ambiguous: true });
+  });
+});
+
+describe("unpublishedDrift", () => {
+  test("no commits → not drifted", () => {
+    expect(unpublishedDrift([]).drifted).toBe(false);
+    expect(unpublishedDrift(["", "  "]).drifted).toBe(false);
+  });
+
+  test("commits → drifted, counted, and LISTED", () => {
+    // The list is the point: "you have unpublished work" without naming what
+    // leaves someone diffing tags by hand to find out.
+    const d = unpublishedDrift(["abc feat: one", "def fix: two"]);
+    expect(d.drifted).toBe(true);
+    expect(d.count).toBe(2);
+    expect(d.summary).toContain("feat: one");
+    expect(d.summary).toContain("fix: two");
+    expect(d.summary).toMatch(/release PR/i);
+  });
+
+  test("blank lines from git's trailing newline don't inflate the count", () => {
+    expect(unpublishedDrift(["abc one", ""]).count).toBe(1);
   });
 });

@@ -56,7 +56,9 @@ export function compareVersions(a: string, b: string): number {
     const [core, pre] = v.split("-");
     const nums = (core ?? "").split(".").map((n) => Number.parseInt(n, 10) || 0);
     // No prerelease sorts above any prerelease → Infinity.
-    const preNum = pre ? Number.parseInt(pre.replace(/^rc\./, ""), 10) || 0 : Number.POSITIVE_INFINITY;
+    const preNum = pre
+      ? Number.parseInt(pre.replace(/^rc\./, ""), 10) || 0
+      : Number.POSITIVE_INFINITY;
     return { nums, preNum };
   };
   const pa = parse(a);
@@ -133,6 +135,40 @@ export async function readRegistry(
   }
 }
 
+/**
+ * Commits sitting on `main` that no published version contains.
+ *
+ * Publish-on-merge skips silently when package.json already matches npm, which
+ * is correct — but it means a fix merged just AFTER a release PR is invisibly
+ * unpublished. That has now happened three times running (#794, #796, #798),
+ * once leaving `@latest` with an app front door that couldn't render. The
+ * version bump is a snapshot of main at merge time, and a release PR cannot see
+ * what merges after it — so noticing has to happen here, on the skip path.
+ *
+ * Advisory only: it warns, never fails. A release that legitimately hasn't been
+ * cut yet is a normal state, not an error.
+ *
+ * Pure so it's testable without a repo; the caller supplies the log lines.
+ */
+export function unpublishedDrift(commitSubjects: readonly string[]): {
+  drifted: boolean;
+  count: number;
+  summary: string;
+} {
+  const commits = commitSubjects.map((c) => c.trim()).filter((c) => c.length > 0);
+  if (commits.length === 0) {
+    return { drifted: false, count: 0, summary: "nothing unpublished" };
+  }
+  return {
+    drifted: true,
+    count: commits.length,
+    summary:
+      `${commits.length} commit(s) on main are NOT in any published version:\n` +
+      commits.map((c) => `  - ${c}`).join("\n") +
+      "\nOpen a release PR to ship them.",
+  };
+}
+
 // --- CLI -------------------------------------------------------------------
 // Usage: bun scripts/release-plan.ts <package-dir> <npm-name> [--tag-push]
 // Emits GitHub Actions outputs; exits non-zero on refusal.
@@ -158,6 +194,33 @@ if (import.meta.main) {
   if ("refuse" in decision) {
     console.error(`::error::${npmName}@${version}: ${decision.reason}`);
     process.exit(1);
+  }
+  // On the skip path, say whether anything is stranded. A silent skip is
+  // indistinguishable from "everything is shipped", which is how three fixes
+  // in a row sat unpublished on main.
+  if (!decision.publish && !rest.includes("--no-drift-check")) {
+    try {
+      const proc = Bun.spawnSync(["git", "log", `v${version}..HEAD`, "--oneline", "--no-merges"]);
+      if (proc.exitCode === 0) {
+        const drift = unpublishedDrift(new TextDecoder().decode(proc.stdout).split("\n"));
+        if (drift.drifted) {
+          console.log(`::warning::${npmName}: ${drift.summary}`);
+          const sum = process.env.GITHUB_STEP_SUMMARY;
+          if (sum) {
+            await Bun.write(
+              sum,
+              `### Unpublished work on main\n\n\`\`\`\n${drift.summary}\n\`\`\`\n`,
+              {
+                createPath: false,
+              },
+            );
+          }
+        }
+      }
+    } catch {
+      // Never fail a run over the advisory check — a missing tag or a shallow
+      // clone just means we can't tell, not that something is wrong.
+    }
   }
   await emit("version", version);
   await emit("dist_tag", distTagFor(version));
