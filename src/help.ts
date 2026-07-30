@@ -1,8 +1,11 @@
 import pkg from "../package.json" with { type: "json" };
-import { knownServices } from "./service-spec.ts";
+import { isInstallableShort, knownServices } from "./service-spec.ts";
 
 export function topLevelHelp(): string {
-  const services = knownServices().join(" | ");
+  // INSTALLABLE, not known: `install` refuses retired modules, so listing them
+  // here advertises a command that errors. (`uninstall` deliberately still
+  // accepts them — a retired module is the one you most want to remove.)
+  const services = knownServices().filter(isInstallableShort).join(" | ");
   return `parachute ${pkg.version} — top-level CLI for the Parachute ecosystem
 
 Fresh install? Start here — works the same on a laptop or a remote server:
@@ -16,6 +19,8 @@ Usage:
   parachute setup                   interactive walk-through: install services + configure
   parachute install <service>       install and register a service
                                     services: ${services}
+  parachute uninstall <service>     stop it, drop its services.json row, remove
+                                    the package (vault DATA is never touched)
   parachute status                  show installed services, run state, health
   parachute doctor                  run health checks + tell you the one thing to fix
   parachute start   [service]       start a module via the supervisor (or ensure the hub is up)
@@ -43,6 +48,28 @@ Usage:
 Flags:
   --help, -h                        show this help (also per-subcommand: \`parachute <cmd> --help\`)
   --version, -v                     print version
+`;
+}
+
+export function uninstallHelp(): string {
+  return `parachute uninstall — remove a module from this box
+
+Usage:
+  parachute uninstall <service> [--yes]
+
+Stops the supervised child, removes the row from ~/.parachute/services.json,
+and runs \`bun remove -g <package>\`. Idempotent: any step that's already done
+is reported and skipped.
+
+  --yes, -y      skip the confirmation prompt (REQUIRED when stdin isn't a TTY,
+                 so a scripted run can never be confirmed by an EOF)
+
+Vault DATA is never touched — removing the vault module leaves every vault on
+disk. Retired modules (notes, scribe) can always be uninstalled even though
+they can no longer be installed.
+
+Needs a running hub: the hub owns the supervisor, so it has to be the one to
+stop the child. If it's down, \`parachute start\` first.
 `;
 }
 
