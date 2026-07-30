@@ -39,7 +39,7 @@
  * missing/corrupt `dist/index.html` can't take the health check down with it.
  */
 
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 
@@ -200,12 +200,91 @@ function mimeFor(path: string): string | undefined {
   return undefined;
 }
 
+/**
+ * Re-root the bundle's ROOT-ABSOLUTE asset URLs onto the mount.
+ *
+ * ## Why this is needed at serve time
+ *
+ * A bundle built with an absolute Vite `base` emits `src="/assets/x.js"`. That
+ * is correct at the origin root and wrong at every mount: served at `/app`, the
+ * browser asks for `/assets/x.js`, which the mount never sees, and the page
+ * loads as an unstyled blank with two 404s. Found live on a self-hosted box
+ * right after `parachute install app` — the assets resolve perfectly at
+ * `/app/assets/...`, the HTML simply never asks for them there.
+ *
+ * Rewriting here rather than in the bundle is deliberate: ONE published package
+ * gets served at several mounts (`/app`, `/notes`, `/surface/<name>`, and the
+ * origin root), so no single build-time base is right for all of them. The
+ * mount is known only here. This is the "serve-time index.html rewrite" the
+ * app's own vite config names as the alternative to build-per-mount.
+ *
+ * Deliberately narrow: only `src=` / `href=` values beginning with a single
+ * `/`. Protocol-relative (`//cdn…`) and absolute (`https://…`) URLs are left
+ * alone, and nothing outside those two attributes is touched, so inline styles
+ * and scripts are untouched. A no-op when `mount` is empty.
+ */
+export function rewriteRootAbsoluteUrls(html: string, mount: string): string {
+  if (!mount) return html;
+  return html.replace(
+    /\b(src|href)="\/(?!\/)([^"]*)"/g,
+    (_m, attr: string, rest: string) => `${attr}="${mount}/${rest}"`,
+  );
+}
+
+/**
+ * Re-root a PWA manifest's `start_url` / `scope` onto the mount.
+ *
+ * A manifest declaring `scope: "/"` while the app is served at `/app` claims
+ * the WHOLE ORIGIN for the installed PWA — so an installed app would capture
+ * `/admin` and every vault URL alongside its own. `start_url: "/"` likewise
+ * launches the installed app at the hub root rather than at the app.
+ *
+ * Only these two keys are touched. Icon `src`s in the wild are already
+ * relative, and relative entries resolve against the manifest URL — which is
+ * now correctly under the mount — so rewriting them would double the prefix.
+ * Malformed JSON is returned untouched rather than throwing: a bad manifest
+ * should degrade the install prompt, not the page.
+ */
+export function rewriteManifestScope(json: string, mount: string): string {
+  if (!mount) return json;
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = JSON.parse(json) as Record<string, unknown>;
+  } catch {
+    return json;
+  }
+  if (typeof parsed !== "object" || parsed === null) return json;
+  for (const key of ["start_url", "scope"]) {
+    const v = parsed[key];
+    if (typeof v === "string" && v.startsWith("/") && !v.startsWith("//")) {
+      parsed[key] = v === "/" ? `${mount}/` : `${mount}${v}`;
+    }
+  }
+  return JSON.stringify(parsed);
+}
+
 export function notesFetch(dist: string, mount: string): (req: Request) => Response {
   const indexHtml = join(dist, "index.html");
-  const spaShell = () =>
-    new Response(Bun.file(indexHtml), {
+  // Read + rewrite once. The dist is immutable for this process's lifetime (an
+  // upgrade restarts the shim), so re-reading per request would buy nothing and
+  // cost a file read plus a regex pass on the hottest path.
+  let shellHtml: string | undefined;
+  const spaShell = () => {
+    if (shellHtml === undefined) {
+      try {
+        shellHtml = rewriteRootAbsoluteUrls(readFileSync(indexHtml, "utf8"), mount);
+      } catch {
+        // Missing/unreadable index.html — fall back to streaming the file so
+        // the existing 404/500 behaviour is unchanged rather than throwing here.
+        return new Response(Bun.file(indexHtml), {
+          headers: { "content-type": "text/html; charset=utf-8" },
+        });
+      }
+    }
+    return new Response(shellHtml, {
       headers: { "content-type": "text/html; charset=utf-8" },
     });
+  };
 
   return (req) => {
     const url = new URL(req.url);
@@ -232,6 +311,17 @@ export function notesFetch(dist: string, mount: string): (req: Request) => Respo
       return new Response("forbidden", { status: 403 });
     }
     if (existsSync(filePath)) {
+      // The manifest declares the installed PWA's scope; served under a mount
+      // it has to be re-rooted or the install claims the whole origin.
+      if (mount && pathname.endsWith(".webmanifest")) {
+        try {
+          return new Response(rewriteManifestScope(readFileSync(filePath, "utf8"), mount), {
+            headers: { "content-type": "application/manifest+json" },
+          });
+        } catch {
+          /* fall through to streaming it unmodified */
+        }
+      }
       const file = Bun.file(filePath);
       const mime = mimeFor(filePath);
       return new Response(file, mime ? { headers: { "content-type": mime } } : undefined);

@@ -92,16 +92,44 @@ describe("hubFetch routing", () => {
   // admin shell at `/admin`. The old discovery-page content moved into the
   // shell's Home overview. Only the bare `/` redirects — `/hub.html` still
   // serves the discovery page (static expose file + explicit-`.html` bookmarks).
-  test("/ redirects (302) to /admin (admin-shell IA)", async () => {
+  test("/ redirects (302) to /admin when the app ISN'T installed", async () => {
     const h = makeHarness();
     try {
       // No DB → exercises the redirect on the static-fallback path. The
       // redirect sits above the static hub.html serve, so it fires regardless
       // of whether a disk file exists.
       writeFileSync(join(h.dir, "hub.html"), "<html><body>hi</body></html>");
-      const res = await hubFetch(h.dir)(req("/"));
+      // manifestPath MUST be pinned to the harness. Omitting it falls back to
+      // the real ~/.parachute/services.json, so this test's result depended on
+      // whether the DEVELOPER had the app installed — it started failing the
+      // moment someone ran `parachute install app` on their own box, which is
+      // a machine state, not a regression.
+      writeFileSync(h.manifestPath, JSON.stringify({ services: [] }));
+      const res = await hubFetch(h.dir, { manifestPath: h.manifestPath })(req("/"));
       expect(res.status).toBe(302);
       expect(res.headers.get("location")).toBe("/admin");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("/ redirects (302) to /app once the app IS installed", async () => {
+    // The other half of the contract (hub#791). Asserting only the /admin case
+    // meant the default that actually ships to new boxes was untested.
+    const h = makeHarness();
+    try {
+      writeFileSync(join(h.dir, "hub.html"), "<html><body>hi</body></html>");
+      writeFileSync(
+        h.manifestPath,
+        JSON.stringify({
+          services: [
+            { name: "parachute-app", port: 1944, paths: ["/app"], health: "/app/health", version: "0.22.9" },
+          ],
+        }),
+      );
+      const res = await hubFetch(h.dir, { manifestPath: h.manifestPath })(req("/"));
+      expect(res.status).toBe(302);
+      expect(res.headers.get("location")).toBe("/app");
     } finally {
       h.cleanup();
     }
