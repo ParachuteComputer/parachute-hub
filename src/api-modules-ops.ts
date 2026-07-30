@@ -37,6 +37,7 @@ import { randomUUID } from "node:crypto";
 import { dirname } from "node:path";
 import { MissingDependencyError, type MissingDependencyWire } from "@openparachute/depcheck";
 import type { CuratedModuleShort } from "./api-modules.ts";
+import { unwireScribeAuth } from "./auto-wire.ts";
 import { isLinked as defaultIsLinked } from "./bun-link.ts";
 import { PARACHUTE_INSTALL_CHANNEL_ENV } from "./commands/install.ts";
 import { buildModuleSpawnRequest, reconcilePortToCanonical } from "./commands/serve-boot.ts";
@@ -1293,6 +1294,20 @@ export async function handleUninstall(
   const run = deps.run ?? defaultRun;
   const code = await run(["bun", "remove", "-g", spec.package]);
   log.push(`bun remove -g ${spec.package} exited ${code}`);
+
+  // 3b. Un-wire what INSTALL wired. Installing scribe writes SCRIBE_URL +
+  // SCRIBE_AUTH_TOKEN into vault's .env on the operator's behalf; leaving them
+  // behind points vault's transcription worker at a dead port and — because a
+  // stale SCRIBE_URL reads as "a scribe is configured" — suppresses vault's own
+  // fallback to the local provider (vault#640). Machine-written config gets
+  // machine-removed.
+  if (short === "scribe") {
+    const unwired = unwireScribeAuth({
+      configDir: deps.configDir,
+      log: (line) => log.push(line),
+    });
+    if (!unwired.changed) log.push("no scribe keys in vault .env — nothing to unwire");
+  }
 
   // 4. Refresh the on-disk well-known so the uninstalled module no
   // longer appears in the inspection artifact. The HTTP path rebuilds
