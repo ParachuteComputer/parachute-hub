@@ -10527,99 +10527,6 @@ describe("hub#689 — owner-on-own-vault verb selector + widening", () => {
   });
 
   // Submit: owner (first admin) + client requested unnamed vault:read + selects
-  // admin → minted vault:<picked>:admin. THE core bug fix.
-  test("owner selects admin on an unnamed vault:read → minted vault:work:admin", async () => {
-    const { db, cleanup } = await makeDb();
-    try {
-      const owner = await createUser(db, "owner", "pw"); // first admin
-      const session = createSession(db, { userId: owner.id });
-      const reg = registerClient(db, {
-        redirectUris: ["https://app.example/cb"],
-        status: "approved",
-      });
-      const { verifier, challenge } = makePkce();
-      const res = await submitConsent(
-        db,
-        session.id,
-        reg.client.clientId,
-        "vault:read",
-        challenge,
-        {
-          vault_pick: "work",
-          verb_select: "admin",
-        },
-      );
-      expect(res.status).toBe(302);
-      const code = new URL(res.headers.get("location") ?? "").searchParams.get("code");
-      expect(code).toBeTruthy();
-      const scope = await redeemScope(db, code ?? "", reg.client.clientId, verifier);
-      expect(scope).toBe("vault:work:admin");
-    } finally {
-      cleanup();
-    }
-  });
-
-  // Submit: owner selects write → vault:<picked>:write.
-  test("owner selects write on an unnamed vault:read → minted vault:work:write", async () => {
-    const { db, cleanup } = await makeDb();
-    try {
-      const owner = await createUser(db, "owner", "pw");
-      const session = createSession(db, { userId: owner.id });
-      const reg = registerClient(db, {
-        redirectUris: ["https://app.example/cb"],
-        status: "approved",
-      });
-      const { verifier, challenge } = makePkce();
-      const res = await submitConsent(
-        db,
-        session.id,
-        reg.client.clientId,
-        "vault:read",
-        challenge,
-        {
-          vault_pick: "work",
-          verb_select: "write",
-        },
-      );
-      expect(res.status).toBe(302);
-      const code = new URL(res.headers.get("location") ?? "").searchParams.get("code");
-      const scope = await redeemScope(db, code ?? "", reg.client.clientId, verifier);
-      expect(scope).toBe("vault:work:write");
-    } finally {
-      cleanup();
-    }
-  });
-
-  // Submit: owner DOWNGRADES — selects read on an unnamed vault:write → read.
-  test("owner selects read on an unnamed vault:write → minted vault:work:read (downgrade)", async () => {
-    const { db, cleanup } = await makeDb();
-    try {
-      const owner = await createUser(db, "owner", "pw");
-      const session = createSession(db, { userId: owner.id });
-      const reg = registerClient(db, {
-        redirectUris: ["https://app.example/cb"],
-        status: "approved",
-      });
-      const { verifier, challenge } = makePkce();
-      const res = await submitConsent(
-        db,
-        session.id,
-        reg.client.clientId,
-        "vault:write",
-        challenge,
-        {
-          vault_pick: "work",
-          verb_select: "read",
-        },
-      );
-      expect(res.status).toBe(302);
-      const code = new URL(res.headers.get("location") ?? "").searchParams.get("code");
-      const scope = await redeemScope(db, code ?? "", reg.client.clientId, verifier);
-      expect(scope).toBe("vault:work:read");
-    } finally {
-      cleanup();
-    }
-  });
 
   // SECURITY: a non-owner who holds only READ on the picked vault forges
   // verb_select=admin → the server re-derives ownership (no admin held) and
@@ -10723,6 +10630,100 @@ describe("hub#689 — owner-on-own-vault verb selector + widening", () => {
           vault_pick: "work",
           // no verb_select
         },
+      );
+      expect(res.status).toBe(302);
+      const code = new URL(res.headers.get("location") ?? "").searchParams.get("code");
+      const scope = await redeemScope(db, code ?? "", reg.client.clientId, verifier);
+      expect(scope).toBe("vault:work:read");
+    } finally {
+      cleanup();
+    }
+  });
+
+  // The selector is retired (2026-07-30). Its two jobs now live elsewhere, and
+  // these tests pin that the CAPABILITY survived the removal.
+
+  test("a forged verb_select is IGNORED, not honoured", async () => {
+    // The old block treated verb_select as an untrusted hint and re-derived
+    // ownership. Now it isn't read at all, which fails narrower: a stale or
+    // hand-crafted field mints what was requested rather than widening it.
+    const { db, cleanup } = await makeDb();
+    try {
+      const owner = await createUser(db, "owner", "pw");
+      const session = createSession(db, { userId: owner.id });
+      const reg = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        status: "approved",
+      });
+      const { verifier, challenge } = makePkce();
+      const res = await submitConsent(
+        db,
+        session.id,
+        reg.client.clientId,
+        "vault:read",
+        challenge,
+        {
+          vault_pick: "work",
+          verb_select: "admin",
+        },
+      );
+      expect(res.status).toBe(302);
+      const code = new URL(res.headers.get("location") ?? "").searchParams.get("code");
+      const scope = await redeemScope(db, code ?? "", reg.client.clientId, verifier);
+      // read was requested; read is what is minted. NOT admin.
+      expect(scope).toBe("vault:work:read");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("a multi-verb request survives instead of collapsing to admin", async () => {
+    // The capability gap this retirement exists to close: three requested verbs
+    // used to become `vault:work:admin` three times, so a read-only agent could
+    // not be expressed. Now each requested verb is preserved and named.
+    const { db, cleanup } = await makeDb();
+    try {
+      const owner = await createUser(db, "owner", "pw");
+      const session = createSession(db, { userId: owner.id });
+      const reg = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        status: "approved",
+      });
+      const { verifier, challenge } = makePkce();
+      const res = await submitConsent(
+        db,
+        session.id,
+        reg.client.clientId,
+        "vault:read vault:write",
+        challenge,
+        { vault_pick: "work" },
+      );
+      expect(res.status).toBe(302);
+      const code = new URL(res.headers.get("location") ?? "").searchParams.get("code");
+      const scope = await redeemScope(db, code ?? "", reg.client.clientId, verifier);
+      expect(scope.split(" ").sort()).toEqual(["vault:work:read", "vault:work:write"]);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("duplicate requested scopes are deduped in the minted set", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const owner = await createUser(db, "owner", "pw");
+      const session = createSession(db, { userId: owner.id });
+      const reg = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        status: "approved",
+      });
+      const { verifier, challenge } = makePkce();
+      const res = await submitConsent(
+        db,
+        session.id,
+        reg.client.clientId,
+        "vault:read vault:read",
+        challenge,
+        { vault_pick: "work" },
       );
       expect(res.status).toBe(302);
       const code = new URL(res.headers.get("location") ?? "").searchParams.get("code");

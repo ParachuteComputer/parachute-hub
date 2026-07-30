@@ -1488,6 +1488,18 @@ function issueAuthCodeRedirect(
   // everywhere by construction.
   const userIsAdmin = isFirstAdmin(db, userId);
   const cappedScopes = capScopesToUserAuthority(db, userId, scopes, { userIsAdmin });
+  // Dedup HERE, after the cap, at the single mint choke-point every path funnels
+  // through — so the auth-code row, the JWT `scope` claim, the refresh row, the
+  // token response, and the recorded grant all carry the same set.
+  //
+  // Three requested verbs that converge on one string used to stay three
+  // strings: nothing on this path deduped (map → map → filter). A token reading
+  // `vault:x:admin vault:x:admin vault:x:admin` is cosmetic, but it made the
+  // scope claim hard to read and trivially wrong-looking in a bug report.
+  //
+  // After the cap, never before: deduping the pre-cap set would change what the
+  // cap sees and could mask a dropped verb.
+  const dedupedScopes = [...new Set(cappedScopes)];
 
   // Drop-not-refuse UX, with one hard floor: if capping leaves an EMPTY set
   // (e.g. a non-owner requested ONLY `vault:<name>:admin`, which they don't
@@ -1506,13 +1518,13 @@ function issueAuthCodeRedirect(
 
   // Record the grant with the CAPPED scopes (single source of truth) so
   // skip-consent re-entry can never widen back to an un-held verb.
-  recordGrant(db, userId, params.clientId, cappedScopes, deps.now?.() ?? new Date());
+  recordGrant(db, userId, params.clientId, dedupedScopes, deps.now?.() ?? new Date());
 
   const code = issueAuthCode(db, {
     clientId: params.clientId,
     userId,
     redirectUri: params.redirectUri,
-    scopes: cappedScopes,
+    scopes: dedupedScopes,
     codeChallenge: params.codeChallenge,
     codeChallengeMethod: params.codeChallengeMethod,
     now: deps.now,
@@ -1905,44 +1917,27 @@ async function handleConsentSubmit(
         400,
       );
     }
-    // hub#689 — owner-on-own-vault verb widening. The consent screen offers
-    // owners a read/write/admin selector (pre-selected to admin) for an
-    // unnamed `vault:read`/`vault:write` request, so an owner whose AI client
-    // asked for read-only can grant the level it actually needs in-flow. The
-    // submitted `verb_select` is an UNTRUSTED hint — we re-derive ownership of
-    // the PICKED vault server-side here, and `capScopesToUserAuthority` (inside
-    // issueAuthCodeRedirect) is the backstop that drops any verb the user
-    // doesn't actually hold. This only ever rewrites the unnamed read/write
-    // verb(s) to the selected level on the picked vault; named scopes and every
-    // other scope are untouched. A forged `verb_select=admin` from a user who
-    // doesn't own the picked vault gets capped back to what they hold (or, for
-    // a vault outside a pinned user's assignment, never reaches here — the
-    // mismatch checks above already 400'd it).
-    const selectedVerb = String(form.get("verb_select") ?? "").trim();
-    if (selectedVerb === "read" || selectedVerb === "write" || selectedVerb === "admin") {
-      // Re-derive, server-side, whether THIS user owns (holds admin on) the
-      // PICKED vault. Owner === first admin (holds admin everywhere) OR an
-      // assigned user whose role grants admin on this vault. Never trust the
-      // client-submitted selector to establish authority.
-      const heldOnPicked = vaultVerbsForUserVault(db, session.userId, pickedVault);
-      const ownsPicked = userIsAdmin || (heldOnPicked?.includes("admin") ?? false);
-      if (ownsPicked) {
-        scopes = scopes.map((s) => {
-          const parts = s.split(":");
-          // Only widen the unnamed read/write verbs the selector was offered
-          // for — leave an unnamed `vault:admin`, named scopes, and non-vault
-          // scopes exactly as requested.
-          if (
-            parts.length === 2 &&
-            parts[0] === "vault" &&
-            (parts[1] === "read" || parts[1] === "write")
-          ) {
-            return `vault:${selectedVerb}`;
-          }
-          return s;
-        });
-      }
-    }
+    // hub#689's owner verb-widening selector is GONE (retired 2026-07-30).
+    //
+    // It was one radio applied to every requested verb, so a multi-verb request
+    // could not survive it: `vault:read vault:write vault:admin` with the
+    // selector's admin default rewrote to `vault:admin` three times. Observed
+    // live by an external team — a read-only research agent was simply not
+    // expressible, because both agents got admin or neither ran.
+    //
+    // Worse, it now CONTRADICTS per-scope consent (#804): a user unchecks
+    // write and admin, and this block rewrote their surviving `vault:read`
+    // back to admin. The checkboxes said read-only; the token said admin.
+    //
+    // Both of the selector's jobs are covered elsewhere now:
+    //   - downgrade → uncheck the scope row (per-scope consent)
+    //   - upgrade   → tick it in the additional-access list, which
+    //                 `grantableExtraScopes` builds through the SAME cap the
+    //                 mint uses, so it can't offer more than the user holds
+    //
+    // A stale `verb_select` from a cached consent page is now simply ignored,
+    // which fails NARROWER — it mints what was requested and checked. That's
+    // the safe direction for an unread field.
     scopes = narrowVaultScopes(scopes, pickedVault);
   }
 
