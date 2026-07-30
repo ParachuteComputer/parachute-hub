@@ -6,6 +6,39 @@ All notable changes to `@openparachute/hub` are documented here. The format foll
 >
 > This backfill covers the 0.6.x line only. Two pre-existing gaps remain undocumented and are **not** addressed here: the `0.5.13` stable itself (the file's newest entry is `0.5.13-rc.48`, never the stable) and the entire `0.5.14-rc` chain (rc.1–rc.21 on npm), which never promoted to a `0.5.14` stable — its work folded forward into 0.6.0.
 
+## [0.7.12-rc.2] - 2026-07-30
+
+**A read-only agent is expressible again (#808).** The owner verb selector was
+one radio applied to every requested verb, pre-selected to admin, so
+`vault:read vault:write vault:admin` could only ever mint admin three times.
+Reported from the field: an agent that should search a vault and never write to
+it could not be given a credential saying so. The selector also silently beat
+per-scope consent -- uncheck write and admin, and it rewrote the surviving
+`vault:read` back to admin. Retired; downgrade is now unchecking a row, upgrade
+is the additional-access list, and the minted set is deduped at the mint
+choke-point.
+
+**Per-scope consent actually works (#806).** Shipped broken in 0.7.12-rc.1: the
+checkbox posted the DISPLAY scope (`vault:unforced:read`) while the server
+filtered the WIRE scope (`vault:read`). Empty intersection, so every unnamed
+vault scope was silently dropped -- and since declining everything returns
+`access_denied`, a user who approved an ordinary consent was told they denied
+it. Anyone testing rc.1 would have hit this.
+
+**Scribe is retired (#809).** Its job moved into vault: whisper.cpp runs
+locally, installed and verified end-to-end by `transcription install`, and it's
+vault's default on any box without a reachable scribe. Graceful like notes -- an
+existing row keeps being supervised, only NEW installs are refused, because a
+box that transcribes today must not stop on upgrade.
+
+**The insufficient-scope challenge names the scope (#807).** Hub deliberately
+keeps `account:*` out of `scopes_supported` -- clients request the whole
+advertised catalog, and a note-taker was asking for permanent delete across
+every vault. RFC 8414 §2 and RFC 9728 §2 both permit that, and MCP's 2025-11-25
+spec says `scopes_supported` should be the MINIMAL set. The gap was that the
+403 buried the scope name in prose; it now rides in the RFC 6750 `scope`
+parameter, matching what `git-transport.ts` already emitted.
+
 ## [0.7.12-rc.1] - 2026-07-30
 
 **The app is served AT the root, not redirected to `/app` (#801).** hub#791 made
