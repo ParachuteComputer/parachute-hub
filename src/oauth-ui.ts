@@ -1082,14 +1082,25 @@ function renderScopeRow(scope: string): string {
     risk === "high"
       ? `<span class="scope-risk-note"><strong>Account-wide.</strong> This is not limited to one vault, and tokens this app creates keep working even after you disconnect it.</span>`
       : "";
+  // One checkbox per requested scope — granular consent. Pre-checked for
+  // ordinary scopes (the app asked for them and approving is the common case),
+  // but a `high` tier scope starts UNCHECKED: account-wide authority should be
+  // something a user reaches for deliberately, not something they inherit by
+  // clicking Approve on a list an app composed.
+  const preChecked = risk === "high" ? "" : " checked";
   return `<li class="${cls}">
-      <div class="scope-head">
-        <code class="scope-name">${escapeHtml(scope)}</code>
-        ${badge}
-      </div>
-      <span class="scope-label">${escapeHtml(explanation.label)}</span>
-      ${riskNote}
-      ${pendingNote}
+      <label class="scope-choice">
+        <input type="checkbox" name="granted_scope" value="${escapeHtml(scope)}"${preChecked} />
+        <span class="scope-choice-body">
+          <span class="scope-head">
+            <code class="scope-name">${escapeHtml(scope)}</code>
+            ${badge}
+          </span>
+          <span class="scope-label">${escapeHtml(explanation.label)}</span>
+          ${riskNote}
+          ${pendingNote}
+        </span>
+      </label>
     </li>`;
 }
 
@@ -1459,6 +1470,15 @@ const STYLES = `
     background: ${PALETTE.dangerSoft};
   }
   .risk-high .scope-name { color: ${PALETTE.danger}; }
+  .scope-choice {
+    display: flex;
+    gap: 0.6rem;
+    align-items: flex-start;
+    cursor: pointer;
+  }
+  .scope-choice input { margin-top: 0.3rem; flex: none; }
+  .scope-choice-body { display: block; }
+
   .extras {
     margin: 0 0 1.25rem;
     border: 1px solid ${PALETTE.borderLight};

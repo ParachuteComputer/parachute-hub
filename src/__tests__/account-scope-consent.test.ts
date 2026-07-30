@@ -135,3 +135,33 @@ describe("requestable is NOT the same as advertised", () => {
     expect(body.scopes_supported).not.toContain(ACCOUNT_SELF_READ_SCOPE);
   });
 });
+
+describe("per-scope consent (granular approval)", () => {
+  test("a high-risk scope renders UNCHECKED, ordinary ones pre-checked", async () => {
+    // Account-wide authority should be something a user reaches for
+    // deliberately, not something they inherit by clicking Approve on a list
+    // the app composed. Everything else is pre-checked because approving what
+    // was asked is the common case.
+    const { renderConsent } = await import("../oauth-ui.ts");
+    const html = renderConsent({
+      params: {
+        clientId: "c",
+        redirectUri: "https://app.example/cb",
+        responseType: "code",
+        scope: "vault:read account:self:admin",
+        codeChallenge: "x",
+        codeChallengeMethod: "S256",
+        state: null,
+        resource: null,
+      },
+      csrfToken: "t",
+      clientId: "c",
+      clientName: "App",
+      scopes: ["vault:read", "account:self:admin"],
+    });
+    expect(html).toMatch(/name="granted_scope" value="vault:read" checked/);
+    // The account row must NOT carry `checked`.
+    const acct = html.slice(html.indexOf('value="account:self:admin"'));
+    expect(acct.slice(0, 40)).not.toContain("checked");
+  });
+});

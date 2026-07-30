@@ -2465,7 +2465,12 @@ describe("handleToken — full OAuth dance", () => {
         client_id: reg.client.clientId,
         redirect_uri: "https://app.example/cb",
         response_type: "code",
-        scope: "",
+        // Non-vault scope on purpose: these tests exercise code REPLAY and PKCE
+        // mismatch, not scope handling. `scope: ""` used to work here, but an
+        // empty grant no longer mints a token (a zero-scope credential looks like
+        // success and can do nothing), and a vault scope would pull in the vault
+        // picker this test has no manifest for.
+        scope: "surface:read",
         code_challenge: challenge,
         code_challenge_method: "S256",
       });
@@ -2625,7 +2630,12 @@ describe("handleToken — full OAuth dance", () => {
         client_id: reg.client.clientId,
         redirect_uri: "https://app.example/cb",
         response_type: "code",
-        scope: "",
+        // Non-vault scope on purpose: these tests exercise code REPLAY and PKCE
+        // mismatch, not scope handling. `scope: ""` used to work here, but an
+        // empty grant no longer mints a token (a zero-scope credential looks like
+        // success and can do nothing), and a vault scope would pull in the vault
+        // picker this test has no manifest for.
+        scope: "surface:read",
         code_challenge: challenge,
         code_challenge_method: "S256",
       });
