@@ -17,7 +17,7 @@ import {
   resolveClientIp,
   stripHopByHopHeaders,
 } from "../hub-server.ts";
-import { setNotesRedirectDisabled, setRootMode } from "../hub-settings.ts";
+import { defaultRootModeFor, setNotesRedirectDisabled, setRootMode } from "../hub-settings.ts";
 import { clearNotesRedirectLogState } from "../notes-redirect.ts";
 import { mintOperatorToken } from "../operator-token.ts";
 import { pidPath } from "../process-state.ts";
@@ -113,41 +113,22 @@ describe("hubFetch routing", () => {
     }
   });
 
-  test("/ SERVES the app (not a redirect) once the app IS installed", async () => {
-    // Changed deliberately. hub#791 made this a 302 to `/app`, which asked a
-    // bundle built for the origin root to live at `/app` — every symptom that
-    // followed (blank page, PWA scope, CSS preload 404s, `/n/<id>` URLs missing
-    // their prefix) traces to that one mismatch. `root-serve.ts` says it plainly:
-    // "the app expects to be served at the origin root". So the default is now
-    // serve-app, and `/` is the app.
+  test("app installed → the DEFAULT root mode is serve-app", () => {
+    // Asserts the RESOLUTION, not the HTTP response.
     //
-    // An operator's stored row or env override still wins — only the DEFAULT
-    // layer changed — which is asserted separately in hub-settings tests.
-    const h = makeHarness();
-    try {
-      writeFileSync(join(h.dir, "hub.html"), "<html><body>hi</body></html>");
-      writeFileSync(
-        h.manifestPath,
-        JSON.stringify({
-          services: [
-            {
-              name: "parachute-app",
-              port: 1944,
-              paths: ["/app"],
-              health: "/app/health",
-              version: "0.22.9",
-            },
-          ],
-        }),
-      );
-      const res = await hubFetch(h.dir, { manifestPath: h.manifestPath })(req("/"));
-      // Not a 302. Either the app dist answers (200) or it's unresolvable in
-      // this harness and we fall back — what must NOT happen is redirecting to
-      // a mount the bundle can't live at.
-      expect(res.status).not.toBe(302);
-    } finally {
-      h.cleanup();
-    }
+    // The previous version of this test drove `hubFetch` and asserted the
+    // response wasn't a 302. That passed on a developer machine (where
+    // @openparachute/app is globally installed, so serve-app resolves a dist
+    // and serves it) and FAILED in CI (where it isn't, so serve-app falls back
+    // to redirect and returns 302). It blocked every release after #801 — the
+    // 0.7.12-rc.1 publish among them — while looking green locally.
+    //
+    // The dist-present branch is root-serve.ts's own concern and is covered
+    // there. What belongs here is the routing decision: given the app is
+    // installed, which mode does the default layer choose.
+    expect(defaultRootModeFor({ services: [{ name: "parachute-app" }] })).toBe("serve-app");
+    expect(defaultRootModeFor({ services: [{ name: "parachute-vault" }] })).toBe("redirect");
+    expect(defaultRootModeFor({ services: [] })).toBe("redirect");
   });
 
   test("/hub.html still serves the discovery page (no DB → static fallback)", async () => {
