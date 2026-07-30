@@ -36,6 +36,7 @@ import {
   statusHelp,
   stopHelp,
   topLevelHelp,
+  uninstallHelp,
   upgradeHelp,
 } from "./help.ts";
 import { HUB_SVC } from "./hub-control.ts";
@@ -484,6 +485,18 @@ async function main(argv: string[]): Promise<number> {
       const mod = await loadCommand("init", () => import("./commands/init.ts"));
       if (!mod) return 1;
       return await mod.init(initOpts);
+    }
+
+    case "uninstall": {
+      if (isHelpFlag(rest[0])) {
+        console.log(uninstallHelp());
+        return 0;
+      }
+      const yes = rest.includes("--yes") || rest.includes("-y");
+      const args = rest.filter((a) => a !== "--yes" && a !== "-y");
+      const mod = await loadCommand("uninstall", () => import("./commands/uninstall.ts"));
+      if (!mod) return 1;
+      return await mod.uninstall(args[0], { yes });
     }
 
     case "install": {
