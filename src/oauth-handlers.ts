@@ -1752,9 +1752,46 @@ async function handleConsentSubmit(
     .getAll("extra_scope")
     .map((v) => String(v))
     .filter((v) => v.length > 0);
+
+  // Per-scope consent (granular approval). The consent screen renders one
+  // checkbox per REQUESTED scope, so a user can approve the notes access an
+  // app needs while declining the account-wide admin it also asked for —
+  // rather than facing an all-or-nothing choice that pushes people to approve
+  // things they don't want.
+  //
+  // Squarely within OAuth: RFC 6749 §3.3 says the AS MAY issue a token with a
+  // narrower scope than requested, and the token response's `scope` tells the
+  // client what it actually got. Google, GitHub and Slack all ship this.
+  //
+  // Back-compatible by construction: `granted_scope` fields are only honoured
+  // when the form supplies at least one. A programmatic POST (or an older
+  // cached consent page) that omits them entirely keeps the previous
+  // approve-everything-requested behaviour, so no existing flow breaks.
+  const grantedFields = form
+    .getAll("granted_scope")
+    .map((v) => String(v))
+    .filter((v) => v.length > 0);
+  if (grantedFields.length > 0) {
+    const kept = new Set(grantedFields);
+    scopes = scopes.filter((sc) => kept.has(sc));
+  }
+
   if (extraScopes.length > 0) {
     scopes = [...new Set([...scopes, ...extraScopes])];
-    params.scope = scopes.join(" ");
+  }
+  params.scope = scopes.join(" ");
+
+  // Declining everything is a real choice, but it must not mint an empty
+  // token: a zero-scope credential looks like success and can do nothing,
+  // which is the failure mode this whole area keeps producing. Treat it as
+  // the denial it is, using the OAuth error the client already handles.
+  if (approve && scopes.length === 0) {
+    return oauthErrorRedirect(
+      params.redirectUri,
+      "access_denied",
+      "No permissions were granted — every requested scope was declined.",
+      params.state,
+    );
   }
   // Defense-in-depth (#96). The GET handler already rejects non-requestable
   // scopes before consent renders, but a hand-crafted POST could carry one
