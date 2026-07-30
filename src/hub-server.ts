@@ -2724,7 +2724,12 @@ export function hubFetch(
         // wizard funnel + pre-admin 503 above (a not-yet-set-up hub still lands
         // on setup, never a half-working app shell). Falls back to the redirect
         // when the app isn't installed (dist unresolvable), with a one-time log.
-        if (req.method === "GET" && resolveRootMode(getDb ? getDb() : null) === "serve-app") {
+        if (
+          req.method === "GET" &&
+          resolveRootMode(getDb ? getDb() : null, {
+            manifest: readManifestLenient(manifestPath),
+          }) === "serve-app"
+        ) {
           const dist = resolveAppDist();
           if (dist) {
             const served = serveAppAtRoot(dist, req, "/");
@@ -4383,7 +4388,11 @@ export function hubFetch(
       // non-HTML unclaimed request, or a reserved /api|/oauth|/.well-known
       // prefix. NO chrome injection — the app owns its whole page. In redirect
       // mode this branch is inert and the tail stays byte-identical to before.
-      if (req.method === "GET" && resolveRootMode(getDb ? getDb() : null) === "serve-app") {
+      if (
+        req.method === "GET" &&
+        resolveRootMode(getDb ? getDb() : null, { manifest: readManifestLenient(manifestPath) }) ===
+          "serve-app"
+      ) {
         const dist = resolveAppDist();
         if (dist) {
           const served = serveAppAtRoot(dist, req, pathname);
