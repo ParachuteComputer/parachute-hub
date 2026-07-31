@@ -765,6 +765,25 @@ export async function runInstall(
   deps: ApiModulesOpsDeps,
   channelOverride?: string,
 ): Promise<void> {
+  // Retired modules refuse HERE, at the choke-point every install path funnels
+  // through — not only at the two callers that happened to check.
+  //
+  // hub#809 retired scribe and gated the CLI (`install.ts`) and `handleInstall`.
+  // It missed `runInstall` itself, and two live surfaces call it directly: the
+  // browser wizard's vault-step scribe sub-form, and the done-screen install
+  // tile. So a retired module stayed installable through the wizard — which is
+  // the path a NEW operator actually takes, and "stop installing retired
+  // modules on new boxes" was the whole point.
+  //
+  // A test asserted the wizard's `bun add -g @openparachute/scribe` and passed
+  // on main after #809, which is how the hole stayed invisible: the retirement
+  // and the bypass were each internally consistent.
+  if (isRetiredShort(short)) {
+    const note =
+      retirementNote(short) ?? `The "${short}" module is retired and can no longer be installed.`;
+    failOperation(deps.registry ?? defaultRegistry, opId, "install", new Error(note));
+    return;
+  }
   const registry = deps.registry ?? defaultRegistry;
   const run = deps.run ?? defaultRun;
   // Channel resolution (hub#337) — precedence:
