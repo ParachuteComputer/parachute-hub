@@ -77,11 +77,6 @@ import {
   readOperatorTokenFile,
 } from "./operator-token.ts";
 import { isHttpsRequest } from "./request-protocol.ts";
-import {
-  decideLocalProvider,
-  platformLocalProvider,
-  readAvailableRamMib,
-} from "./scribe-config.ts";
 import { SEED_VERSION } from "./service-spec.ts";
 import { findService, readManifestLenient } from "./services-manifest.ts";
 import {
@@ -743,13 +738,6 @@ export interface RenderVaultStepProps {
     status: "pending" | "running" | "succeeded" | "failed";
     log: readonly string[];
     error?: string;
-    /**
-     * Optional scribe install op_id, threaded through so the success
-     * redirect carries `&op_scribe=<id>` and the done step picks up the
-     * in-flight scribe install via the existing per-tile op-poll
-     * mechanism (`buildInstallTiles` reads `op_<short>` query param).
-     */
-    scribeOpId?: string;
   };
 }
 
@@ -866,7 +854,6 @@ export function renderVaultStep(props: RenderVaultStepProps): string {
             <span class="vault-mode-desc">Only useful if you re-ran the wizard on an existing vault. Otherwise picks the same shape as merge.</span>
           </label>
         </fieldset>
-        ${renderScribeSubForm(cloudHost === true)}
         <button type="submit" class="btn btn-primary">Continue</button>
       </form>
       <script>
@@ -893,147 +880,6 @@ export function renderVaultStep(props: RenderVaultStepProps): string {
       </script>
     </div>`;
   return baseDocument("Set up your Parachute hub — vault", body);
-}
-
-/**
- * Scribe install sub-form embedded in the vault step (folded in
- * 2026-05-27 per Aaron's team-meeting directive: "folding the scribe
- * question into the vault step is a good idea"). Operator answers
- * scribe-related questions in the same form as vault name, the POST
- * handler kicks both installs in parallel, and the done screen polls
- * scribe's progress via the existing per-tile op-poll mechanism.
- *
- * The provider list adapts to the runtime context:
- *   - Cloud container (Render / Fly): local transcribers (parakeet,
- *     whisper) don't fit in 512MB + can't reach hardware acceleration.
- *     We hide them. Groq is the default (fast cloud Whisper, ~$0.04/hr
- *     of audio); OpenAI is the alternative.
- *   - Local (Mac / Linux): parakeet-mlx is the default on Mac (silicon
- *     MLX); falls back to onnx-asr cross-platform. Cloud providers
- *     stay available as choices for operators who'd rather pay than
- *     run local inference.
- *
- * The API key input shows conditionally — only when a cloud provider
- * is selected. It's a plain text input (no `type=password`) because
- * (a) the operator just pasted it from their provider's dashboard, and
- * (b) showing it lets them verify they pasted correctly before submit.
- * Mode-switching between providers via the radio is handled by an
- * inline `<script>` block — no SPA bundle, no module deps.
- *
- * The "Skip — no transcription" option is third and unchecked by
- * default. Most operators want voice transcription once they know
- * they can; the default-on posture matches the auto-transcribe default
- * flip that landed in vault#373.
- */
-function renderScribeSubForm(cloudHost: boolean): string {
-  const localBlock = cloudHost
-    ? ""
-    : `
-        <label class="scribe-provider-option">
-          <input type="radio" name="scribe_provider" value="local"${cloudHost ? "" : " checked"} data-needs-key="false" />
-          <span class="provider-name">Local <small>(Mac MLX or ONNX — no API key needed)</small></span>
-        </label>`;
-  const groqDefault = cloudHost ? " checked" : "";
-  // Cleanup providers that need a host-side binary or local server
-  // (claude-code → `claude` CLI + `claude setup-token`; ollama → local
-  // Ollama server) are hidden on cloud hosts (Render / Fly). The
-  // remaining cloud-friendly choices (anthropic / openai / groq /
-  // gemini) stay visible — they only need an API key.
-  const claudeCodeCleanupBlock = cloudHost
-    ? ""
-    : `
-              <label class="scribe-provider-option">
-                <input type="radio" name="scribe_cleanup_provider" value="claude-code" data-needs-key="false" />
-                <span class="provider-name">Claude Code <small>(subscription auth — run <code>claude setup-token</code> on this host)</small></span>
-              </label>`;
-  const ollamaCleanupBlock = cloudHost
-    ? ""
-    : `
-              <label class="scribe-provider-option">
-                <input type="radio" name="scribe_cleanup_provider" value="ollama" data-needs-key="false" />
-                <span class="provider-name">Ollama <small>(local LLM — requires Ollama running on this machine)</small></span>
-              </label>`;
-  return `
-        <details class="scribe-suboptions" open>
-          <summary class="cursor-pointer">
-            <span class="field-label">Enable voice transcription</span>
-            <span class="field-hint"> · Scribe installs alongside vault, transcribes audio attachments automatically</span>
-          </summary>
-          <div class="scribe-provider-block">
-            <p class="field-hint">Pick a transcription provider. You can change this later in <code>/admin/modules</code>.</p>
-            <div class="scribe-provider-list">
-              ${localBlock}
-              <label class="scribe-provider-option">
-                <input type="radio" name="scribe_provider" value="groq"${groqDefault} data-needs-key="true" />
-                <span class="provider-name">Groq <small>(~\$0.04/hr of audio, fast)</small></span>
-              </label>
-              <label class="scribe-provider-option">
-                <input type="radio" name="scribe_provider" value="openai" data-needs-key="true" />
-                <span class="provider-name">OpenAI Whisper <small>(~\$0.36/hr of audio)</small></span>
-              </label>
-              <label class="scribe-provider-option">
-                <input type="radio" name="scribe_provider" value="none" data-needs-key="false" />
-                <span class="provider-name">Skip — no transcription</span>
-              </label>
-            </div>
-            <label class="field scribe-api-key-field" data-shows-on="cloud">
-              <span class="field-label">API key</span>
-              <input type="password" name="scribe_api_key" autocomplete="off" placeholder="gsk_… or sk-…" />
-              <span class="field-hint">Pasted directly into <code>~/.parachute/scribe/config.json</code> on this hub (file mode 0o600). Leave blank to skip and set later in the admin SPA.</span>
-            </label>
-            <fieldset class="scribe-cleanup-block">
-              <legend class="field-label">Cleanup <small>(optional LLM polish pass on transcripts)</small></legend>
-              <p class="field-hint">After transcription, scribe can run a cleanup pass to fix punctuation, capitalization, and obvious transcription glitches. Pick a provider, or skip.</p>
-              <div class="scribe-provider-list">
-                <label class="scribe-provider-option">
-                  <input type="radio" name="scribe_cleanup_provider" value="none" checked data-needs-key="false" />
-                  <span class="provider-name">Skip cleanup <small>(default — raw transcripts only)</small></span>
-                </label>
-                ${claudeCodeCleanupBlock}
-                <label class="scribe-provider-option">
-                  <input type="radio" name="scribe_cleanup_provider" value="anthropic" data-needs-key="true" />
-                  <span class="provider-name">Anthropic API <small>(needs ANTHROPIC_API_KEY)</small></span>
-                </label>
-                ${ollamaCleanupBlock}
-                <label class="scribe-provider-option">
-                  <input type="radio" name="scribe_cleanup_provider" value="openai" data-needs-key="true" />
-                  <span class="provider-name">OpenAI <small>(needs OPENAI_API_KEY)</small></span>
-                </label>
-                <label class="scribe-provider-option">
-                  <input type="radio" name="scribe_cleanup_provider" value="groq" data-needs-key="true" />
-                  <span class="provider-name">Groq <small>(needs GROQ_API_KEY)</small></span>
-                </label>
-                <label class="scribe-provider-option">
-                  <input type="radio" name="scribe_cleanup_provider" value="gemini" data-needs-key="true" />
-                  <span class="provider-name">Google Gemini <small>(needs GOOGLE_API_KEY)</small></span>
-                </label>
-              </div>
-              <label class="field scribe-cleanup-api-key-field" style="display: none;">
-                <span class="field-label">Cleanup API key</span>
-                <input type="password" name="scribe_cleanup_api_key" autocomplete="off" placeholder="sk-ant-… or sk-… or gsk-…" />
-                <span class="field-hint">Pasted directly into <code>~/.parachute/scribe/config.json</code> on this hub (file mode 0o600). Leave blank to skip and paste later in the admin SPA.</span>
-              </label>
-            </fieldset>
-          </div>
-        </details>
-        <script>
-          (function () {
-            function toggle(radioName, keySelector) {
-              var radios = document.querySelectorAll('input[name="' + radioName + '"]');
-              var keyField = document.querySelector(keySelector);
-              function sync() {
-                var selected = document.querySelector('input[name="' + radioName + '"]:checked');
-                var needsKey = selected && selected.dataset.needsKey === "true";
-                if (keyField) keyField.style.display = needsKey ? "" : "none";
-              }
-              radios.forEach(function (r) { r.addEventListener("change", sync); });
-              sync();
-            }
-            toggle("scribe_provider", ".scribe-api-key-field");
-            toggle("scribe_cleanup_provider", ".scribe-cleanup-api-key-field");
-          })();
-        </script>
-  `;
 }
 
 function renderVaultOpStep(props: {
@@ -1074,7 +920,7 @@ function renderVaultOpStep(props: {
       </section>
       ${
         operation.status === "succeeded"
-          ? `<meta http-equiv="refresh" content="1; url=/admin/setup?just_finished=1${operation.scribeOpId ? `&op_scribe=${encodeURIComponent(operation.scribeOpId)}` : ""}" />`
+          ? `<meta http-equiv="refresh" content="1; url=/admin/setup?just_finished=1" />`
           : ""
       }
     </div>`;
@@ -1829,11 +1675,6 @@ export function handleSetupGet(req: Request, deps: SetupWizardDeps): Response {
       const registry = deps.registry;
       const op = registry?.get(opId);
       if (op) {
-        // Carry the scribe op_id forward via the query param so the
-        // op-poll page's success-redirect threads it into the done
-        // step's URL (where buildInstallTiles picks it up via the
-        // existing per-tile `op_scribe` mechanism).
-        const scribeOpIdParam = url.searchParams.get("op_scribe") ?? undefined;
         return new Response(
           renderVaultStep({
             csrfToken: csrf.token,
@@ -1843,7 +1684,6 @@ export function handleSetupGet(req: Request, deps: SetupWizardDeps): Response {
               status: op.status,
               log: op.log,
               ...(op.error !== undefined ? { error: op.error } : {}),
-              ...(scribeOpIdParam !== undefined ? { scribeOpId: scribeOpIdParam } : {}),
             },
           }),
           { status: 200, headers: extraHeaders },
@@ -2556,93 +2396,18 @@ export async function handleSetupVaultPost(req: Request, deps: SetupWizardDeps):
       "[setup-wizard] handleSetupVaultPost called with no operations registry — install will NOT run. Wire deps.registry in the dispatcher.",
     );
   }
-  // Scribe sub-form fold (2026-05-27). The vault step's form lets
-  // the operator answer "do you also want voice transcription?" +
-  // "do you also want LLM cleanup?" in the same submission. If they
-  // asked for either, we (a) write the chosen provider(s) + API
-  // key(s) to `~/.parachute/scribe/config.json` so scribe finds
-  // them on first boot, and (b) kick a scribe install op in
-  // parallel with vault install. The vault op-poll page threads the
-  // scribe op_id through its success-redirect so the done step can
-  // poll scribe progress via the existing per-tile mechanism.
-  //
-  // Cleanup-without-transcribe is a valid combo: the operator can
-  // hit scribe's REST cleanup endpoint directly with their own raw
-  // text. We install scribe + write the cleanup block in that case.
-  let scribeProvider = String(form.get("scribe_provider") ?? "").trim();
-  const scribeCleanupProvider = String(form.get("scribe_cleanup_provider") ?? "").trim();
-  // RAM/platform gate: if the operator asked for `local` on a box that can't
-  // run a local ASR model (no local backend for the platform, or too little
-  // RAM — the 1 GB droplet would OOM), redirect the choice to a cloud provider
-  // (groq) rather than recording a dead `local` string scribe can never honor.
-  // The reason is logged; the inline UI surfaces it via the scribe op poll.
-  if (scribeProvider === "local") {
-    const decision = decideLocalProvider(process.platform, readAvailableRamMib());
-    if (!decision.ok) {
-      console.warn(
-        `[setup-wizard] local transcription unavailable on this host: ${decision.reason} ` +
-          `Steering to "${decision.steerTo}".`,
-      );
-      scribeProvider = decision.steerTo ?? "groq";
-    }
-  }
-  const wantsTranscribe = scribeProvider !== "" && scribeProvider !== "none";
-  const wantsCleanup = scribeCleanupProvider !== "" && scribeCleanupProvider !== "none";
-  let scribeOpId: string | undefined;
-  if (wantsTranscribe || wantsCleanup) {
-    const scribeApiKey = String(form.get("scribe_api_key") ?? "").trim();
-    const scribeCleanupApiKey = String(form.get("scribe_cleanup_api_key") ?? "").trim();
-    // Write scribe config FIRST so scribe's first boot picks up the
-    // provider(s) + key(s) without a second config edit. We don't
-    // fail the wizard on a config-write error — log it + carry on;
-    // scribe will boot with defaults + the operator can fix via
-    // /scribe/admin.
-    try {
-      writeScribeConfigForWizard(deps.configDir, {
-        ...(wantsTranscribe
-          ? { transcribe: { provider: scribeProvider, apiKey: scribeApiKey } }
-          : {}),
-        ...(wantsCleanup
-          ? { cleanup: { provider: scribeCleanupProvider, apiKey: scribeCleanupApiKey } }
-          : {}),
-      });
-    } catch (err) {
-      console.warn(
-        `[setup-wizard] failed to write scribe config: ${err instanceof Error ? err.message : String(err)} — kicking install anyway, operator can configure later.`,
-      );
-    }
-    // Kick scribe install in parallel. Don't block on it; the done
-    // step's per-tile op-poll surfaces progress.
-    if (registry) {
-      const scribeSpec = specFor("scribe");
-      const scribeOp = registry.create("install", "scribe");
-      scribeOpId = scribeOp.id;
-      void runInstall(scribeOp.id, "scribe", scribeSpec, {
-        db: deps.db,
-        issuer: deps.issuer,
-        manifestPath: deps.manifestPath,
-        configDir: deps.configDir,
-        supervisor: deps.supervisor,
-        registry,
-        ...(deps.run ? { run: deps.run } : {}),
-        ...(deps.isLinked ? { isLinked: deps.isLinked } : {}),
-      }).catch((err) => {
-        const msg = err instanceof Error ? err.message : String(err);
-        registry.update(
-          scribeOp.id,
-          { status: "failed", error: msg },
-          `scribe install failed: ${msg}`,
-        );
-      });
-    }
-  }
-  const redirectUrl = scribeOpId
-    ? `/admin/setup?op=${encodeURIComponent(op.id)}&op_scribe=${encodeURIComponent(scribeOpId)}`
-    : `/admin/setup?op=${encodeURIComponent(op.id)}`;
+  // The scribe sub-form is gone (scribe retired, hub#809). Transcription is the
+  // vault's now: `parachute-vault transcription install` sizes a model to the
+  // host, downloads it, and verifies it transcribes. The browser-native place
+  // to do that is the vault admin's Transcription page, which the done screen
+  // already links to — a hub-side control here would be a second, worse UI for
+  // a vault-owned operation, and it would have to run a multi-hundred-megabyte
+  // download inside the vault-install op, turning a 10-60s poll page into a
+  // many-minute one where a transcription failure muddies the vault signal.
+  const redirectUrl = `/admin/setup?op=${encodeURIComponent(op.id)}`;
   if (form.isJson) {
     return jsonOkResponse({
       op_id: op.id,
-      ...(scribeOpId ? { scribe_op_id: scribeOpId } : {}),
       step: "vault",
       mode: rawMode,
     });
@@ -2736,129 +2501,6 @@ export async function postVaultImportImpl(args: {
     }
   }
   throw lastErr ?? new Error("vault import: exhausted retries");
-}
-
-/**
- * Write a minimal scribe config that selects the operator's chosen
- * transcribe + cleanup providers + API keys (when applicable).
- * Idempotent: reads any existing config, merges, writes back. File
- * mode 0o600 — the config holds API keys, owner-only.
- *
- * Lives in setup-wizard.ts (not scribe's own config-write.ts) because
- * (a) it's a one-time wizard write — the SPA's PUT /.parachute/config
- * surface is the canonical post-setup path, and (b) hub doesn't
- * import scribe-internal modules. The shape of `scribe-config.json`
- * is documented in parachute-scribe/src/config.ts; the fields we set
- * (`transcribe.provider`, `transcribeProviders.<name>.apiKey`,
- * `cleanup.provider`, `cleanup.default`, `cleanupProviders.<name>.apiKey`)
- * are stable. Cleanup block extended 2026-05-27 — scribe boots with
- * `cleanup: none` otherwise, so first-install operators got "raw
- * transcript only" until they hand-edited the config.
- *
- * Signature changed 2026-05-27 from `(configDir, provider, apiKey)` to
- * the options-object shape so the caller can express "cleanup only,
- * no transcribe" without smuggling sentinel strings.
- */
-interface WizardScribeConfig {
-  /** Set when the operator chose a transcription provider (anything other than "none"). */
-  transcribe?: { provider: string; apiKey: string };
-  /** Set when the operator chose a cleanup provider (anything other than "none"). */
-  cleanup?: { provider: string; apiKey: string };
-  /**
-   * Platform override for resolving the `local` choice (test seam). Defaults to
-   * the real host platform. Mac → parakeet-mlx, Linux → onnx-asr.
-   */
-  platform?: NodeJS.Platform;
-}
-function writeScribeConfigForWizard(configDir: string, config: WizardScribeConfig): void {
-  const update: Record<string, unknown> = {};
-  const platform = config.platform ?? process.platform;
-
-  if (config.transcribe) {
-    const { provider, apiKey } = config.transcribe;
-    // For `local`, resolve to the CORRECT platform backend — parakeet-mlx on
-    // macOS, onnx-asr on Linux. (Was hardcoded to parakeet-mlx, which silently
-    // fails on every Linux box.) No key needed for local. The caller's
-    // RAM/platform gate is the single place that decides "local isn't possible
-    // here" and should have steered to cloud before reaching this writer — but
-    // if that gate is ever bypassed and the platform has no local backend, we
-    // write "none" (transcription off) rather than a dead provider string, so
-    // this writer can never record something that silently fails.
-    if (provider === "local") {
-      const resolved = platformLocalProvider(platform);
-      update.transcribe = { provider: resolved ?? "none" };
-    } else {
-      // Cloud providers need a key. Empty key → just set provider;
-      // the operator can paste the key later via /scribe/admin
-      // without a restart (per provider-config.ts's per-request
-      // precedence).
-      update.transcribe = { provider };
-      if (apiKey !== "") {
-        update.transcribeProviders = { [provider]: { apiKey } };
-      }
-    }
-  }
-
-  if (config.cleanup) {
-    const { provider, apiKey } = config.cleanup;
-    // Always set `cleanup.default: true` when the operator opted in to
-    // cleanup — they want polished output as the default; the per-
-    // request `cleanup` flag on each transcribe request can still
-    // opt out individually.
-    update.cleanup = { provider, default: true };
-    // `claude-code` (host CLI auth) and `ollama` (local server)
-    // don't need an API key. Everything else (anthropic, openai,
-    // groq, gemini) takes a key. Empty key → just set the provider;
-    // the operator can paste the key later via the admin SPA without
-    // a restart.
-    const needsKey = provider !== "claude-code" && provider !== "ollama";
-    if (needsKey && apiKey !== "") {
-      update.cleanupProviders = { [provider]: { apiKey } };
-    }
-  }
-
-  if (Object.keys(update).length === 0) return;
-  persistScribeConfig(configDir, update);
-}
-
-/**
- * Merge-write to scribe's config file at `<configDir>/scribe/config.json`.
- * Reads existing JSON when present, deep-merges `update`, writes back at
- * mode 0o600. Creates the parent dir if missing.
- */
-function persistScribeConfig(configDir: string, update: Record<string, unknown>): void {
-  const scribeDir = join(configDir, "scribe");
-  const configPath = join(scribeDir, "config.json");
-  mkdirSync(scribeDir, { recursive: true });
-  let existing: Record<string, unknown> = {};
-  if (existsSync(configPath)) {
-    try {
-      existing = JSON.parse(readFileSync(configPath, "utf8")) as Record<string, unknown>;
-    } catch {
-      // Malformed existing config — treat as empty + overwrite.
-      existing = {};
-    }
-  }
-  // Shallow merge at top level, deep merge for the sub-blocks we touch
-  // (transcribe + transcribeProviders + cleanup + cleanupProviders). The
-  // merge logic is generic and handles any nested object — it doesn't
-  // hard-code the block names.
-  const merged: Record<string, unknown> = { ...existing };
-  for (const [key, value] of Object.entries(update)) {
-    if (
-      typeof value === "object" &&
-      value !== null &&
-      !Array.isArray(value) &&
-      typeof merged[key] === "object" &&
-      merged[key] !== null &&
-      !Array.isArray(merged[key])
-    ) {
-      merged[key] = { ...(merged[key] as Record<string, unknown>), ...value };
-    } else {
-      merged[key] = value;
-    }
-  }
-  writeFileSync(configPath, `${JSON.stringify(merged, null, 2)}\n`, { mode: 0o600 });
 }
 
 /**
