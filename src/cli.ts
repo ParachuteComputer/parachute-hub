@@ -121,8 +121,8 @@ function extractTag(args: string[]): {
 }
 
 /**
- * Generic `--name=<value>` / `--name <value>` extractor used for the scribe
- * install flags. Returns the matched value and argv with the flag stripped, or
+ * Generic `--name=<value>` / `--name <value>` extractor (used by `--channel`).
+ * Returns the matched value and argv with the flag stripped, or
  * an error when the flag is present without a value.
  */
 function extractNamedFlag(
@@ -524,19 +524,9 @@ async function main(argv: string[]): Promise<number> {
         );
         return 1;
       }
-      const providerExtract = extractNamedFlag(channelExtract.rest, "--scribe-provider");
-      if (providerExtract.error) {
-        console.error(`parachute install: ${providerExtract.error}`);
-        return 1;
-      }
-      const keyExtract = extractNamedFlag(providerExtract.rest, "--scribe-key");
-      if (keyExtract.error) {
-        console.error(`parachute install: ${keyExtract.error}`);
-        return 1;
-      }
-      const noStart = keyExtract.rest.includes("--no-start");
-      const interactive = keyExtract.rest.includes("--interactive");
-      const installArgs = keyExtract.rest.filter(
+      const noStart = channelExtract.rest.includes("--no-start");
+      const interactive = channelExtract.rest.includes("--interactive");
+      const installArgs = channelExtract.rest.filter(
         (a) => a !== "--no-start" && a !== "--interactive",
       );
       const service = installArgs[0];
@@ -544,9 +534,7 @@ async function main(argv: string[]): Promise<number> {
         console.error(
           "usage: parachute install <service|all> [--channel rc|latest] [--tag <name>] [--no-start] [--interactive]",
         );
-        console.error(
-          "       parachute install scribe [--scribe-provider <name>] [--scribe-key <key>]",
-        );
+        console.error();
         console.error(`services: ${knownServices().join(", ")}`);
         return 1;
       }
@@ -557,8 +545,6 @@ async function main(argv: string[]): Promise<number> {
       }
       if (noStart) installOpts.noStart = true;
       if (interactive) installOpts.interactive = true;
-      if (providerExtract.value) installOpts.scribeProvider = providerExtract.value;
-      if (keyExtract.value) installOpts.scribeKey = keyExtract.value;
       const mod = await loadCommand("install", () => import("./commands/install.ts"));
       if (!mod) return 1;
       if (service === "all") {

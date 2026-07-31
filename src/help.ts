@@ -79,7 +79,6 @@ export function installHelp(): string {
 Usage:
   parachute install <service> [--channel rc|latest] [--tag <name>] [--no-start] [--interactive]
   parachute install all       [--channel rc|latest] [--tag <name>] [--no-start]
-  parachute install scribe    [--scribe-provider <name>] [--scribe-key <key>]
 
 Services:
   ${knownServices().join(", ")}
@@ -96,7 +95,6 @@ What it does:
      (services follow a 4-tier resolvePort ladder; services.json wins).
   4. verify the service registered itself in ~/.parachute/services.json
   5. for scribe in a TTY: prompt for transcription provider + API key
-     (or take \`--scribe-provider\` / \`--scribe-key\`)
   6. start the service in the background (idempotent — no-op if already up)
 
 Flags:
@@ -120,10 +118,8 @@ Flags:
                             crash-loop, #580) — prefer the light default + manage
                             from the admin UI unless you specifically want the
                             old interview.
-  --scribe-provider <name>  set scribe's transcription provider non-interactively.
                             Known: parakeet-mlx (default), onnx-asr, whisper, groq, openai.
                             Skips the interactive picker.
-  --scribe-key <key>        set the API key for the chosen provider non-interactively.
                             Stored in ~/.parachute/scribe/.env. Only meaningful for
                             cloud providers (groq → GROQ_API_KEY, openai → OPENAI_API_KEY).
 
@@ -141,7 +137,6 @@ Examples:
   parachute install surface                                 # installs surface (auto-bootstraps Notes)
   parachute install notes                                   # legacy notes-daemon — deprecated; use \`parachute install surface\` instead
   parachute install scribe                                  # installs, prompts for provider, starts scribe
-  parachute install scribe --scribe-provider groq --scribe-key gsk_…
                                                             # non-interactive scribe setup
   parachute install vault --channel rc                      # pin to rc dist-tag
   PARACHUTE_INSTALL_CHANNEL=rc parachute install vault      # same, env-driven
