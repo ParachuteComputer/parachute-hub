@@ -596,7 +596,12 @@ describe("runCliWizard", () => {
     expect(transcribeCmds).toEqual([]);
   });
 
-  test("transcription step (cloud) drives the install one-shot via the injected runner", async () => {
+  test("a legacy cloud mode now drives the VAULT install, not scribe", async () => {
+    // `--transcribe-mode=groq` used to shell `parachute install scribe
+    // --scribe-provider groq`. Scribe is retired (hub#809), so that command can
+    // only fail. The historical spellings still parse — an existing script
+    // shouldn't error — and now mean "set up local transcription", which is the
+    // only thing left for them to mean.
     const { fetchImpl } = makeFakeHub();
     const transcribeCmds: string[][] = [];
     const code = await runCliWizard({
@@ -618,15 +623,7 @@ describe("runCliWizard", () => {
       },
     });
     expect(code).toBe(0);
-    expect(transcribeCmds[0]).toEqual([
-      "parachute",
-      "install",
-      "scribe",
-      "--scribe-provider",
-      "groq",
-      "--scribe-key",
-      "gsk_wired",
-    ]);
+    expect(transcribeCmds[0]).toEqual(["parachute-vault", "transcription", "install", "--yes"]);
   });
 
   test("transcription step is skipped when configDir is absent", async () => {
@@ -719,8 +716,8 @@ describe("runCliWizard", () => {
         },
       });
       expect(code).toBe(0); // completed, did NOT throw
-      expect(ran).toBe(false); // none → no scribe install
-      expect(logs.join("\n")).toContain("Transcription off");
+      expect(ran).toBe(false); // headless with no flag → nothing installed
+      expect(logs.join("\n")).toContain("Skipped.");
       // Full flow still walked account → vault → expose.
       expect(state.posted.map((p) => p.path)).toEqual([
         "/admin/setup/account",
