@@ -6,6 +6,34 @@ All notable changes to `@openparachute/hub` are documented here. The format foll
 >
 > This backfill covers the 0.6.x line only. Two pre-existing gaps remain undocumented and are **not** addressed here: the `0.5.13` stable itself (the file's newest entry is `0.5.13-rc.48`, never the stable) and the entire `0.5.14-rc` chain (rc.1–rc.21 on npm), which never promoted to a `0.5.14` stable — its work folded forward into 0.6.0.
 
+## [0.7.12-rc.3] - 2026-07-30
+
+**The scribe retirement was bypassable, and is now closed (#811).** hub#809
+gated the CLI and `handleInstall` but missed `runInstall` -- the function both
+of them call -- and two live surfaces call it directly: the browser wizard's
+scribe sub-form and the done-screen install tile. So a retired module stayed
+installable through the wizard, which is the path a NEW operator actually
+takes, and "stop installing retired modules on new boxes" was the whole point.
+A test asserted the wizard's `bun add -g @openparachute/scribe` and PASSED
+after #809 -- the retirement and the bypass were each internally consistent.
+The refusal now lives where every install path converges.
+
+**`parachute init` sets up transcription, through the vault (#812).** The
+wizard's transcription step asked, then shelled `parachute install scribe` --
+which #809 refuses -- so every non-`none` answer dead-ended in "scribe install
+returned 1". It now runs `parachute-vault transcription install`, which sizes a
+model to the host, downloads it, and verifies it can transcribe before claiming
+success. Headless with no flag still skips: a blank answer from a non-TTY means
+nobody is there, and an unprompted yes downloads hundreds of megabytes onto a
+box whose operator never saw the question.
+
+**The install-time scribe machinery is deleted (#813).** The provider picker,
+the `--scribe-provider` / `--scribe-key` flags, the setup prompts, and
+`autoWireScribeAuth` -- all unreachable once install refuses. `selfHealScribeAuth`
+and `unwireScribeAuth` deliberately stay: the first keeps an EXISTING supervised
+scribe's auth aligned on every boot, the second stops a removed scribe leaving
+vault pointed at a dead port.
+
 ## [0.7.12-rc.2] - 2026-07-30
 
 **A read-only agent is expressible again (#808).** The owner verb selector was
