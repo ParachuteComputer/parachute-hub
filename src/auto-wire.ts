@@ -187,84 +187,20 @@ export function unwireScribeAuth(opts: {
   return { removed, changed: true };
 }
 
-export async function autoWireScribeAuth(opts: AutoWireOpts): Promise<AutoWireResult> {
-  const random = opts.randomToken ?? defaultRandomToken;
-  const log = opts.log ?? (() => {});
-  const alive = opts.alive ?? defaultAlive;
-  const restartService =
-    opts.restartService ??
-    ((short: string) =>
-      lifecycleRestart(short, {
-        configDir: opts.configDir,
-        log,
-      }));
-
-  const vaultEnvPath = join(opts.configDir, "vault", ".env");
-  const scribeConfigPath = join(opts.configDir, "scribe", "config.json");
-
-  const parsed = parseEnvFile(vaultEnvPath);
-  let lines = parsed.lines;
-  let didWriteEnv = false;
-
-  const existingToken = parsed.values[SCRIBE_AUTH_ENV_KEY];
-  const tokenAlreadySet = existingToken !== undefined && existingToken.length > 0;
-  const token = tokenAlreadySet ? existingToken : random();
-  if (!tokenAlreadySet) {
-    lines = upsertEnvLine(lines, SCRIBE_AUTH_ENV_KEY, token);
-    didWriteEnv = true;
-  }
-
-  const existingUrl = parsed.values[SCRIBE_URL_ENV_KEY];
-  const urlAlreadySet = existingUrl !== undefined && existingUrl.length > 0;
-  const scribeUrl = urlAlreadySet ? existingUrl : defaultScribeUrl();
-  if (!urlAlreadySet) {
-    lines = upsertEnvLine(lines, SCRIBE_URL_ENV_KEY, scribeUrl);
-    didWriteEnv = true;
-  }
-
-  if (didWriteEnv) writeEnvFile(vaultEnvPath, lines);
-  writeScribeConfig(scribeConfigPath, token);
-
-  if (tokenAlreadySet && urlAlreadySet) {
-    log(
-      `${SCRIBE_AUTH_ENV_KEY} and ${SCRIBE_URL_ENV_KEY} already set in vault .env — preserved. Synced scribe config.json.`,
-    );
-  } else if (tokenAlreadySet) {
-    log(
-      `${SCRIBE_AUTH_ENV_KEY} already set in vault .env — preserved. Wired ${SCRIBE_URL_ENV_KEY}=${scribeUrl}. Synced scribe config.json.`,
-    );
-  } else {
-    log(
-      `Auto-wired shared secret + ${SCRIBE_URL_ENV_KEY} for vault → scribe transcription. Stored in ${vaultEnvPath} and ${scribeConfigPath}.`,
-    );
-  }
-
-  // Vault caches .env on process start; without a restart the worker keeps
-  // running with stale (or absent) SCRIBE_URL/SCRIBE_AUTH_TOKEN and voice
-  // memos never transcribe. Mirrors the auto-restart-on-expose pattern from
-  // PR #39 — skip silently if vault isn't running.
-  let restartedVault = false;
-  if (didWriteEnv && processState("vault", opts.configDir, alive).status === "running") {
-    log("Restarting vault to pick up new transcription wiring…");
-    const code = await restartService("vault");
-    if (code === 0) {
-      restartedVault = true;
-    } else {
-      log(
-        "⚠ vault restart failed. Run manually once the issue is resolved: parachute restart vault",
-      );
-    }
-  }
-
-  return {
-    generated: !tokenAlreadySet,
-    token,
-    scribeUrl,
-    vaultEnvPath,
-    scribeConfigPath,
-    restartedVault,
-  };
-}
+// `autoWireScribeAuth` lived here until scribe's retirement (hub#809). It minted
+// a shared secret at INSTALL time and wrote it to both sides. With every install
+// path now refusing scribe, it had no callers left.
+//
+// Deliberately NOT deleted alongside it:
+//   - `selfHealScribeAuth` runs on every `parachute serve` boot and keeps an
+//     EXISTING supervised scribe's auth aligned with vault's .env. That's the
+//     constituency graceful retirement exists to protect — a box transcribing
+//     today must keep transcribing, with auth intact rather than drifting open.
+//   - `unwireScribeAuth` runs on uninstall, and is what stops a removed scribe
+//     leaving vault pointed at a dead :1943 (which would also suppress vault's
+//     whisper-cpp fallback).
+//
+// What's gone is the token-MINTING write path for a module we no longer install.
 
 export interface SelfHealScribeAuthResult {
   /** True when scribe's config.json was written this call (was missing/out-of-sync). */

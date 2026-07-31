@@ -2,7 +2,6 @@ import type { Database } from "bun:sqlite";
 import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { createConnection } from "node:net";
 import { dirname, join } from "node:path";
-import { autoWireScribeAuth } from "../auto-wire.ts";
 import { bunGlobalPrefixes, isLinked as defaultIsLinkedShared } from "../bun-link.ts";
 import { CONFIG_DIR, SERVICES_MANIFEST_PATH } from "../config.ts";
 import { type ExposeState, readExposeState } from "../expose-state.ts";
@@ -58,11 +57,6 @@ import { type OwnerProbeFn, defaultOwnerOfPid } from "../supervisor.ts";
 import { WELL_KNOWN_PATH } from "../well-known.ts";
 import { type LifecycleOpts, start as lifecycleStart } from "./lifecycle.ts";
 import { migrateNotice } from "./migrate.ts";
-import {
-  type InteractiveAvailability,
-  type SetupScribeProviderOpts,
-  setupScribeProvider,
-} from "./scribe-provider-interactive.ts";
 
 export type Runner = (cmd: readonly string[]) => Promise<number>;
 
@@ -232,11 +226,6 @@ export interface InstallOpts {
    */
   envOverride?: NodeJS.ProcessEnv;
   /**
-   * Override the random-token source for the vault↔scribe auto-wire.
-   * Tests pass a deterministic string; production uses crypto.randomBytes.
-   */
-  randomToken?: () => string;
-  /**
    * Probe whether `pkg` is present at bun's global node_modules (returns the
    * package.json path on hit, null on miss). Used after `bun add -g` returns
    * non-zero to distinguish a real failure from bun 1.2.x's noisy
@@ -342,23 +331,6 @@ export interface InstallOpts {
    * crash-looping the supervisor's own child (the #580 field signature).
    */
   disableStaleModuleUnits?: (opts?: DisableStaleModuleUnitsOpts) => DisableStaleModuleUnitsResult;
-  /**
-   * `parachute install scribe` only: pre-pick the transcription provider so
-   * the prompt doesn't fire. Validated against scribe's known providers — an
-   * unknown name is logged and the config is left at default.
-   */
-  scribeProvider?: string;
-  /**
-   * `parachute install scribe` only: pre-supply the API key for the chosen
-   * provider. Ignored for local providers (parakeet-mlx / onnx-asr / whisper).
-   */
-  scribeKey?: string;
-  /**
-   * Test seam for the scribe provider picker. Tests pass `{ kind: "available",
-   * prompt: ... }` to drive the prompt without a real TTY; production lets
-   * the default sense `process.stdin.isTTY`.
-   */
-  scribeAvailability?: InteractiveAvailability;
   /**
    * Test seam for the canonical-slot TCP probe. Production probes
    * `127.0.0.1:<port>` with a short timeout; tests inject deterministic
@@ -1328,33 +1300,12 @@ export async function install(input: string, opts: InstallOpts = {}): Promise<nu
     }
   }
 
-  // Auto-wire the vault↔scribe shared secret + SCRIBE_URL when both services
-  // end up installed. Fires from either install order (scribe then vault, or
-  // vault then scribe). Idempotent — preserves any pre-existing values in
-  // vault .env. Restarts vault if it's running so the worker re-reads .env.
-  if (spec.manifestName === "parachute-vault" || spec.manifestName === "parachute-scribe") {
-    const vaultPresent = !!findService("parachute-vault", manifestPath);
-    const scribePresent = !!findService("parachute-scribe", manifestPath);
-    if (vaultPresent && scribePresent) {
-      const autoWireOpts: Parameters<typeof autoWireScribeAuth>[0] = { configDir, log };
-      if (opts.randomToken) autoWireOpts.randomToken = opts.randomToken;
-      await autoWireScribeAuth(autoWireOpts);
-    }
-  }
-
-  // Scribe-only: prompt for transcription provider (or accept --scribe-provider
-  // / --scribe-key). Has to land before auto-start so the very first scribe
-  // boot reads the right provider — and inside the prompt we restart scribe
-  // ourselves if it was already running, mirroring the auto-wire pattern.
-  // Failure here doesn't fail the install: a flaky restart shouldn't undo a
-  // successful `bun add`.
-  if (short === "scribe") {
-    const setupOpts: SetupScribeProviderOpts = { configDir, log };
-    if (opts.scribeProvider) setupOpts.preselectProvider = opts.scribeProvider;
-    if (opts.scribeKey) setupOpts.preselectKey = opts.scribeKey;
-    if (opts.scribeAvailability) setupOpts.availability = opts.scribeAvailability;
-    await setupScribeProvider(setupOpts);
-  }
+  // The vault↔scribe auto-wire is gone with scribe's retirement (hub#809).
+  // `selfHealScribeAuth` still runs on every `parachute serve` boot, which is
+  // what keeps an EXISTING supervised scribe's auth aligned — the constituency
+  // the graceful retirement exists to protect. `unwireScribeAuth` still runs on
+  // uninstall. What's removed is the token-MINTING write path for a module we
+  // no longer install.
 
   const notice = migrateNotice(configDir, now());
   if (notice) log(notice);

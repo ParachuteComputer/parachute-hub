@@ -1,12 +1,6 @@
 import { createInterface } from "node:readline/promises";
 import { CONFIG_DIR, SERVICES_MANIFEST_PATH } from "../config.ts";
 import {
-  SCRIBE_PROVIDERS,
-  type ScribeProviderKey,
-  apiKeyEnvFor,
-  isKnownScribeProvider,
-} from "../scribe-config.ts";
-import {
   FIRST_PARTY_FALLBACKS,
   KNOWN_MODULES,
   type ServiceSpec,
@@ -18,7 +12,15 @@ import {
 import type { ServiceEntry } from "../services-manifest.ts";
 import { findService } from "../services-manifest.ts";
 import { type InstallOpts, install } from "./install.ts";
-import type { InteractiveAvailability } from "./scribe-provider-interactive.ts";
+/**
+ * Whether an interactive prompt is possible. Lived in
+ * `scribe-provider-interactive.ts` until scribe's retirement (hub#809) deleted
+ * that module; it's a generic prompt seam with nothing scribe-specific about
+ * it, so it moves here — its only remaining consumer.
+ */
+export type InteractiveAvailability =
+  | { kind: "available"; prompt: (question: string) => Promise<string> }
+  | { kind: "not-tty" };
 
 /**
  * `parachute setup` — unified, prompt-up-front walk-through that orchestrates
@@ -82,11 +84,6 @@ interface ServiceChoice {
 
 interface VaultAnswer {
   vaultName: string;
-}
-
-interface ScribeAnswer {
-  provider: ScribeProviderKey;
-  apiKey: string | undefined;
 }
 
 // Reject leading and trailing hyphens. The previous form `[a-z0-9][a-z0-9-]*`
@@ -189,7 +186,6 @@ const BLURBS: Record<string, string> = {
   // notes is `deprecated` (not offered on a fresh setup) — this blurb only
   // renders if a legacy install surfaces it in the survey.
   notes: "Notes PWA — web/mobile UI on top of vault (notes-daemon; superseded by `surface`)",
-  scribe: "audio transcription for dictation + recordings",
 };
 
 function blurbFor(choice: ServiceChoice): string {
@@ -253,49 +249,6 @@ async function askVaultName(
       `  invalid name "${candidate}" — must start with [a-z0-9] and contain only [a-z0-9-]. Try again.`,
     );
   }
-}
-
-async function askScribeProvider(
-  prompt: (q: string) => Promise<string>,
-  log: (line: string) => void,
-): Promise<ScribeAnswer> {
-  log("");
-  log("scribe — transcription provider:");
-  for (let i = 0; i < SCRIBE_PROVIDERS.length; i++) {
-    const p = SCRIBE_PROVIDERS[i];
-    if (!p) continue;
-    log(`  [${i + 1}] ${p.label} — ${p.blurb}`);
-  }
-  let provider: ScribeProviderKey | undefined;
-  while (!provider) {
-    const raw = (await prompt("Pick a provider (Enter for parakeet-mlx): ")).trim();
-    if (raw.length === 0) {
-      provider = "parakeet-mlx";
-      break;
-    }
-    if (/^\d+$/.test(raw)) {
-      const idx = Number.parseInt(raw, 10) - 1;
-      const hit = SCRIBE_PROVIDERS[idx];
-      if (hit) {
-        provider = hit.key;
-        break;
-      }
-      log(`  out of range — pick 1..${SCRIBE_PROVIDERS.length}`);
-      continue;
-    }
-    if (isKnownScribeProvider(raw)) {
-      provider = raw;
-      break;
-    }
-    log(`  unknown provider "${raw}" — try a number from the list above`);
-  }
-  const apiKeyEnv = apiKeyEnvFor(provider);
-  let apiKey: string | undefined;
-  if (apiKeyEnv) {
-    const raw = (await prompt(`scribe — ${apiKeyEnv} (or Enter to skip): `)).trim();
-    if (raw.length > 0) apiKey = raw;
-  }
-  return { provider, apiKey };
 }
 
 function summarizeUrls(
@@ -386,17 +339,11 @@ export async function setup(opts: SetupOpts = {}): Promise<number> {
   // Pre-collect per-service answers so the operator sits through one batch
   // of questions instead of mid-stream interruptions.
   const vaultPick = picks.find((p) => p.short === "vault");
-  const scribePick = picks.find((p) => p.short === "scribe");
 
   let vaultAnswer: VaultAnswer | undefined;
   if (vaultPick) {
     log("");
     vaultAnswer = await askVaultName(prompt, log);
-  }
-
-  let scribeAnswer: ScribeAnswer | undefined;
-  if (scribePick) {
-    scribeAnswer = await askScribeProvider(prompt, log);
   }
 
   log("");
@@ -411,10 +358,6 @@ export async function setup(opts: SetupOpts = {}): Promise<number> {
     if (opts.noStart) installOpts.noStart = true;
     if (choice.short === "vault" && vaultAnswer) {
       installOpts.vaultName = vaultAnswer.vaultName;
-    }
-    if (choice.short === "scribe" && scribeAnswer) {
-      installOpts.scribeProvider = scribeAnswer.provider;
-      if (scribeAnswer.apiKey) installOpts.scribeKey = scribeAnswer.apiKey;
     }
     const code = await installFn(choice.short, installOpts);
     if (code !== 0 && firstFailure === 0) firstFailure = code;

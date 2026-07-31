@@ -1195,7 +1195,6 @@ describe("install", () => {
         isLinked: () => false,
         portProbe: async () => false,
         log: () => {},
-        randomToken: () => "should-not-fire",
       });
       expect(existsSync(join(configDir, "vault", ".env"))).toBe(false);
       expect(existsSync(join(configDir, "surface", "config.json"))).toBe(false);
@@ -2008,7 +2007,6 @@ describe("#579 / #580 item 1 — light manual install + guidance", () => {
         startService: async () => 0,
         isLinked: () => false,
         portProbe: async () => false,
-        scribeAvailability: { kind: "not-tty" },
         log: (l) => logs.push(l),
         guidanceCtx: { hubUnitInstalled: true, exposeState: undefined, hubPort: 1939 },
       });
