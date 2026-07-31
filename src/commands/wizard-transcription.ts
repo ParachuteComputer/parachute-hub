@@ -2,319 +2,125 @@
  * Transcription step for the CLI setup wizard (`parachute setup-wizard` /
  * `parachute init`).
  *
- * Until now the CLI wizard NEVER asked about transcription — it walked
- * Account → Vault → Expose and stopped, while the browser wizard's vault step
- * folds a full scribe sub-form (none / cloud + key / local). That divergence
- * is the "asks different questions in its CLI vs browser forms" root cause from
- * the onboarding-streamline arc. This module brings the CLI to parity.
+ * ## Why this file shrank from 320 lines to ~110
  *
- * Crucially it follows the arc's "never ask without doing" rule: when the
- * operator picks a provider we ACTUALLY set it up, or honestly say we couldn't
- * and point at the alternative — we never record a dead provider string.
+ * It used to offer scribe's model — none / a cloud provider + API key / a local
+ * engine, with a RAM gate and a platform gate — then shell
+ * `parachute install scribe --scribe-provider …`. Scribe is retired (hub#809),
+ * so every non-`none` choice dead-ended in "✗ scribe install returned 1". A
+ * question that cannot be answered successfully is worse than no question.
  *
- *   - **none**  → write nothing; say transcription is off + how to turn it on.
- *   - **cloud** (groq / openai) → write provider + key (scribe-config.ts), then
- *     install + start scribe via the hub's own `parachute install scribe`
- *     one-shot. The very-first scribe boot reads the provider we just wrote.
- *   - **local** → RAM/platform-gate FIRST (decideLocalProvider). If the box
- *     can't run a local model (no backend for the platform, or < 2 GB RAM) we
- *     do NOT write `local` — we explain why + steer to the cloud one-shot. If
- *     it can, we install scribe, then run scribe's own runnable install routine
- *     (`parachute-scribe install-backend --provider <onnx-asr|parakeet-mlx>`,
- *     scribe PR #79) which apt/pip-installs the engine + warm-pulls the model
- *     and exits non-zero on hard failure. On success we record the resolved
- *     platform provider; on failure we say so + point at cloud, recording
- *     nothing.
+ * Transcription lives in the vault now: `parachute-vault transcription install`
+ * picks a whisper.cpp engine and a model sized to this host's RAM, downloads
+ * them, and VERIFIES it can actually transcribe before reporting success. So
+ * the RAM gate, the platform gate, the provider choice and the API-key prompt
+ * all belong to the vault — and the branch collapses to one yes/no.
  *
- * Everything that touches the host (subprocess spawn, RAM probe, the prompt)
- * goes through an injected seam so tests exercise every branch WITHOUT
- * installing anything or shelling out.
+ * The wizard still ASKS, because doing this at install time is the difference
+ * between a box that transcribes voice notes and one where the operator finds
+ * out months later that it never did. It just asks a question something can
+ * answer.
+ *
+ * Keeps the arc's "never ask without doing" rule: yes really installs, and a
+ * failure says so plainly instead of leaving a half-configured box. Never
+ * fatal — a Parachute that can't transcribe is still a working Parachute, and
+ * failing setup over an optional extra is a worse outcome than a warning.
  */
-
-import { createInterface } from "node:readline/promises";
-import {
-  type ScribeProviderKey,
-  apiKeyEnvFor,
-  clearScribeProvider,
-  decideLocalProvider,
-  readAvailableRamMib,
-} from "../scribe-config.ts";
 
 /** Outcome of one subprocess. Exit code only — stdio is inherited / streamed. */
 export type WizardCommandRunner = (cmd: readonly string[]) => Promise<number>;
 
 export interface TranscriptionStepOpts {
-  /** `~/.parachute` (or the PARACHUTE_HOME override). Where scribe config lives. */
+  /** `~/.parachute` (or the PARACHUTE_HOME override). */
   configDir: string;
   /** Log shim — production prints to stdout; tests capture into an array. */
   log: (line: string) => void;
   /** Prompt seam — production uses readline; tests inject a scripted queue. */
   prompt?: (question: string) => Promise<string>;
   /**
-   * Pre-supply the choice non-interactively (mirrors the wizard's other
-   * run-from-flag escapes). `none` | `local` | a cloud provider name.
+   * Pre-supply the answer non-interactively (mirrors the wizard's other
+   * run-from-flag escapes).
+   *
+   * The historical spellings are all still accepted so an existing
+   * `--transcribe=…` in someone's script keeps working: `none` means skip, and
+   * `local` / `groq` / `openai` all now mean "set up local transcription",
+   * because that is the only thing left for them to mean. Silently redirecting
+   * a cloud choice is defensible precisely because the alternative is the
+   * error this rewrite exists to delete.
    */
   transcribeMode?: "none" | "local" | "groq" | "openai";
-  /** Pre-supplied cloud API key (for `groq` / `openai`). */
-  transcribeApiKey?: string;
-  /**
-   * Command runner seam. Production spawns the real binary inheriting stdio;
-   * tests inject a recorder so nothing installs. Receives a full argv —
-   * `["parachute", "install", "scribe", ...]` or
-   * `["parachute-scribe", "install-backend", "--provider", "onnx-asr"]`.
-   */
+  /** Command runner seam. Tests inject a recorder so nothing installs. */
   runCommand?: WizardCommandRunner;
-  /** Platform override (test seam). Defaults to the real host platform. */
-  platform?: NodeJS.Platform;
-  /** Available-RAM override in MiB (test seam). Defaults to the real probe. */
-  availableRamMib?: number | null;
 }
 
-/** Default readline prompt (matches wizard.ts's defaultPrompt). */
+/**
+ * Default readline prompt. A non-TTY returns the empty answer rather than
+ * throwing: this step is optional and must NEVER block setup on a headless box
+ * (the same posture the previous version took, and worth keeping).
+ */
 async function defaultPrompt(question: string): Promise<string> {
-  // Non-TTY guard (headless-hardening): unlike wizard.ts's required-step
-  // prompts (which throw), the transcription step is optional and must NEVER
-  // block setup. On a closed / non-interactive stdin, return the empty answer
-  // — which the callers already treat as a benign default (a blank cloud API
-  // key means "set it later"; a blank local-install confirm takes the [Y]
-  // default). `resolveChoice` short-circuits to "none" before ever reaching
-  // here without a flag; this covers the flag-supplied-mode downstream prompts.
   if (!process.stdin.isTTY) return "";
-  const rl = createInterface({ input: process.stdin, output: process.stdout });
-  try {
-    return await rl.question(question);
-  } finally {
-    rl.close();
-  }
+  process.stdout.write(question);
+  for await (const line of console) return line;
+  return "";
 }
 
-/**
- * Default command runner: spawn the binary, inherit stdio so the operator sees
- * apt/pip progress in real time, resolve to the exit code. Never throws — a
- * spawn failure (binary not on PATH) surfaces as a non-zero code, which the
- * caller treats as "couldn't install."
- */
-const defaultRunCommand: WizardCommandRunner = async (cmd) => {
-  try {
-    const proc = Bun.spawn([...cmd], {
-      stdout: "inherit",
-      stderr: "inherit",
-      stdin: "inherit",
-    });
-    return await proc.exited;
-  } catch {
-    return 127; // ENOENT / spawn failure → "command not found"
-  }
-};
+async function defaultRunCommand(cmd: readonly string[]): Promise<number> {
+  const proc = Bun.spawn([...cmd], { stdin: "inherit", stdout: "inherit", stderr: "inherit" });
+  return await proc.exited;
+}
 
-/**
- * Walk the transcription step. Returns 0 always — a transcription that
- * couldn't be set up is reported honestly but does NOT fail the wizard (the
- * operator can finish setup and add it later; it's not a blocking step).
- */
+/** Resolve the answer from a flag, else ask. Interactive blank ⇒ yes; headless ⇒ skip. */
+async function resolveWanted(
+  opts: TranscriptionStepOpts,
+  prompt: (q: string) => Promise<string>,
+): Promise<boolean> {
+  if (opts.transcribeMode !== undefined) return opts.transcribeMode !== "none";
+  // Headless with no flag ⇒ SKIP, preserving the previous contract. A blank
+  // answer here means "nobody is there", not "yes" — and unprompted, a yes
+  // downloads several hundred megabytes onto a box whose operator never saw
+  // the question. An interactive blank is a different thing: a person read the
+  // prompt and pressed enter.
+  if (!process.stdin.isTTY && opts.prompt === undefined) return false;
+  const answer = (await prompt("  Set up transcription now? [Y/n]: ")).trim().toLowerCase();
+  // Interactive blank defaults to YES: the operator is walking a setup wizard,
+  // the work is a download plus a verification, and skipping fails silently —
+  // audio uploads and nothing ever transcribes it.
+  return answer !== "n" && answer !== "no";
+}
+
 export async function walkTranscriptionStep(opts: TranscriptionStepOpts): Promise<number> {
   const log = opts.log;
   const prompt = opts.prompt ?? defaultPrompt;
   const runCommand = opts.runCommand ?? defaultRunCommand;
-  const platform = opts.platform ?? process.platform;
 
   log("");
-  log("Step — Transcription (scribe)");
-  log("  Parachute can transcribe voice notes + audio attachments. Pick a");
-  log("  transcription engine, or skip and add one later.");
+  log("Step — Transcription");
+  log("  Turn voice notes and audio attachments into text, on this machine.");
+  log("  The audio never leaves the box.");
 
-  // Resolve the choice (flag or prompt).
-  const choice = await resolveChoice(opts, prompt, log);
-  if (choice === "none") {
+  if (!(await resolveWanted(opts, prompt))) {
     log("");
-    log("  Transcription off. Turn it on later with `parachute install scribe`.");
+    log("  Skipped. Set it up any time with `parachute-vault transcription install`.");
     return 0;
   }
 
-  if (choice === "local") {
-    return await handleLocal(opts, prompt, runCommand, platform, log);
-  }
-
-  // Cloud provider (groq / openai).
-  return await handleCloud(opts, choice, prompt, runCommand, log);
-}
-
-type ResolvedChoice = "none" | "local" | "groq" | "openai";
-
-async function resolveChoice(
-  opts: TranscriptionStepOpts,
-  prompt: (q: string) => Promise<string>,
-  log: (l: string) => void,
-): Promise<ResolvedChoice> {
-  if (opts.transcribeMode !== undefined) return opts.transcribeMode;
-  // Non-TTY guard (headless-hardening): with no `--transcribe-mode` flag AND a
-  // closed / non-interactive stdin (cloud-init, ssh heredoc, the e2e
-  // container), the real `defaultPrompt`'s `prompt("Pick [1]:")` would busy-hang
-  // forever on Bun's `readline/promises` question() — the exact wedge that
-  // timed out the Tier-1 e2e. Transcription is optional / opt-in and documented
-  // as NEVER blocking setup, so we DEFAULT to "none" (not throw — unlike the
-  // required account / vault / expose prompts in wizard.ts) with an honest log
-  // line. Guarded on `opts.prompt === undefined` so an injected prompt seam (a
-  // scripted test queue, or a caller supplying its own reader) is still honored
-  // — the wedge only exists for the real readline-backed default prompt.
-  if (opts.prompt === undefined && !process.stdin.isTTY) {
-    log("");
-    log("  stdin is not interactive — defaulting transcription to none.");
-    log("  Turn it on later with `parachute install scribe` (or re-run with --transcribe-mode).");
-    return "none";
-  }
   log("");
-  log("  1) None — skip transcription (default)");
-  log("  2) Local — run the engine on this box (no API key, needs ~2 GB RAM)");
-  log("  3) Cloud — Groq or OpenAI (fast, needs an API key, ~$0.04/hr of audio)");
-  for (let attempt = 0; attempt < 5; attempt++) {
-    const raw = (await prompt("  Pick [1]: ")).trim().toLowerCase();
-    if (raw === "" || raw === "1" || raw === "none" || raw === "n") return "none";
-    if (raw === "2" || raw === "local" || raw === "l") return "local";
-    if (raw === "3" || raw === "cloud" || raw === "c") {
-      // Sub-pick which cloud provider.
-      for (let inner = 0; inner < 5; inner++) {
-        const which = (await prompt("  Cloud provider — [g]roq (default) or [o]penai: "))
-          .trim()
-          .toLowerCase();
-        if (which === "" || which === "g" || which === "groq") return "groq";
-        if (which === "o" || which === "openai") return "openai";
-        log(`  Sorry — expected groq or openai (got "${which}"). Try again.`);
-      }
-      log("  Too many invalid entries; skipping transcription.");
-      return "none";
-    }
-    if (raw === "groq" || raw === "g") return "groq";
-    if (raw === "openai" || raw === "o") return "openai";
-    log(`  Sorry — expected 1, 2, or 3 (got "${raw}"). Try again.`);
-  }
-  log("  Too many invalid entries; skipping transcription.");
-  return "none";
-}
+  log("  Downloading a speech model sized to this machine, then verifying it…");
+  // `--yes` because the wizard already asked. Without it the vault command
+  // asks again — and under `curl … | bash` stdin is the pipe, so that second
+  // prompt would hang rather than default.
+  const code = await runCommand(["parachute-vault", "transcription", "install", "--yes"]);
 
-async function handleCloud(
-  opts: TranscriptionStepOpts,
-  provider: "groq" | "openai",
-  prompt: (q: string) => Promise<string>,
-  runCommand: WizardCommandRunner,
-  log: (l: string) => void,
-): Promise<number> {
-  const envKey = apiKeyEnvFor(provider as ScribeProviderKey);
-  let apiKey = opts.transcribeApiKey;
-  if (apiKey === undefined && envKey) {
-    apiKey = (await prompt(`  Paste your ${envKey} (or blank to set later): `)).trim();
-  }
-
-  // Install + start scribe via the EXISTING one-shot path, handing it the
-  // chosen provider + key. `parachute install scribe --scribe-provider <p>
-  // [--scribe-key <k>]` writes the provider into scribe's config + the key into
-  // scribe/.env and starts the module — the same wiring the bare CLI install
-  // does. Passing the provider also suppresses install's own interactive
-  // provider prompt (it's already an explicit choice).
-  const cmd = ["parachute", "install", "scribe", "--scribe-provider", provider];
-  if (envKey && apiKey && apiKey.length > 0) {
-    cmd.push("--scribe-key", apiKey);
-  }
-  log("");
-  log(`  Installing scribe with the ${provider} cloud provider…`);
-  const code = await runCommand(cmd);
-  if (code !== 0) {
-    log(`  ✗ scribe install returned ${code}. Retry: \`${cmd.join(" ")}\`.`);
-    return 0;
-  }
-  if (envKey && !(apiKey && apiKey.length > 0)) {
-    log(
-      `  ✓ Recorded ${provider}. Add ${envKey} later: \`echo '${envKey}=<value>' >> ${opts.configDir}/scribe/.env\` then \`parachute restart scribe\`.`,
-    );
-  } else {
-    log(`  ✓ Scribe installed and running with the ${provider} cloud provider.`);
-  }
-  return 0;
-}
-
-async function handleLocal(
-  opts: TranscriptionStepOpts,
-  prompt: (q: string) => Promise<string>,
-  runCommand: WizardCommandRunner,
-  platform: NodeJS.Platform,
-  log: (l: string) => void,
-): Promise<number> {
-  const ramMib =
-    opts.availableRamMib !== undefined ? opts.availableRamMib : readAvailableRamMib(platform);
-  const decision = decideLocalProvider(platform, ramMib);
-
-  if (!decision.ok) {
-    // Can't install local here — say EXACTLY why + point at the cloud one-shot.
-    // Do NOT record a dead `local` provider string.
-    log("");
-    log(`  ✗ Local transcription isn't possible on this box: ${decision.reason}`);
-    log("");
-    log("  One-shot cloud alternative — get a free Groq key at https://console.groq.com,");
-    log("  then run:");
-    log("    parachute install scribe --scribe-provider groq --scribe-key gsk_…");
-    log("  (or re-run this wizard and choose Cloud).");
+  if (code === 0) {
+    log("  ✓ Transcription ready.");
     return 0;
   }
 
-  const provider = decision.provider as "parakeet-mlx" | "onnx-asr";
-  log("");
-  log(`  This box can run ${provider} locally.`);
-
-  // Confirm before the (slow, apt/pip) install unless pre-supplied.
-  if (opts.transcribeMode === undefined) {
-    const ok = (await prompt(`  Install ${provider} now? [Y/n]: `)).trim().toLowerCase();
-    if (ok === "n" || ok === "no") {
-      log(
-        "  Skipped. Install later with `parachute-scribe install-backend` or re-run this wizard.",
-      );
-      return 0;
-    }
-  }
-
-  // Install the scribe module first, recording the resolved provider so install
-  // doesn't prompt for one. (We UNDO this record below if the engine install
-  // fails — so a failure never leaves a dead provider string.)
-  log("");
-  log("  Installing the scribe module…");
-  const moduleCode = await runCommand([
-    "parachute",
-    "install",
-    "scribe",
-    "--scribe-provider",
-    provider,
-  ]);
-  if (moduleCode !== 0) {
-    clearScribeProvider(opts.configDir);
-    log(`  ✗ scribe module install returned ${moduleCode} — not recording a local provider.`);
-    return 0;
-  }
-
-  // Run scribe's OWN runnable install routine (scribe PR #79). It apt/pip-
-  // installs the engine, warm-pulls the model, and exits non-zero on hard
-  // failure (no engine on PATH, too little RAM on its own re-check, etc.).
-  log("");
-  log(`  Installing the ${provider} engine via scribe (this can take a few minutes)…`);
-  // The `--provider <p>` FLAG form is intentional (not the positional
-  // `install-backend <p>`): scribe's cmdInstallBackend reads it via getFlag
-  // when args[1] starts with "-". If scribe ever moves off its module-level
-  // `args` global, re-confirm this flag is still honored.
-  const code = await runCommand(["parachute-scribe", "install-backend", "--provider", provider]);
-  if (code !== 0) {
-    // HONEST skip — undo the provisional provider record; do NOT leave a dead
-    // provider string scribe can't honor.
-    clearScribeProvider(opts.configDir);
-    log("");
-    log(`  ✗ ${provider} install failed (exit ${code}); not recording it as the provider.`);
-    log(
-      "    Cloud alternative: `parachute install scribe --scribe-provider groq --scribe-key gsk_…`",
-    );
-    return 0;
-  }
-
-  // Engine installed + verified by scribe — keep the provider recorded (the
-  // install step already wrote it) and restart so the running scribe picks it up.
-  log("");
-  log(`  ✓ ${provider} installed and recorded as the transcription provider.`);
-  await runCommand(["parachute", "restart", "scribe"]);
+  // Deliberately returns 0. A non-zero here would fail `parachute init` over
+  // something the operator can retry with one command.
+  log(`  ✗ Transcription setup returned ${code} — everything else is fine.`);
+  log("    Retry any time:        parachute-vault transcription install");
+  log("    See what's missing:    parachute-vault transcription status");
   return 0;
 }
