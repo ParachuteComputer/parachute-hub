@@ -408,6 +408,67 @@ describe("account API — auth gates", () => {
     }
   });
 
+  // LOAD-BEARING (the whole point of not advertising `account:*`).
+  //
+  // Handoff §4 settles that `account:*` stays out of `scopes_supported` — RFC
+  // 8414 §2 / RFC 9728 §2 permit it and MCP's spec wants the minimal set — on
+  // the explicit grounds that discovery happens AT THE POINT OF REFUSAL, via
+  // the RFC 6750 §3 `scope` challenge parameter. `AdminAuthError.requiredScope`
+  // exists solely to carry it (admin-auth.ts:33-50). `requireScope` passed it;
+  // `requireAnyScope` did not, so every `/account/*` route — the exact surface
+  // account scopes were invented for — refused without saying what to ask for.
+  //
+  // The prior 403 test above asserts only the JSON body, which is why the gap
+  // survived: `error_description` is prose for humans, `scope` is the field a
+  // client parses. Assert the HEADER.
+  test("403 names the missing scope in the RFC 6750 `scope` challenge parameter", async () => {
+    const h = makeHarness();
+    try {
+      const token = await bearer(h, ["vault:beta:read"]);
+      const res = await handleAccountListVaults(withBearer("/account/vaults", token), deps(h));
+      expect(res.status).toBe(403);
+      const challenge = res.headers.get("www-authenticate") ?? "";
+      expect(challenge).toContain('error="insufficient_scope"');
+      // Read the `scope` parameter itself, not the whole header: the prose in
+      // `error_description` does list every acceptable scope, and asserting on
+      // the raw string would pass on that alone — which is the exact
+      // false-negative that let the omission ship.
+      const scopeParam = /(?:^|[\s,])scope="([^"]*)"/.exec(challenge)?.[1];
+      // The narrowest scope an account-door client can actually request — NOT
+      // the host scope it also would have been accepted with, and not a list.
+      expect(scopeParam).toBe(ACCOUNT_READ_SCOPE);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  // Mutations advertise the admin scope, not the read one — a client that got
+  // `account:self:read` from the list route and then tried to create a vault
+  // must be told to step UP, not handed the scope it already has.
+  test("a mutation 403 challenges for account:self:admin, not account:self:read", async () => {
+    const h = makeHarness();
+    try {
+      const token = await bearer(h, [ACCOUNT_READ_SCOPE]);
+      const res = await handleAccountCreateVault(
+        new Request("http://127.0.0.1:1939/account/vaults", {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify({ name: "probe" }),
+        }),
+        deps(h),
+      );
+      expect(res.status).toBe(403);
+      const challenge = res.headers.get("www-authenticate") ?? "";
+      const scopeParam = /(?:^|[\s,])scope="([^"]*)"/.exec(challenge)?.[1];
+      expect(scopeParam).toBe(ACCOUNT_ADMIN_SCOPE);
+    } finally {
+      h.cleanup();
+    }
+  });
+
   test("a plain parachute:host:admin token is accepted (H1-independent)", async () => {
     const h = makeHarness();
     try {
