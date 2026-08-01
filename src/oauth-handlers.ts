@@ -80,7 +80,12 @@ import {
   loginRateLimiter,
 } from "./rate-limit.ts";
 import { isHttpsRequest } from "./request-protocol.ts";
-import { narrowResourceVaultScopes, resolveResourceVault } from "./resource-binding.ts";
+import {
+  isRootMcpResource,
+  narrowResourceVaultScopes,
+  narrowRootMcpScopes,
+  resolveResourceVault,
+} from "./resource-binding.ts";
 import {
   ACCOUNT_SELF_ADMIN_SCOPE,
   ACCOUNT_SELF_READ_SCOPE,
@@ -1004,15 +1009,28 @@ export function handleAuthorizeGet(db: Database, req: Request, deps: OAuthDeps):
   // the URL) so the two never diverge. Re-entry after login re-narrows
   // idempotently (no foreign scopes left to drop).
   //
-  // No resource, or one that isn't a per-vault MCP resource (off-origin,
-  // malformed, non-vault path) → `boundVault` is null and the flow is
+  // The ROOT `/mcp` door takes the same treatment minus the naming. It is a
+  // vault door too (vault derives the target from the token), so foreign
+  // scopes are just as unusable in the token it mints — but the resource
+  // carries no vault name, so there is nothing to narrow the vault scopes TO
+  // and the consent picker still supplies that. Without this branch the root
+  // door was the one place the whole-hub catalog still reached consent.
+  //
+  // No resource, or one that isn't an MCP resource we front (off-origin,
+  // malformed, non-vault path) → neither branch fires and the flow is
   // byte-for-byte the pre-#461 behavior (manual picker, etc.).
-  const boundVault = resolveResourceVault(parsed.resource, resolveBoundOrigins(deps));
+  const boundOrigins = resolveBoundOrigins(deps);
+  const boundVault = resolveResourceVault(parsed.resource, boundOrigins);
   if (boundVault) {
     parsed.scope = narrowResourceVaultScopes(
       parsed.scope.split(" ").filter((s) => s.length > 0),
       boundVault,
     ).join(" ");
+    url.searchParams.set("scope", parsed.scope);
+  } else if (isRootMcpResource(parsed.resource, boundOrigins)) {
+    parsed.scope = narrowRootMcpScopes(parsed.scope.split(" ").filter((s) => s.length > 0)).join(
+      " ",
+    );
     url.searchParams.set("scope", parsed.scope);
   }
 
@@ -1689,13 +1707,19 @@ async function handleConsentSubmit(
   // `resource` field. Re-narrow here so the minted token is always named +
   // correctly-audienced regardless of what the form body claims. Same
   // semantics as the GET path: only when `resource` resolves to one of our
-  // per-vault MCP resources; no-op otherwise (manual-pick path unchanged).
-  const boundVault = resolveResourceVault(params.resource, resolveBoundOrigins(deps));
+  // MCP resources — per-vault (narrow + name) or root (drop foreign scopes,
+  // picker still names); no-op otherwise (manual-pick path unchanged).
+  const boundOrigins = resolveBoundOrigins(deps);
+  const boundVault = resolveResourceVault(params.resource, boundOrigins);
   if (boundVault) {
     params.scope = narrowResourceVaultScopes(
       params.scope.split(" ").filter((s) => s.length > 0),
       boundVault,
     ).join(" ");
+  } else if (isRootMcpResource(params.resource, boundOrigins)) {
+    params.scope = narrowRootMcpScopes(params.scope.split(" ").filter((s) => s.length > 0)).join(
+      " ",
+    );
   }
   const approve = String(form.get("approve") ?? "") === "yes";
   const sessionId = parseSessionCookie(req.headers.get("cookie"));

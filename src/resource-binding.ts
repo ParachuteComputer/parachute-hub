@@ -47,6 +47,26 @@ const VAULT_MCP_PATH_RE = /^\/vault\/([^/]+)\/mcp\/?$/;
 const VAULT_PRM_PATH_RE = /^\/vault\/([^/]+)\/\.well-known\/oauth-protected-resource\/?$/;
 
 /**
+ * The same two shapes for the ROOT MCP door, which carries no vault name:
+ *
+ *   - the MCP endpoint:  `<origin>/mcp`
+ *   - the PRM document:  `<origin>/.well-known/oauth-protected-resource/mcp`
+ *     (path-suffixed per the MCP spec's per-resource discovery convention —
+ *     see the handler in `hub-server.ts`, which authors this document from
+ *     the hub's own scope registry).
+ *
+ * Root `/mcp` is not a single-vault endpoint: vault derives the target from
+ * the token (`deriveVaultFromToken`) and re-dispatches through the per-vault
+ * machinery with the audience pin intact. Verified live against a hub with
+ * three vaults — the same URL served `parachute-vault/alpha` to an
+ * `aud=vault.alpha` token and `parachute-vault/beta` to an `aud=vault.beta`
+ * one, and each token 401'd (`audience mismatch`) at the other's per-vault
+ * path.
+ */
+const ROOT_MCP_PATH_RE = /^\/mcp\/?$/;
+const ROOT_PRM_PATH_RE = /^\/\.well-known\/oauth-protected-resource\/mcp\/?$/;
+
+/**
  * Resolve the RFC 8707 `resource` parameter to a vault instance name, or null
  * when it isn't a per-vault MCP resource (absent, malformed, off-origin, or a
  * non-vault path). Off-origin resources return null deliberately: we only
@@ -78,6 +98,35 @@ export function resolveResourceVault(
   const prm = VAULT_PRM_PATH_RE.exec(parsed.pathname);
   if (prm?.[1]) return decodeVaultName(prm[1]);
   return null;
+}
+
+/**
+ * True when the RFC 8707 `resource` names the hub's ROOT MCP door (or its PRM
+ * document). Same origin gate as `resolveResourceVault` — a resource we don't
+ * front can't drive any narrowing.
+ *
+ * This is deliberately a SEPARATE predicate rather than a new return value on
+ * `resolveResourceVault`, because the root door has **no vault name to narrow
+ * to**. `resolveResourceVault` answers "which vault?"; the honest answer for
+ * root is "none yet — the consent picker decides." Folding root into its
+ * return type would hand callers a name-shaped value that isn't a name.
+ *
+ * Callers pair this with `narrowRootMcpScopes`, never with
+ * `narrowResourceVaultScopes`: there is nothing to name the scopes after.
+ */
+export function isRootMcpResource(
+  resource: string | null | undefined,
+  boundOrigins: readonly string[],
+): boolean {
+  if (!resource) return false;
+  let parsed: URL;
+  try {
+    parsed = new URL(resource);
+  } catch {
+    return false;
+  }
+  if (!boundOrigins.includes(parsed.origin)) return false;
+  return ROOT_MCP_PATH_RE.test(parsed.pathname) || ROOT_PRM_PATH_RE.test(parsed.pathname);
 }
 
 /** Canonical vault-name shape — mirrors `VAULT_SCOPED_RE`'s name group. */
@@ -146,4 +195,41 @@ export function narrowResourceVaultScopes(scopes: readonly string[], vaultName: 
     }
   }
   return out;
+}
+
+/**
+ * The root-`/mcp` counterpart of `narrowResourceVaultScopes`: drop every
+ * non-vault scope, and change nothing else.
+ *
+ * Root `/mcp` is a vault door — whichever vault the token names. So the same
+ * argument that drops `scribe:*` / `agent:send` / `hub:admin` from a per-vault
+ * consent applies verbatim here: the flow ends in a token stamped
+ * `aud=vault.<picked>`, in which those scopes are unusable, and carrying them
+ * only inflates the consent surface. Before this branch existed a `resource`
+ * naming root `/mcp` fell through `resolveResourceVault` to null, the whole
+ * binding path no-op'd, and the root door alone kept showing the entire hub
+ * scope catalog — the exact "scary consent" this module was written to kill,
+ * surviving at one of the two MCP doors.
+ *
+ * What this deliberately does NOT do is name the scopes. Unnamed
+ * `vault:<verb>` is left exactly as requested, because there is no vault in
+ * the resource to name it after; the consent picker supplies the name and the
+ * existing rewrite turns it into `vault:<picked>:<verb>` before the code is
+ * issued (`docs/contracts/oauth-scopes.md`, "Parser rules"). That is also why
+ * the root PRM advertises the bare `vault:read` / `vault:write` /
+ * `vault:admin` shapes: at the root door the bare shape is the correct thing
+ * for a client to *request*, even though it is never the shape that ships in
+ * the minted token.
+ *
+ * Already-named `vault:<name>:<verb>` rides through untouched, same as the
+ * per-vault path — a client that named a vault is not second-guessed here.
+ *
+ * A request that carries ONLY foreign scopes narrows to the empty list, which
+ * the authorize handler already refuses with `invalid_scope` rather than
+ * minting a zero-scope token. Same terminal behaviour as the per-vault path.
+ *
+ * Idempotent: a second pass has nothing left to drop.
+ */
+export function narrowRootMcpScopes(scopes: readonly string[]): string[] {
+  return scopes.filter((s) => s.split(":")[0] === "vault");
 }
