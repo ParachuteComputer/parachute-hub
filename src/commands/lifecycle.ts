@@ -286,19 +286,32 @@ function resolveSupervisor(opts: LifecycleOpts["supervisor"]): ResolvedSuperviso
  * Called when a verb finds NO hub unit installed (Phase 5b removed the detached
  * spawners, so there is no detached arm to fall back to). When the offer is
  * enabled, it runs `offerMigrateToSupervised` (which itself checks "no unit +
- * prior detached" and prompts / prints). Returns `true` ONLY when the operator
+ * prior detached" and prompts / prints). `ready` is true ONLY when the operator
  * accepted AND the cutover succeeded — i.e. the box is NOW supervised, so the
  * caller can dispatch through the supervisor path. Every other outcome (offer
- * disabled, no-offer, declined, printed in a non-TTY, migrate-failed) returns
- * `false` → the caller surfaces the actionable "run `parachute migrate
- * --to-supervised`" error (NOT a detached spawn — that path is gone).
+ * disabled, no-offer, declined, printed in a non-TTY, migrate-failed) leaves
+ * `ready` false and the verb exits non-zero (NOT a detached spawn — that path
+ * is gone). WHO tells the operator why is the second flag's job, below.
  *
- * The migrate-failed case deliberately returns `false`: a failed cutover leaves
+ * The migrate-failed case deliberately returns not-ready: a failed cutover leaves
  * the box un-migrated (the cutover is fail-safe + re-runnable), so the verb
  * surfaces the error rather than dispatching into a supervisor that isn't up.
+ *
+ * `surfaced` reports whether the offer printed anything, so the caller knows
+ * whether it still owes the operator a message. `no-offer` is the ONE outcome
+ * that returns in silence (`migrate-offer.ts:160,162` — a supervised box, or a
+ * clean box with no prior-detached evidence); `printed` / `declined` /
+ * `migrate-failed` each log their own guidance.
  */
-async function maybeOfferAndMigrate(r: Resolved): Promise<boolean> {
-  if (!r.migrateOffer.enabled) return false;
+interface OfferAttempt {
+  /** The box is now supervised — dispatch through the supervisor arm. */
+  ready: boolean;
+  /** The offer already told the operator something; don't double-print. */
+  surfaced: boolean;
+}
+
+async function maybeOfferAndMigrate(r: Resolved): Promise<OfferAttempt> {
+  if (!r.migrateOffer.enabled) return { ready: false, surfaced: false };
   const result = await r.migrateOffer.offer({
     configDir: r.configDir,
     manifestPath: r.manifestPath,
@@ -309,9 +322,9 @@ async function maybeOfferAndMigrate(r: Resolved): Promise<boolean> {
     // takes the supervisor arm (the unit is freshly installed; `unitInstalled`
     // was resolved as false before the offer).
     r.sup.unitInstalled = true;
-    return true;
+    return { ready: true, surfaced: true };
   }
-  return false;
+  return { ready: false, surfaced: result.outcome !== "no-offer" };
 }
 
 /**
@@ -336,12 +349,17 @@ async function maybeOfferAndMigrate(r: Resolved): Promise<boolean> {
  */
 async function requireSupervisedOrOffer(r: Resolved): Promise<boolean> {
   if (r.sup.unitInstalled) return true;
-  const migrated = await maybeOfferAndMigrate(r);
-  if (migrated) return true;
-  // No unit and not migrated. If the offer was enabled it already surfaced its
-  // own guidance (prompt / printed command / declined note); otherwise print the
-  // actionable command so a script on a never-migrated box isn't left guessing.
-  if (!r.migrateOffer.enabled) {
+  const attempt = await maybeOfferAndMigrate(r);
+  if (attempt.ready) return true;
+  // No unit and not migrated. Print the actionable command UNLESS the offer
+  // already surfaced its own guidance (prompt / printed command / declined
+  // note). Gating on `surfaced` rather than on `enabled` is load-bearing: the
+  // verbs all pass `migrateOffer: { enabled: true }` (cli.ts), and the offer
+  // returns `no-offer` in SILENCE on a clean box with no prior-detached
+  // evidence — which is every container / fresh install. Gating on `enabled`
+  // meant `parachute start <svc>` there exited 1 with nothing on stdout or
+  // stderr.
+  if (!attempt.surfaced) {
     r.log(
       "No supervised hub unit is installed. Run `parachute migrate --to-supervised` to install it,",
     );

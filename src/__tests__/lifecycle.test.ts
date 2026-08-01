@@ -446,6 +446,63 @@ describe("§7.5 no-unit path in start/stop/restart", () => {
     }
   });
 
+  // LOAD-BEARING: the offer is ENABLED (which is what cli.ts always passes) and
+  // returns `no-offer` — the one outcome that returns without logging anything
+  // (migrate-offer.ts:160,162: a supervised box, or a CLEAN box with no
+  // prior-detached evidence). A clean box is every container and every fresh
+  // install, so this is the common shape, not an edge case.
+  //
+  // Gating the fallback print on `enabled` instead of on "did the offer say
+  // anything" made `parachute start <svc>` exit 1 with ZERO bytes on stdout and
+  // stderr there — reproduced live before this fix. The test above only covers
+  // the offer-DISABLED path, which is why the gap survived; and the declined /
+  // migrate-failed tests below pass `log: () => {}`, discarding the evidence.
+  test("no unit + offer enabled but silent (no-offer) → still surfaces the actionable error", async () => {
+    const h = makeHarness();
+    try {
+      seedVault(h.manifestPath);
+      const log: string[] = [];
+      const offerStub = makeOfferStub("no-offer");
+      const code = await start("vault", {
+        configDir: h.configDir,
+        manifestPath: h.manifestPath,
+        log: (l) => log.push(l),
+        migrateOffer: { enabled: true, offer: offerStub.offer },
+      });
+      expect(code).toBe(1);
+      expect(offerStub.calls).toBe(1);
+      // Never exit non-zero in silence.
+      expect(log.length).toBeGreaterThan(0);
+      expect(log.join("\n")).toMatch(/No supervised hub unit is installed/);
+      expect(log.join("\n")).toMatch(/parachute migrate --to-supervised/);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  // The other half of the contract: an outcome that DID speak for itself must not
+  // be followed by the generic line. Without this, "always print" would pass the
+  // test above while double-printing at the operator.
+  test("declined → the verb does NOT double-print the generic migrate error", async () => {
+    const h = makeHarness();
+    try {
+      seedVault(h.manifestPath);
+      const log: string[] = [];
+      const offerStub = makeOfferStub("declined");
+      const code = await start("vault", {
+        configDir: h.configDir,
+        manifestPath: h.manifestPath,
+        log: (l) => log.push(l),
+        migrateOffer: { enabled: true, offer: offerStub.offer },
+      });
+      expect(code).toBe(1);
+      expect(offerStub.calls).toBe(1);
+      expect(log.join("\n")).not.toMatch(/No supervised hub unit is installed/);
+    } finally {
+      h.cleanup();
+    }
+  });
+
   test("start: accept+migrate → dispatches through the supervisor (no detached spawn)", async () => {
     const h = makeHarness();
     try {
