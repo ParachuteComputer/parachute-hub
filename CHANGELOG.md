@@ -6,6 +6,62 @@ All notable changes to `@openparachute/hub` are documented here. The format foll
 >
 > This backfill covers the 0.6.x line only. Two pre-existing gaps remain undocumented and are **not** addressed here: the `0.5.13` stable itself (the file's newest entry is `0.5.13-rc.48`, never the stable) and the entire `0.5.14-rc` chain (rc.1–rc.21 on npm), which never promoted to a `0.5.14` stable — its work folded forward into 0.6.0.
 
+## [0.7.12] - 2026-07-31
+
+**Stable promotion of the 0.7.12 line.** Promotes rc.1-rc.2 plus #811, #812,
+#813 and #815 to `@latest`, which had been six releases behind. A box installed
+before this got none of the below.
+
+- **`/` serves the app (#801).** hub#791 made `/` REDIRECT to `/app`, which
+  asked a bundle built for the origin root to live somewhere else. Four bugs
+  followed from that one mismatch -- an unstyled blank page, a PWA manifest that
+  would have claimed the whole origin, CSS preloads 404ing on some routes, and
+  note URLs missing their prefix. `serve-app` mode already existed and is now
+  the default when the app is installed. Self-host note URLs now match the
+  hosted door exactly (`/n/<id>` on both), so links and docs are portable.
+  `/app` stays a valid secondary mount.
+
+- **A read-only agent is expressible (#808).** The owner verb selector was one
+  radio applied to every requested verb, pre-selected to admin, so
+  `vault:read vault:write vault:admin` could only mint admin three times.
+  Reported from the field: an agent that should search a vault and never write
+  to it could not be given a credential saying so.
+
+- **Per-scope consent (#804, #806).** Each requested scope gets its own
+  checkbox; high-risk ones start unchecked. Declining everything returns
+  `access_denied` rather than minting a zero-scope token that looks like
+  success and can do nothing. #806 fixes the version rc.1 shipped broken, where
+  the checkbox posted the display scope while the server filtered the wire
+  scope.
+
+- **Account scopes are requestable, capped, and risk-tiered (#798, #803).**
+  Requestable so an agent that manages vaults can be built at all; capped so a
+  non-admin can't consent their way to account-wide authority (on self-host the
+  account IS the box); NOT advertised, because clients request the whole
+  catalog and a note-taker was asking for permanent delete across every vault.
+
+- **Scribe is retired (#809, #811, #813, #815).** Its job moved into vault:
+  whisper.cpp runs locally, installed and verified end-to-end. Graceful -- an
+  existing row keeps being supervised and keeps transcribing; only NEW installs
+  are refused. #811 closed a bypass where the browser wizard could still
+  install it.
+
+- **`parachute init` sets up transcription (#812)**, through the vault rather
+  than through the retired module.
+
+- **`parachute uninstall` exists (#793, #794)**, and un-wires `SCRIBE_URL` from
+  vault's `.env` so a removed scribe doesn't leave the vault pointed at a dead
+  port.
+
+- **The insufficient-scope 403 names the scope (#807)** in the RFC 6750 `scope`
+  parameter, which is how an unattended client discovers a scope that isn't
+  advertised.
+
+- **Publish-on-merge reports unpublished drift (#799)** -- the skip path was
+  silent, which is indistinguishable from "everything is shipped".
+
+No schema migration.
+
 ## [0.7.12-rc.2] - 2026-07-30
 
 **A read-only agent is expressible again (#808).** The owner verb selector was
