@@ -74,11 +74,15 @@ const ACCOUNT_API_CLIENT_ID = "parachute-account";
  * carries `account:self:admin`; a plain operator/host-admin token carries
  * `parachute:host:admin`. Either is accepted so H2 works independent of H1's
  * merge order (SCOPE-b).
+ *
+ * ORDER IS LOAD-BEARING: `requireAnyScope` puts `[0]` in the RFC 6750 `scope`
+ * challenge, so the narrowest scope an account-door client should request must
+ * come first.
  */
 const ADMIN_SCOPES: readonly string[] = [ACCOUNT_SELF_ADMIN_SCOPE, HOST_ADMIN_SCOPE];
 /** Scopes that satisfy a `/account/*` READ. `admin ⊇ read`, spelled explicitly
  * because the hub's `requireScope` does an exact-string membership check (no
- * inheritance expansion at validate time). */
+ * inheritance expansion at validate time). Narrowest-first, per ADMIN_SCOPES. */
 const READ_SCOPES: readonly string[] = [
   ACCOUNT_SELF_READ_SCOPE,
   ACCOUNT_SELF_ADMIN_SCOPE,
@@ -139,6 +143,14 @@ function methodNotAllowed(allow: string): Response {
  * a SET of scopes rather than a single required one, so `/account/*` can accept
  * `account:self:*` OR `parachute:host:admin`. Throws `AdminAuthError` (401/403);
  * callers translate via `adminAuthErrorResponse`.
+ *
+ * The 403 carries `acceptable[0]` as `AdminAuthError.requiredScope`, so the
+ * challenge names a scope the caller can actually request. FIRST, not the whole
+ * set: RFC 6750 §3 permits a space-delimited `scope` list, but a list here
+ * would read as "you need all of these" when any ONE suffices — and the other
+ * entries are host scopes an account-door client should never ask for. Both
+ * sets below are ordered narrowest-account-scope-first for exactly this reason;
+ * keep them that way.
  */
 export async function requireAnyScope(
   db: Database,
@@ -160,7 +172,11 @@ export async function requireAnyScope(
   const scopes =
     typeof scopeClaim === "string" ? scopeClaim.split(/\s+/).filter((s) => s.length > 0) : [];
   if (!acceptable.some((s) => scopes.includes(s))) {
-    throw new AdminAuthError(403, `token missing one of required scopes: ${acceptable.join(", ")}`);
+    throw new AdminAuthError(
+      403,
+      `token missing one of required scopes: ${acceptable.join(", ")}`,
+      acceptable[0],
+    );
   }
   const clientIdRaw = (validated.payload as { client_id?: unknown }).client_id;
   const clientId = typeof clientIdRaw === "string" ? clientIdRaw : undefined;
