@@ -1031,6 +1031,40 @@ describe("handleAccountHomeGet", () => {
     expect(html).toContain("version history + GitHub");
   });
 
+  test("vault#822 — a never-worked remote reaches the HTML as unhealthy", async () => {
+    // End to end for the field report: the handler must carry the push OUTCOME
+    // all the way to the markup. The seam this pins is
+    // `mirrorHealthy[vaultName] = isMirrorHealthy(stat)` — without it the value
+    // is computed correctly and then dropped, which is precisely the bug class
+    // being fixed, one layer up.
+    await createUser(harness.db, "admin", "admin-passphrase", { passwordChanged: true });
+    const friend = await createUser(harness.db, "alice", "alice-passphrase", {
+      allowMulti: true,
+      passwordChanged: true,
+      assignedVaults: ["alice"],
+    });
+    const session = createSession(harness.db, { userId: friend.id });
+    const cookie = buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000));
+    const req = new Request(`${HUB_ORIGIN}/account/`, { headers: { cookie } });
+    const res = await handleAccountHomeGet(req, {
+      db: harness.db,
+      hubOrigin: HUB_ORIGIN,
+      resolveVaultPort: () => 1940,
+      // A remote is configured and has never accepted a push — Aaron's vault.
+      fetchMirror: async () => ({
+        enabled: true,
+        backedUpToRemote: true,
+        remotePushState: "never" as const,
+      }),
+    });
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('data-backup-healthy="false"');
+    expect(html).toContain("GitHub backup has never worked");
+    // The regression, stated as the thing that must not reach a browser again.
+    expect(html).not.toContain("Backed up — version history + GitHub");
+  });
+
   test("omits the backup line gracefully when the mirror fetch fails (null)", async () => {
     await createUser(harness.db, "admin", "admin-passphrase", { passwordChanged: true });
     const friend = await createUser(harness.db, "alice", "alice-passphrase", {
