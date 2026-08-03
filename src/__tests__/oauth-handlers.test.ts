@@ -9550,6 +9550,169 @@ describe("RFC 8707 resource binding — vault-bound MCP (fix #461)", () => {
       cleanup();
     }
   });
+
+  // ─── the ROOT `/mcp` door ────────────────────────────────────────────────
+  //
+  // Root `/mcp` is a vault door too — vault derives the target from the token
+  // and re-dispatches with the audience pin intact (verified live on a hub
+  // with three vaults: one URL, `parachute-vault/alpha` for an alpha token,
+  // `parachute-vault/beta` for a beta one, each 401'ing at the other's
+  // per-vault path). So the same foreign-scope drop applies. What does NOT
+  // apply is the naming: the root resource carries no vault name, so the
+  // picker stays and the existing rewrite names the scopes at consent.
+  //
+  // Before this branch `resolveResourceVault` returned null for `<origin>/mcp`
+  // and the whole binding path no-op'd, leaving the root door as the one place
+  // a client still saw the whole-hub catalog.
+  describe("root /mcp (no vault name in the resource)", () => {
+    /** The whole-hub catalog shape a client over-requests, scribe installed. */
+    const CATALOG = "vault:read vault:write scribe:transcribe";
+
+    async function consentFor(resource?: string) {
+      const { db, cleanup } = await makeDb();
+      try {
+        const user = await createUser(db, "owner", "pw");
+        const session = createSession(db, { userId: user.id });
+        const reg = registerClient(db, { redirectUris: ["https://app.example/cb"] });
+        const { challenge } = makePkce();
+        const res = handleAuthorizeGet(
+          db,
+          new Request(
+            authorizeUrl({
+              client_id: reg.client.clientId,
+              redirect_uri: "https://app.example/cb",
+              response_type: "code",
+              code_challenge: challenge,
+              code_challenge_method: "S256",
+              scope: CATALOG,
+              ...(resource ? { resource } : {}),
+            }),
+            {
+              headers: {
+                cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000))}`,
+              },
+            },
+          ),
+          RESOURCE_DEPS,
+        );
+        expect(res.status).toBe(200);
+        return await res.text();
+      } finally {
+        cleanup();
+      }
+    }
+
+    test("CONTROL: with no resource the catalog reaches consent intact", async () => {
+      // Without this the drop-assertions below would pass on a consent screen
+      // that never rendered scribe in the first place.
+      const html = await consentFor();
+      expect(html).toContain("scribe:transcribe");
+      expect(html).toContain("Pick a vault");
+    });
+
+    test("resource=<origin>/mcp drops foreign scopes but KEEPS the picker", async () => {
+      const html = await consentFor(`${ISSUER}/mcp`);
+      // The scary-consent fix now reaches the root door.
+      expect(html).not.toContain("scribe:");
+      // …and the vault scopes survive un-narrowed, because the resource names
+      // no vault. The picker supplies the name; naming them here would mean
+      // inventing a vault the client never asked for.
+      expect(html).toContain("Pick a vault");
+      expect(html).not.toContain("vault:jon:read");
+      expect(html).not.toContain("vault:boulder:read");
+    });
+
+    test("the root PRM URL is accepted as the resource too", async () => {
+      // The exact string the root 401 challenge hands a client back:
+      // `resource_metadata=".../.well-known/oauth-protected-resource/mcp"`.
+      const html = await consentFor(`${ISSUER}/.well-known/oauth-protected-resource/mcp`);
+      expect(html).not.toContain("scribe:");
+      expect(html).toContain("Pick a vault");
+    });
+
+    test("an off-origin /mcp drives nothing — same gate as the per-vault path", async () => {
+      const html = await consentFor("https://evil.example/mcp");
+      expect(html).toContain("scribe:transcribe");
+      expect(html).toContain("Pick a vault");
+    });
+
+    test("a hand-crafted consent POST can't smuggle a foreign scope back in", async () => {
+      // The GET handler already narrowed what the form rendered, so an honest
+      // browser never posts `scribe:transcribe` here. This is the defense-in-
+      // depth half — the mirror of the per-vault re-narrow in the POST path.
+      // Without it the minted token carries a scope the consent screen never
+      // showed.
+      const { db, cleanup } = await makeDb();
+      try {
+        const user = await createUser(db, "owner", "pw");
+        const session = createSession(db, { userId: user.id });
+        const reg = registerClient(db, { redirectUris: ["https://app.example/cb"] });
+        const { verifier, challenge } = makePkce();
+        const consentRes = await handleAuthorizePost(
+          db,
+          new Request(`${ISSUER}/oauth/authorize`, {
+            method: "POST",
+            body: new URLSearchParams({
+              __action: "consent",
+              __csrf: TEST_CSRF,
+              approve: "yes",
+              client_id: reg.client.clientId,
+              redirect_uri: "https://app.example/cb",
+              response_type: "code",
+              scope: "vault:read scribe:transcribe",
+              vault_pick: "jon",
+              code_challenge: challenge,
+              code_challenge_method: "S256",
+              resource: `${ISSUER}/mcp`,
+            }),
+            headers: {
+              "content-type": "application/x-www-form-urlencoded",
+              cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000))}`,
+            },
+          }),
+          RESOURCE_DEPS,
+        );
+        expect(consentRes.status).toBe(302);
+        const code = new URL(consentRes.headers.get("location") ?? "").searchParams.get("code");
+        expect(code).toBeTruthy();
+
+        const tokenRes = await handleToken(
+          db,
+          new Request(`${ISSUER}/oauth/token`, {
+            method: "POST",
+            body: new URLSearchParams({
+              grant_type: "authorization_code",
+              code: code ?? "",
+              client_id: reg.client.clientId,
+              redirect_uri: "https://app.example/cb",
+              code_verifier: verifier,
+            }),
+            headers: { "content-type": "application/x-www-form-urlencoded" },
+          }),
+          RESOURCE_DEPS,
+        );
+        expect(tokenRes.status).toBe(200);
+        const tok = (await tokenRes.json()) as { scope: string };
+        // scribe dropped; the picker's vault named the surviving vault scope,
+        // which is what makes the token usable at root /mcp at all (an unnamed
+        // `vault:read` / `aud=vault` token is rejected there).
+        expect(tok.scope.split(" ")).not.toContain("scribe:transcribe");
+        expect(tok.scope).toBe("vault:jon:read");
+      } finally {
+        cleanup();
+      }
+    });
+
+    test("a per-vault resource still narrows AND names — root did not shadow it", async () => {
+      // Ordering lock: the handler tries `resolveResourceVault` first. If the
+      // root branch ever ran first, this consent would lose the vault name and
+      // regress #461 to the weaker treatment.
+      const html = await consentFor(`${ISSUER}/vault/jon/mcp`);
+      expect(html).toContain("vault:jon:read");
+      expect(html).not.toContain("scribe:");
+      expect(html).not.toContain('name="vault_pick"');
+    });
+  });
 });
 
 // ───────────────────────────────────────────────────────────────────────────

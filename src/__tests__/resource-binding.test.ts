@@ -1,5 +1,10 @@
 import { describe, expect, test } from "bun:test";
-import { narrowResourceVaultScopes, resolveResourceVault } from "../resource-binding.ts";
+import {
+  isRootMcpResource,
+  narrowResourceVaultScopes,
+  narrowRootMcpScopes,
+  resolveResourceVault,
+} from "../resource-binding.ts";
 
 const ORIGIN = "https://hub.example";
 const BOUND = [ORIGIN, "http://127.0.0.1:1939"];
@@ -119,5 +124,95 @@ describe("narrowResourceVaultScopes", () => {
   test("is idempotent over an already-narrowed list", () => {
     const once = narrowResourceVaultScopes(["vault:read"], "jon");
     expect(narrowResourceVaultScopes(once, "jon")).toEqual(once);
+  });
+});
+
+describe("isRootMcpResource", () => {
+  test("recognises the root MCP endpoint", () => {
+    expect(isRootMcpResource(`${ORIGIN}/mcp`, BOUND)).toBe(true);
+    expect(isRootMcpResource(`${ORIGIN}/mcp/`, BOUND)).toBe(true);
+    expect(isRootMcpResource(`${ORIGIN}/mcp?x=1#y`, BOUND)).toBe(true);
+  });
+
+  test("recognises the root PRM document URL", () => {
+    // The path-suffixed shape the root 401 challenge advertises verbatim:
+    // `WWW-Authenticate: Bearer resource_metadata=".../.well-known/oauth-protected-resource/mcp"`.
+    expect(isRootMcpResource(`${ORIGIN}/.well-known/oauth-protected-resource/mcp`, BOUND)).toBe(
+      true,
+    );
+  });
+
+  test("resolves against a non-issuer bound origin (loopback)", () => {
+    expect(isRootMcpResource("http://127.0.0.1:1939/mcp", BOUND)).toBe(true);
+  });
+
+  test("returns false off-origin — same gate as resolveResourceVault", () => {
+    expect(isRootMcpResource("https://evil.example/mcp", BOUND)).toBe(false);
+  });
+
+  test("returns false for absent / malformed / non-root paths", () => {
+    expect(isRootMcpResource(null, BOUND)).toBe(false);
+    expect(isRootMcpResource(undefined, BOUND)).toBe(false);
+    expect(isRootMcpResource("", BOUND)).toBe(false);
+    expect(isRootMcpResource("not a url", BOUND)).toBe(false);
+    expect(isRootMcpResource(`${ORIGIN}/mcp/extra`, BOUND)).toBe(false);
+    expect(isRootMcpResource(`${ORIGIN}/scribe/mcp`, BOUND)).toBe(false);
+    // The BARE PRM (no `/mcp` suffix) describes the hub as a resource, not the
+    // root MCP door — a different document with a different `resource` field.
+    expect(isRootMcpResource(`${ORIGIN}/.well-known/oauth-protected-resource`, BOUND)).toBe(false);
+  });
+
+  test("a per-vault resource is NOT root — the two branches are disjoint", () => {
+    // The authorize handler tries `resolveResourceVault` first and only falls
+    // through to this predicate. If both could answer for one resource, the
+    // vault name would be silently dropped in favour of the weaker root
+    // treatment on any reorder.
+    for (const r of [
+      `${ORIGIN}/vault/jon/mcp`,
+      `${ORIGIN}/vault/jon/.well-known/oauth-protected-resource`,
+    ]) {
+      expect(resolveResourceVault(r, BOUND)).not.toBeNull();
+      expect(isRootMcpResource(r, BOUND)).toBe(false);
+    }
+  });
+});
+
+describe("narrowRootMcpScopes", () => {
+  test("drops non-vault scopes — the root door's scary-consent fix", () => {
+    // Same catalog claude.ai over-requests in the per-vault test above. At the
+    // root door it used to arrive at consent untouched, because
+    // `resolveResourceVault` returned null and the whole binding path no-op'd.
+    expect(
+      narrowRootMcpScopes([
+        "vault:read",
+        "vault:write",
+        "vault:admin",
+        "scribe:admin",
+        "scribe:transcribe",
+        "channel:send",
+        "hub:admin",
+      ]),
+    ).toEqual(["vault:read", "vault:write", "vault:admin"]);
+  });
+
+  test("does NOT name the vault scopes — there is no vault in the resource", () => {
+    // The picker supplies the name; `vault:<name>:<verb>` is minted downstream.
+    // Naming them here would require inventing a vault the client never asked
+    // for. This is the whole reason root is a separate branch and not an entry
+    // in the resolvable set.
+    expect(narrowRootMcpScopes(["vault:read"])).toEqual(["vault:read"]);
+  });
+
+  test("leaves already-named vault scopes untouched", () => {
+    expect(narrowRootMcpScopes(["vault:jon:read", "hub:admin"])).toEqual(["vault:jon:read"]);
+  });
+
+  test("a foreign-only request narrows to empty (authorize refuses invalid_scope)", () => {
+    expect(narrowRootMcpScopes(["hub:admin", "scribe:admin"])).toEqual([]);
+  });
+
+  test("is idempotent", () => {
+    const once = narrowRootMcpScopes(["vault:read", "hub:admin"]);
+    expect(narrowRootMcpScopes(once)).toEqual(once);
   });
 });
