@@ -1016,7 +1016,11 @@ describe("handleAccountHomeGet", () => {
       hubOrigin: HUB_ORIGIN,
       resolveVaultPort: () => 1940,
       // Stub the mirror fetch: resolves to a backed-up, GitHub-pushing config.
-      fetchMirror: async () => ({ enabled: true, backedUpToRemote: true }),
+      fetchMirror: async () => ({
+        enabled: true,
+        backedUpToRemote: true,
+        remotePushState: "ok" as const,
+      }),
     });
     expect(res.status).toBe(200);
     const html = await res.text();

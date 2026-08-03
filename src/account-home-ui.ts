@@ -160,6 +160,15 @@ export interface RenderAccountHomeOpts {
    */
   mirrorPushing?: Record<string, boolean>;
   /**
+   * Per-vault "does the backup line describe a GOOD state?" flag, threaded from
+   * `isMirrorHealthy(stat)`. Maps `vaultName` → `false` when the vault's push
+   * remote is failing or has never worked. Drives the tile's `✓` vs `!` glyph —
+   * gated on this proper boolean, NOT sniffed out of the `mirrorLines` string,
+   * same discipline as `mirrorPushing`. A vault absent defaults to `true`
+   * (healthy) so an older caller that doesn't build the map renders unchanged.
+   */
+  mirrorHealthy?: Record<string, boolean>;
+  /**
    * Set after a successful `POST /account/vault-token/<name>` to show the
    * freshly-minted token ONCE (the only time it's ever shown — the hub keeps
    * no plaintext copy). Drives the show-once banner at the top of the page.
@@ -262,6 +271,7 @@ export function renderAccountHome(opts: RenderAccountHomeOpts): string {
     usageStats: opts.usageStats ?? {},
     mirrorLines: opts.mirrorLines ?? {},
     mirrorPushing: opts.mirrorPushing ?? {},
+    mirrorHealthy: opts.mirrorHealthy ?? {},
   });
 
   const accountCard = renderAccountCard({
@@ -462,6 +472,8 @@ interface VaultCardOpts {
   mirrorLines: Record<string, string>;
   /** `vaultName` → is backup already pushing to a remote (gates the GitHub action). */
   mirrorPushing: Record<string, boolean>;
+  /** `vaultName` → is the backup state good (drives the ✓ vs ! glyph). Absent = healthy. */
+  mirrorHealthy: Record<string, boolean>;
 }
 
 /**
@@ -493,7 +505,7 @@ export function accountClaudeMcpAddCommand(trimmedOrigin: string, vaultName: str
 function renderVaultCard(opts: VaultCardOpts): string {
   const { assignedVaults, trimmedOrigin, isFirstAdmin, csrfToken, mintableVerbs, usageStats } =
     opts;
-  const { mirrorLines, mirrorPushing } = opts;
+  const { mirrorLines, mirrorPushing, mirrorHealthy } = opts;
 
   if (assignedVaults.length > 0) {
     // One vault tile per assignment (multi-user Phase 2 PR 2). The tile is the
@@ -535,6 +547,7 @@ function renderVaultCard(opts: VaultCardOpts): string {
           vaultName,
           mirrorLine,
           mirrorPushing[vaultName] ?? false,
+          mirrorHealthy[vaultName] ?? true,
           holdsAdmin,
           csrfToken,
         );
@@ -614,11 +627,17 @@ function renderVaultCard(opts: VaultCardOpts): string {
  * pushing to a remote) — `pushing` is a proper boolean threaded from the mirror
  * status (`VaultMirrorStat.backedUpToRemote`), never re-derived from the
  * display string.
+ *
+ * `healthy` likewise arrives as a boolean (`isMirrorHealthy`) and decides the
+ * glyph: `✓` for a good state, `!` when the push remote is failing or has
+ * never worked. Defaulting it to `true` at the call site keeps an older caller
+ * that doesn't thread the map rendering exactly as before.
  */
 function renderBackupBlock(
   vaultName: string,
   mirrorLine: string | undefined,
   pushing: boolean,
+  healthy: boolean,
   holdsAdmin: boolean,
   csrfToken: string,
 ): string {
@@ -638,10 +657,16 @@ function renderBackupBlock(
               </button>
             </form>`
       : "";
+  // Glyph follows OUTCOME, not configuration. A vault whose remote has never
+  // accepted a push gets `!`, never `✓` — the check mark next to "GitHub
+  // backup has never worked" was the whole shape of vault#822.
+  const glyph = healthy ? "✓" : "!";
+  const glyphClass = healthy ? "vault-backup-check" : "vault-backup-check vault-backup-warn";
+  const lineClass = healthy ? "vault-backup-line" : "vault-backup-line vault-backup-line-warn";
   return `
           <div class="vault-backup" data-testid="vault-backup">
-            <p class="vault-backup-line" data-testid="backup-state-line">
-              <span class="vault-backup-check" aria-hidden="true">✓</span>${escapeHtml(mirrorLine)}</p>${githubAction}
+            <p class="${lineClass}" data-testid="backup-state-line" data-backup-healthy="${healthy}">
+              <span class="${glyphClass}" aria-hidden="true">${glyph}</span>${escapeHtml(mirrorLine)}</p>${githubAction}
           </div>`;
 }
 
@@ -1034,6 +1059,15 @@ const STYLES = `
     display: inline-flex;
     align-items: center;
     justify-content: center;
+  }
+  /* Failing / never-worked backup: the line and its glyph go danger-coloured
+     so a broken off-site backup does not read as a healthy one at a glance. */
+  .vault-backup-line-warn { color: ${PALETTE.danger}; }
+  .vault-backup-warn {
+    background: ${PALETTE.dangerSoft};
+    color: ${PALETTE.danger};
+    border-color: ${PALETTE.danger};
+    font-weight: 700;
   }
   .vault-backup-github { margin: 0.4rem 0 0; }
   .vault-build-ui {

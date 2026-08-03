@@ -49,7 +49,7 @@ import type { Database } from "bun:sqlite";
 import { hash as argonHash } from "@node-rs/argon2";
 import { type ChangePasswordMode, renderChangePassword } from "./account-change-password-ui.ts";
 import { renderAccountHome } from "./account-home-ui.ts";
-import { fetchVaultMirrorStatus, formatMirrorLine } from "./account-mirror.ts";
+import { fetchVaultMirrorStatus, formatMirrorLine, isMirrorHealthy } from "./account-mirror.ts";
 import { fetchVaultUsage, formatUsageStat } from "./account-usage.ts";
 import { POST_LOGIN_DEFAULT } from "./admin-handlers.ts";
 import { renderAdminError } from "./admin-login-ui.ts";
@@ -575,6 +575,10 @@ export async function handleAccountHomeGet(req: Request, deps: AccountHomeDeps):
   // Threaded to the renderer as a proper boolean so it gates the "Back up to
   // GitHub ↗" action without re-deriving "are we pushing?" from the line string.
   const mirrorPushing: Record<string, boolean> = {};
+  // Whether each vault's backup line describes a GOOD state — drives the tile's
+  // `✓` vs `!`. A proper boolean for the same reason `mirrorPushing` is one: the
+  // renderer must never infer health by reading the display string.
+  const mirrorHealthy: Record<string, boolean> = {};
   if (deps.resolveVaultPort && user.assignedVaults.length > 0) {
     const fetchMirror = deps.fetchMirror ?? fetchVaultMirrorStatus;
     const resolvePort = deps.resolveVaultPort;
@@ -595,6 +599,7 @@ export async function handleAccountHomeGet(req: Request, deps: AccountHomeDeps):
           if (line) {
             mirrorLines[vaultName] = line;
             mirrorPushing[vaultName] = stat.backedUpToRemote;
+            mirrorHealthy[vaultName] = isMirrorHealthy(stat);
           }
         }
       }),
@@ -627,6 +632,7 @@ export async function handleAccountHomeGet(req: Request, deps: AccountHomeDeps):
       usageStats,
       mirrorLines,
       mirrorPushing,
+      mirrorHealthy,
       connectedVault,
     }),
     200,
