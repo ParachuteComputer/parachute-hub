@@ -21,6 +21,7 @@ import {
   accountMcpEndpoint,
   renderAccountHome,
 } from "../account-home-ui.ts";
+import type { VaultVerb } from "../users.ts";
 
 const HUB_ORIGIN = "https://hub.example";
 const CSRF = "test-csrf-token";
@@ -332,6 +333,84 @@ describe("renderAccountHome", () => {
     });
     expect(noMirror).not.toContain('data-testid="backup-state-line"');
     expect(noMirror).not.toContain('data-testid="vault-backup"');
+  });
+
+  test("backup glyph — follows the mirrorHealthy boolean, not the line string", () => {
+    // vault#822 regression guard, render layer. The logic tests in
+    // account-mirror.test.ts prove `isMirrorHealthy` returns false for a
+    // never-worked remote; NOTHING proved the renderer consumed it. That is the
+    // same shape as the bug itself — a correct value computed and then
+    // discarded — so it gets its own test rather than riding on the logic ones.
+    //
+    // Assertions are scoped to the backup block: `✓` legitimately appears
+    // elsewhere on the page (the onboarding checklist's "You're connected"),
+    // so a page-wide `not.toContain("✓")` would fail for the wrong reason.
+    const backupBlock = (html: string): string => {
+      const start = html.indexOf('data-testid="vault-backup"');
+      if (start === -1) return "";
+      return html.slice(start, html.indexOf("</div>", start));
+    };
+    const base = {
+      username: "alice",
+      assignedVaults: ["alice"],
+      passwordChanged: true,
+      hubOrigin: HUB_ORIGIN,
+      isFirstAdmin: false,
+      csrfToken: CSRF,
+      twoFactorEnabled: false,
+      mintableVerbs: { alice: ["read", "write", "admin"] as VaultVerb[] },
+    };
+
+    const broken = backupBlock(
+      renderAccountHome({
+        ...base,
+        mirrorLines: { alice: "Version history saved here — GitHub backup has never worked" },
+        mirrorPushing: { alice: true },
+        mirrorHealthy: { alice: false },
+      }),
+    );
+    // No green check next to a sentence saying the backup is broken.
+    expect(broken).toContain('data-backup-healthy="false"');
+    expect(broken).toContain("vault-backup-warn");
+    expect(broken).toContain(">!</span>");
+    expect(broken).not.toContain(">\u2713</span>");
+
+    const healthy = backupBlock(
+      renderAccountHome({
+        ...base,
+        mirrorLines: { alice: "Backed up — version history + GitHub" },
+        mirrorPushing: { alice: true },
+        mirrorHealthy: { alice: true },
+      }),
+    );
+    expect(healthy).toContain('data-backup-healthy="true"');
+    expect(healthy).toContain(">\u2713</span>");
+    expect(healthy).not.toContain("vault-backup-warn");
+
+    // The glyph must follow the BOOLEAN, not the words. A line that reads
+    // healthy with mirrorHealthy=false still gets `!` — same discipline the
+    // mirrorPushing test below pins for the GitHub action.
+    const lying = backupBlock(
+      renderAccountHome({
+        ...base,
+        mirrorLines: { alice: "Backed up — version history + GitHub" },
+        mirrorPushing: { alice: true },
+        mirrorHealthy: { alice: false },
+      }),
+    );
+    expect(lying).toContain(">!</span>");
+    expect(lying).not.toContain(">\u2713</span>");
+
+    // Absent from the map → healthy, so an older caller that never builds it
+    // renders exactly as before.
+    const legacy = backupBlock(
+      renderAccountHome({
+        ...base,
+        mirrorLines: { alice: "Backed up — full version history" },
+      }),
+    );
+    expect(legacy).toContain(">\u2713</span>");
+    expect(legacy).not.toContain("vault-backup-warn");
   });
 
   test("backup action — gated on the mirrorPushing boolean, not the line string", () => {
