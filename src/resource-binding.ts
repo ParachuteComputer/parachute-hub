@@ -224,9 +224,11 @@ export function narrowResourceVaultScopes(scopes: readonly string[], vaultName: 
  * Already-named `vault:<name>:<verb>` rides through untouched, same as the
  * per-vault path — a client that named a vault is not second-guessed here.
  *
- * A request that carries ONLY foreign scopes narrows to the empty list, which
- * the authorize handler already refuses with `invalid_scope` rather than
- * minting a zero-scope token. Same terminal behaviour as the per-vault path.
+ * A request that carries ONLY foreign scopes narrows to the empty list. The
+ * root authorize handler refuses that case with `invalid_scope` rather than
+ * reaching a zero-scope consent screen; the per-vault path deliberately keeps
+ * its empty narrowed list and renders consent, because that existing behavior
+ * is part of its contract.
  *
  * Idempotent: a second pass has nothing left to drop.
  */
