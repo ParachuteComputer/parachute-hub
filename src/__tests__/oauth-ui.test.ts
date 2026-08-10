@@ -316,8 +316,7 @@ describe("renderConsent", () => {
     expect(html).not.toContain('value="yes" class="btn btn-primary" disabled');
   });
 
-  // hub#689 — owner-on-own-vault verb selector rendering.
-  test("renders the owner verb selector (read/write/admin), pre-selected to admin", () => {
+  test("never renders the retired verb selector", () => {
     const html = renderConsent({
       params: { ...PARAMS, scope: "vault:read" },
       csrfToken: CSRF,
@@ -325,48 +324,8 @@ describe("renderConsent", () => {
       clientName: "App",
       scopes: ["vault:read"],
       vaultPicker: { unnamedVerbs: ["read"], availableVaults: ["work"], lockedVault: "work" },
-      ownerVerbSelector: { requestedVerbs: ["read"] },
     });
-    expect(html).toContain("Access level");
-    expect(html).toContain('name="verb_select" value="read"');
-    expect(html).toContain('name="verb_select" value="write"');
-    expect(html).toContain('name="verb_select" value="admin"');
-    // Admin is the pre-selected (checked) option.
-    expect(html).toMatch(/name="verb_select" value="admin"[^>]*checked/);
-    // read/write are NOT pre-checked.
-    expect(html).not.toMatch(/name="verb_select" value="read"[^>]*checked/);
-    expect(html).not.toMatch(/name="verb_select" value="write"[^>]*checked/);
-  });
-
-  test("owner verb selector keeps the admin option visibly flagged (admin badge + red border)", () => {
-    const html = renderConsent({
-      params: { ...PARAMS, scope: "vault:read" },
-      csrfToken: CSRF,
-      clientId: "c",
-      clientName: "App",
-      scopes: ["vault:read"],
-      vaultPicker: { unnamedVerbs: ["read"], availableVaults: ["work"], lockedVault: "work" },
-      ownerVerbSelector: { requestedVerbs: ["read"] },
-    });
-    // The .scope-admin red-border class + the admin badge ride on the admin
-    // radio option so a pre-selected admin grant stays transparent.
-    expect(html).toContain("verb-option-admin");
-    expect(html).toContain("scope-admin");
-    expect(html).toContain("badge-admin");
-  });
-
-  test("does NOT render the verb selector when ownerVerbSelector is absent (non-owner)", () => {
-    const html = renderConsent({
-      params: { ...PARAMS, scope: "vault:read" },
-      csrfToken: CSRF,
-      clientId: "c",
-      clientName: "App",
-      scopes: ["vault:read"],
-      vaultPicker: { unnamedVerbs: ["read"], availableVaults: ["work"], lockedVault: "work" },
-      // ownerVerbSelector omitted → no selector
-    });
-    expect(html).not.toContain("Access level");
-    expect(html).not.toContain('name="verb_select"');
+    expect(html.match(/name="verb_select"/g) ?? []).toHaveLength(0);
   });
 
   // hub#314 — same-hub vs external trust marker. The `.badge-trust-*` class
@@ -535,13 +494,8 @@ describe("substituteVaultDisplay", () => {
     expect(substituteVaultDisplay("vault:other:read", "work")).toBe("vault:other:read");
   });
 
-  test("vault admin (vault:admin) doesn't get narrowed — admin verb stays unnamed", () => {
-    // vault:admin is a full-vault scope; we don't narrow it the same way
-    // because per-vault admin is `vault:<name>:admin` (non-requestable) and
-    // the unnamed vault:admin form is the legacy full-vault grant. Keep the
-    // displayed shape as-is so the operator sees the scope they're
-    // consenting to literally.
-    expect(substituteVaultDisplay("vault:admin", "work")).toBe("vault:admin");
+  test("vault admin (vault:admin) gets the same named display as other verbs", () => {
+    expect(substituteVaultDisplay("vault:admin", "work")).toBe("vault:work:admin");
   });
 
   test("'*' → renders the wildcard display form (vault:*:<verb>)", () => {
@@ -618,6 +572,30 @@ describe("renderConsent displayVault substitution", () => {
     expect(html).toContain("A specific vault is picked below");
     // explainScope label still resolves via the verb-form lookup.
     expect(html).toContain("Read your notes");
+  });
+
+  test("admin displayVault substitution includes the admin verb", () => {
+    const html = renderConsent({
+      params: { ...PARAMS, scope: "vault:admin" },
+      csrfToken: CSRF,
+      clientId: "c",
+      clientName: "App",
+      scopes: ["vault:admin"],
+      displayVault: "u",
+    });
+    expect(html).toContain('<code class="scope-name">vault:u:admin</code>');
+  });
+
+  test("display-normalized duplicate vault scopes render one row", () => {
+    const html = renderConsent({
+      params: { ...PARAMS, scope: "vault:read vault:unforced:read" },
+      csrfToken: CSRF,
+      clientId: "c",
+      clientName: "App",
+      scopes: ["vault:read", "vault:unforced:read"],
+      displayVault: "unforced",
+    });
+    expect((html.match(/<li class="scope/g) ?? []).length).toBe(1);
   });
 
   test("displayVault undefined preserves the legacy raw form (no substitution)", () => {
