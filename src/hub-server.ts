@@ -72,7 +72,8 @@
  *                                                 connections sweep, CLI remove,
  *                                                 supervisor restart)
  *   # /account/* — the Bearer-gated account-door REST facade (Phase 2, H2).
- *   # account:self:admin OR parachute:host:admin (mutations); +:read (reads).
+ *   # account:self:write (create/configure), account:self:admin (delete/mint),
+ *   # or parachute:host:admin (all mutations); +:read (reads).
  *   /account                      (GET)        → account bootstrap {id,email,door} (Bearer only)
  *   /account/vaults               (GET/POST)   → list / create vault (create returns vault_token)
  *   /account/vaults/<name>        (DELETE)     → teardown (wraps /vaults/<name> cascade)
@@ -259,7 +260,7 @@ import { handleHostAdminToken } from "./admin-host-admin-token.ts";
 import { handleModuleToken } from "./admin-module-token.ts";
 import { routeAdminSurfaces } from "./admin-surfaces.ts";
 import { handleVaultAdminToken } from "./admin-vault-admin-token.ts";
-import { handleCreateVault, handleDeleteVault } from "./admin-vaults.ts";
+import { type RunResult, handleCreateVault, handleDeleteVault } from "./admin-vaults.ts";
 import { handleApiAccount } from "./api-account-2fa.ts";
 import {
   handleAccountChangePasswordGet,
@@ -1387,6 +1388,8 @@ export interface HubFetchDeps {
    * at a tmpdir; production defaults to `<CONFIG_DIR>/connections.json`.
    */
   connectionsStorePath?: string;
+  /** Test seam for the vault-removal command used by DELETE route tests. */
+  deleteVaultRunCommand?: (cmd: readonly string[]) => Promise<RunResult>;
   /**
    * Path to `agent-grants.json` (the agent-connector grant store, 4b-1). Tests
    * point this at a tmpdir; production defaults to `<CONFIG_DIR>/agent-grants.json`.
@@ -3167,6 +3170,7 @@ export function hubFetch(
           agentOrigin,
           resolveVaultOrigin,
           resolveModuleOrigin: makeResolveModuleOrigin(manifestPath),
+          ...(deps?.deleteVaultRunCommand ? { runCommand: deps.deleteVaultRunCommand } : {}),
           // Daemon eviction — the same in-process supervisor the lifecycle
           // verbs drive (module-ops API); restarting vault evicts the open
           // store handle + re-runs selfRegister (services.json path rebuild).
@@ -3989,9 +3993,9 @@ export function hubFetch(
       // The normalized account API both doors mount (the hosted cloud door
       // mounts the twin). Bearer-authed, machine-to-machine — no session
       // cookie — so these precede the session-cookie `/account/vault-token/`
-      // + `/account/` HTML routes below. Mutations accept account:self:admin
-      // OR parachute:host:admin; reads also accept account:self:read. See
-      // `account-api.ts`.
+      // + `/account/` HTML routes below. Create/set-caps accept
+      // account:self:write (or its stronger admin scope); delete/mint remain
+      // admin-only; reads also accept account:self:read. See `account-api.ts`.
       // ====================================================================
       if (pathname === "/account/vaults") {
         if (!getDb) return dbNotConfigured();
@@ -4027,10 +4031,11 @@ export function hubFetch(
           return new Response("method not allowed", { status: 405 });
         }
         // DELETE /account/vaults/<name> — teardown via the full identity
-        // cascade. Gate with the account-scope set here (accept account:self:admin
-        // OR parachute:host:admin), then delegate to `handleDeleteVault`, which
-        // re-gates parachute:host:admin — the superset account token carries it,
-        // so this is belt-and-suspenders, not a second authorization.
+        // cascade. Gate with the admin-only account-scope set here (accept
+        // account:self:admin OR parachute:host:admin), then delegate to
+        // `handleDeleteVault`, which re-gates parachute:host:admin — the
+        // superset account token carries it, so this is belt-and-suspenders,
+        // not a second authorization.
         if (req.method === "DELETE") {
           const name = decodeURIComponent(rest);
           if (!name || name.includes("/")) return new Response("not found", { status: 404 });
@@ -4065,6 +4070,7 @@ export function hubFetch(
             agentOrigin,
             resolveVaultOrigin,
             resolveModuleOrigin: makeResolveModuleOrigin(manifestPath),
+            ...(deps?.deleteVaultRunCommand ? { runCommand: deps.deleteVaultRunCommand } : {}),
             ...(supervisor
               ? {
                   restartVaultModule: async () => {

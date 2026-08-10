@@ -20,13 +20,15 @@
  *   GET    /.well-known/parachute-account → the public capabilities descriptor
  *
  * Auth posture: `Authorization: Bearer` + scope, adopting the hub's admin shape
- * (NOT the console session-cookie + CSRF + HTML-form shape). Mutations accept
- * `account:self:admin` OR `parachute:host:admin`; reads additionally accept
- * `account:self:read`. Per PLAN-DECISION SCOPE-b the hub's account token is a
- * SUPERSET that carries both the `account:self:*` string AND the host scopes,
- * so the wrapped cores (which still gate on `parachute:host:admin`) accept it
- * unchanged and this facade works whether or not the H1 scope-registry PR has
- * landed — a plain host-admin token is always sufficient.
+ * (NOT the console session-cookie + CSRF + HTML-form shape). Create-vault and
+ * set-caps accept `account:self:write` or its stronger `:admin` scope;
+ * delete-vault and token-minting remain admin-only. Reads accept `:read` and
+ * stronger account scopes. Every route also accepts `parachute:host:admin`.
+ * Per PLAN-DECISION SCOPE-b the hub's account token is a SUPERSET that carries
+ * both the `account:self:*` string AND the host scopes, so the wrapped cores
+ * (which still gate on `parachute:host:admin`) accept it unchanged and this
+ * facade works whether or not the H1 scope-registry PR has landed — a plain
+ * host-admin token is always sufficient.
  *
  * On self-host the account IS the box (operator ≡ account ≡ box): the account
  * id is the sentinel `self`, and the operator owns every vault, so the
@@ -56,31 +58,42 @@ import { SERVICES_MANIFEST_PATH } from "./config.ts";
 import { activePublicSignupPath } from "./invites.ts";
 import { inferAudience } from "./jwt-audience.ts";
 import { recordTokenMint, signAccessToken, validateAccessToken } from "./jwt-sign.ts";
-import { ACCOUNT_SELF_ADMIN_SCOPE, ACCOUNT_SELF_READ_SCOPE } from "./scope-explanations.ts";
+import {
+  ACCOUNT_SELF_ADMIN_SCOPE,
+  ACCOUNT_SELF_READ_SCOPE,
+  ACCOUNT_SELF_WRITE_SCOPE,
+} from "./scope-explanations.ts";
 import { readManifestLenient } from "./services-manifest.ts";
 import { getUserById } from "./users.ts";
 import { getVaultCap, setVaultCap } from "./vault-caps.ts";
 import { VAULT_NAME_CHARSET_RE } from "./vault-name.ts";
 import { isVaultEntry, vaultInstanceNameFor } from "./well-known.ts";
 
-// The `account:self:{admin,read}` scope strings are defined once in
-// scope-explanations.ts (H1, #746) — the same registry that makes them
-// non-OAuth-requestable — and imported here so the two never drift.
+// The `account:self:{admin,write,read}` scope strings are defined once in
+// scope-explanations.ts (H1, #746) and imported here so the two never drift.
 /** client_id stamped on per-vault tokens this surface mints + their registry rows. */
 const ACCOUNT_API_CLIENT_ID = "parachute-account";
 
 /**
- * Scopes that satisfy a `/account/*` MUTATION. The account superset token
- * carries `account:self:admin`; a plain operator/host-admin token carries
- * `parachute:host:admin`. Either is accepted so H2 works independent of H1's
- * merge order (SCOPE-b).
+ * Scopes that satisfy an admin-only `/account/*` mutation (delete / mint). The
+ * account superset token carries `account:self:admin`; a plain
+ * operator/host-admin token carries `parachute:host:admin`. Either is accepted
+ * so H2 works independent of H1's merge order (SCOPE-b).
  *
  * ORDER IS LOAD-BEARING: `requireAnyScope` puts `[0]` in the RFC 6750 `scope`
  * challenge, so the narrowest scope an account-door client should request must
  * come first.
  */
 const ADMIN_SCOPES: readonly string[] = [ACCOUNT_SELF_ADMIN_SCOPE, HOST_ADMIN_SCOPE];
-/** Scopes that satisfy a `/account/*` READ. `admin ⊇ read`, spelled explicitly
+/** Scopes that satisfy a `/account/*` WRITE mutation (create, set-caps) — the
+ * middle rung: provision/configure without delete or credential-minting
+ * authority. ORDER IS LOAD-BEARING (see ADMIN_SCOPES doc) — narrowest first. */
+const WRITE_SCOPES: readonly string[] = [
+  ACCOUNT_SELF_WRITE_SCOPE,
+  ACCOUNT_SELF_ADMIN_SCOPE,
+  HOST_ADMIN_SCOPE,
+];
+/** Scopes that satisfy a `/account/*` READ. `admin ⊇ write ⊇ read`, spelled explicitly
  * because the hub's `requireScope` does an exact-string membership check (no
  * inheritance expansion at validate time). Narrowest-first, per ADMIN_SCOPES. */
 const READ_SCOPES: readonly string[] = [
@@ -184,8 +197,10 @@ export async function requireAnyScope(
   return { sub, scopes, clientId, audience: aud };
 }
 
-/** Scope set for a `/account/*` mutation (create / delete / mint / set-caps). */
+/** Scope set for admin-only `/account/*` mutations (delete / mint). */
 export const ACCOUNT_MUTATION_SCOPES = ADMIN_SCOPES;
+/** Scope set for write-tier `/account/*` mutations (create / set-caps). */
+export const ACCOUNT_WRITE_SCOPES = WRITE_SCOPES;
 /** Scope set for a `/account/*` read (list / get-caps / bootstrap). */
 export const ACCOUNT_READ_SCOPES = READ_SCOPES;
 
@@ -411,7 +426,7 @@ export async function handleAccountCreateVault(
 ): Promise<Response> {
   if (req.method !== "POST") return methodNotAllowed("POST");
   try {
-    await requireAnyScope(deps.db, req, ADMIN_SCOPES, deps.knownIssuers ?? [deps.issuer]);
+    await requireAnyScope(deps.db, req, WRITE_SCOPES, deps.knownIssuers ?? [deps.issuer]);
   } catch (err) {
     return adminAuthErrorResponse(err);
   }
@@ -672,7 +687,7 @@ export async function handleAccountSetVaultCaps(
 ): Promise<Response> {
   if (req.method !== "PUT") return methodNotAllowed("PUT");
   try {
-    await requireAnyScope(deps.db, req, ADMIN_SCOPES, deps.knownIssuers ?? [deps.issuer]);
+    await requireAnyScope(deps.db, req, WRITE_SCOPES, deps.knownIssuers ?? [deps.issuer]);
   } catch (err) {
     return adminAuthErrorResponse(err);
   }

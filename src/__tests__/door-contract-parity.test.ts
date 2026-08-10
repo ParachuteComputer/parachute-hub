@@ -3,12 +3,17 @@ import {
   ACCESS_TOKEN_TTL_SECONDS as CONTRACT_ACCESS_TTL,
   ACCOUNT_SELF_ADMIN_SCOPE as CONTRACT_ACCOUNT_ADMIN,
   ACCOUNT_SELF_READ_SCOPE as CONTRACT_ACCOUNT_READ,
+  ACCOUNT_SELF_WRITE_SCOPE as CONTRACT_ACCOUNT_WRITE,
   REFRESH_GRACE_MS as CONTRACT_REFRESH_GRACE,
   REFRESH_TOKEN_TTL_MS as CONTRACT_REFRESH_TTL,
   hasAccountScope,
 } from "@openparachute/door-contract";
 import { ACCESS_TOKEN_TTL_SECONDS, REFRESH_GRACE_MS, REFRESH_TOKEN_TTL_MS } from "../jwt-sign.ts";
-import { ACCOUNT_SELF_ADMIN_SCOPE, ACCOUNT_SELF_READ_SCOPE } from "../scope-explanations.ts";
+import {
+  ACCOUNT_SELF_ADMIN_SCOPE,
+  ACCOUNT_SELF_READ_SCOPE,
+  ACCOUNT_SELF_WRITE_SCOPE,
+} from "../scope-explanations.ts";
 
 /**
  * Drift detector for the shared door contract (Cloud+Hub shared-core campaign,
@@ -34,13 +39,18 @@ describe("door-contract parity — token constants", () => {
 describe("door-contract parity — account scopes", () => {
   test("the hub's account scope strings equal the shared contract", () => {
     expect(ACCOUNT_SELF_ADMIN_SCOPE).toBe(CONTRACT_ACCOUNT_ADMIN);
+    expect(ACCOUNT_SELF_WRITE_SCOPE).toBe(CONTRACT_ACCOUNT_WRITE);
     expect(ACCOUNT_SELF_READ_SCOPE).toBe(CONTRACT_ACCOUNT_READ);
   });
 
-  test("the shared checker agrees with the hub's admin⊇read intent", () => {
-    // The hub's `/account/*` gate treats `account:self:admin` as satisfying a
-    // read requirement (scope-explanations.ts). The shared checker must too.
+  test("the shared checker agrees with the hub's admin⊇write⊇read intent", () => {
+    // The hub's `/account/*` gate treats stronger account scopes as satisfying
+    // weaker requirements (scope-explanations.ts). The shared checker must too.
     expect(hasAccountScope([ACCOUNT_SELF_ADMIN_SCOPE], "self", "read")).toBe(true);
+    expect(hasAccountScope([ACCOUNT_SELF_ADMIN_SCOPE], "self", "write")).toBe(true);
+    expect(hasAccountScope([ACCOUNT_SELF_WRITE_SCOPE], "self", "write")).toBe(true);
+    expect(hasAccountScope([ACCOUNT_SELF_WRITE_SCOPE], "self", "read")).toBe(true);
     expect(hasAccountScope([ACCOUNT_SELF_READ_SCOPE], "self", "admin")).toBe(false);
+    expect(hasAccountScope([ACCOUNT_SELF_WRITE_SCOPE], "self", "admin")).toBe(false);
   });
 });

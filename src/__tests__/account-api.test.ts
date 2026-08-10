@@ -31,6 +31,7 @@ import { getVaultCap } from "../vault-caps.ts";
 const ISSUER = "http://127.0.0.1:1939";
 const HOST_ADMIN_SCOPE = "parachute:host:admin";
 const ACCOUNT_ADMIN_SCOPE = "account:self:admin";
+const ACCOUNT_WRITE_SCOPE = "account:self:write";
 const ACCOUNT_READ_SCOPE = "account:self:read";
 
 type RunResult = { exitCode: number; stdout: string; stderr: string };
@@ -442,10 +443,10 @@ describe("account API — auth gates", () => {
     }
   });
 
-  // Mutations advertise the admin scope, not the read one — a client that got
-  // `account:self:read` from the list route and then tried to create a vault
-  // must be told to step UP, not handed the scope it already has.
-  test("a mutation 403 challenges for account:self:admin, not account:self:read", async () => {
+  // Create/configure mutations advertise the write scope, not the read one —
+  // a client that got `account:self:read` from the list route and then tried
+  // to create a vault must be told to step UP, not handed the scope it has.
+  test("a write mutation 403 challenges for account:self:write, not account:self:read", async () => {
     const h = makeHarness();
     try {
       const token = await bearer(h, [ACCOUNT_READ_SCOPE]);
@@ -463,7 +464,7 @@ describe("account API — auth gates", () => {
       expect(res.status).toBe(403);
       const challenge = res.headers.get("www-authenticate") ?? "";
       const scopeParam = /(?:^|[\s,])scope="([^"]*)"/.exec(challenge)?.[1];
-      expect(scopeParam).toBe(ACCOUNT_ADMIN_SCOPE);
+      expect(scopeParam).toBe(ACCOUNT_WRITE_SCOPE);
     } finally {
       h.cleanup();
     }
@@ -491,7 +492,7 @@ describe("account API — auth gates", () => {
     }
   });
 
-  test("account:self:read is accepted on reads but rejected (403) on mutations", async () => {
+  test("account:self:read is accepted on reads but rejected (403) on all mutations", async () => {
     const h = makeHarness();
     try {
       const token = await bearer(h, [ACCOUNT_READ_SCOPE]);
@@ -502,6 +503,18 @@ describe("account API — auth gates", () => {
         deps(h),
       );
       expect(write.status).toBe(403);
+      const setCaps = await handleAccountSetVaultCaps(
+        jsonReq("/account/vaults/beta/caps", token, "PUT", { cap_bytes: 1024 }),
+        "beta",
+        deps(h),
+      );
+      expect(setCaps.status).toBe(403);
+      const mint = await handleAccountMintVaultToken(
+        withBearer("/account/vaults/beta/token", token, { method: "POST" }),
+        "beta",
+        deps(h),
+      );
+      expect(mint.status).toBe(403);
     } finally {
       h.cleanup();
     }
@@ -542,6 +555,33 @@ describe("handleAccountListVaults", () => {
 // POST /account/vaults — create (returns a ready-to-use vault token)
 // ===========================================================================
 describe("handleAccountCreateVault", () => {
+  test("account:self:write can create a vault", async () => {
+    const h = makeHarness(["default"]);
+    try {
+      const token = await bearer(h, [ACCOUNT_WRITE_SCOPE]);
+      const runCommand = async (_cmd: readonly string[]): Promise<RunResult> => {
+        upsertService(
+          {
+            name: "parachute-vault",
+            port: 4101,
+            paths: ["/vault/default", "/vault/work"],
+            health: "/health",
+            version: "0.4.2",
+          },
+          h.manifestPath,
+        );
+        return { exitCode: 0, stdout: vaultCreateJson("work", "hubjwt.work.access"), stderr: "" };
+      };
+      const res = await handleAccountCreateVault(
+        jsonReq("/account/vaults", token, "POST", { name: "work" }),
+        deps(h, { runCommand }),
+      );
+      expect(res.status).toBe(201);
+    } finally {
+      h.cleanup();
+    }
+  });
+
   test("201 returns the vault token + services block on a fresh create", async () => {
     const h = makeHarness(["default"]);
     try {
@@ -654,6 +694,24 @@ describe("handleAccountCreateVault", () => {
 // POST /account/vaults/<name>/token — per-vault token mint
 // ===========================================================================
 describe("handleAccountMintVaultToken", () => {
+  test("account:self:write is rejected and the challenge remains account:self:admin", async () => {
+    const h = makeHarness(["field-notes"]);
+    try {
+      const token = await bearer(h, [ACCOUNT_WRITE_SCOPE]);
+      const res = await handleAccountMintVaultToken(
+        withBearer("/account/vaults/field-notes/token", token, { method: "POST" }),
+        "field-notes",
+        deps(h),
+      );
+      expect(res.status).toBe(403);
+      const challenge = res.headers.get("www-authenticate") ?? "";
+      const scopeParam = /(?:^|[\s,])scope="([^"]*)"/.exec(challenge)?.[1];
+      expect(scopeParam).toBe(ACCOUNT_ADMIN_SCOPE);
+    } finally {
+      h.cleanup();
+    }
+  });
+
   test("mints a vault token with aud=vault.<name> and default read+write scope", async () => {
     const h = makeHarness(["field-notes"]);
     try {
@@ -749,6 +807,22 @@ describe("handleAccountMintVaultToken", () => {
 // GET / PUT /account/vaults/<name>/caps
 // ===========================================================================
 describe("account caps", () => {
+  test("account:self:write can set a vault's caps", async () => {
+    const h = makeHarness(["field-notes"]);
+    try {
+      const token = await bearer(h, [ACCOUNT_WRITE_SCOPE]);
+      const res = await handleAccountSetVaultCaps(
+        jsonReq("/account/vaults/field-notes/caps", token, "PUT", { cap_bytes: 1048576 }),
+        "field-notes",
+        deps(h),
+      );
+      expect(res.status).toBe(200);
+      expect(getVaultCap(h.db, "field-notes")?.capBytes).toBe(1048576);
+    } finally {
+      h.cleanup();
+    }
+  });
+
   test("GET reports null cap for an uncapped vault; PUT sets it; GET reflects", async () => {
     const h = makeHarness(["field-notes"]);
     try {

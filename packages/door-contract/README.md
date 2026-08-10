@@ -21,7 +21,7 @@ owns the **door/issuer** side.
 | Module | Contract |
 |---|---|
 | `tokens.ts` | `ACCESS_TOKEN_TTL_SECONDS`, `REFRESH_TOKEN_TTL_MS`, `REFRESH_GRACE_MS`, `TOKEN_TYPE`, `SIGNING_ALG` + `AccessTokenClaims` / `TokenResponse` |
-| `scopes.ts` | the `account:<id>:<verb>` grammar (`admin ⊇ read`) + `hasAccountScope` |
+| `scopes.ts` | the `account:<id>:<verb>` grammar (`admin ⊇ write ⊇ read`) + `hasAccountScope` |
 | `discovery.ts` | RFC 8414 / 9728 metadata vectors: `expected*Metadata(issuer, …)` |
 | `account-contract.ts` | the `/account/*` route table (`ACCOUNT_ROUTES`) + request/response types, the `AccountAuthDescriptor` block, and `ACCOUNT_ERROR_CODES` |
 | `vault-scopes.ts` | `validateVaultScopes(requested, vaultName)` — the shared per-vault-mint scope validator |

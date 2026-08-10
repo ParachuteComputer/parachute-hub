@@ -90,6 +90,7 @@ import {
 import {
   ACCOUNT_SELF_ADMIN_SCOPE,
   ACCOUNT_SELF_READ_SCOPE,
+  ACCOUNT_SELF_WRITE_SCOPE,
   isNonRequestableScope,
   isRequestableScope,
   scopeIsAdmin,
@@ -1530,6 +1531,7 @@ export function grantableExtraScopes(
       ? [`vault:${v}:read`, `vault:${v}:write`, `vault:${v}:admin`]
       : ["vault:read", "vault:write", "vault:admin"]),
     ACCOUNT_SELF_READ_SCOPE,
+    ACCOUNT_SELF_WRITE_SCOPE,
     ACCOUNT_SELF_ADMIN_SCOPE,
   ];
 

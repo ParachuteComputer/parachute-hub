@@ -1,9 +1,9 @@
 /**
  * Account scopes: requestable, risk-tiered, and capped to the account holder.
  *
- * The decision (2026-07-30) was that `account:self:admin` may be requested
- * through the public OAuth flow, carrying delete-vault, because most
- * integrations never need it and the ones that do are legitimate.
+ * The decision (2026-07-30) was that the account scope ladder may be requested
+ * through the public OAuth flow, with the write rung carrying create/configure
+ * authority and admin carrying delete-vault and credential-minting authority.
  *
  * Implementing that naively would have been a privilege escalation. On
  * self-host the account IS the box — `account-api.ts` says so plainly:
@@ -22,14 +22,16 @@ import { describe, expect, test } from "bun:test";
 import {
   ACCOUNT_SELF_ADMIN_SCOPE,
   ACCOUNT_SELF_READ_SCOPE,
+  ACCOUNT_SELF_WRITE_SCOPE,
   explainScope,
   isRequestableScope,
   riskForExplanation,
 } from "../scope-explanations.ts";
 
 describe("requestability", () => {
-  test("both account scopes are now requestable via OAuth", () => {
+  test("all three account scopes are now requestable via OAuth", () => {
     expect(isRequestableScope(ACCOUNT_SELF_ADMIN_SCOPE)).toBe(true);
+    expect(isRequestableScope(ACCOUNT_SELF_WRITE_SCOPE)).toBe(true);
     expect(isRequestableScope(ACCOUNT_SELF_READ_SCOPE)).toBe(true);
   });
 
@@ -58,6 +60,19 @@ describe("risk tiers", () => {
     const e = explainScope(ACCOUNT_SELF_ADMIN_SCOPE);
     expect(e).toBeTruthy();
     expect(riskForExplanation(e!)).toBe("high");
+  });
+
+  test("account:self:write is ELEVATED with an explicit boundary label", () => {
+    const e = explainScope(ACCOUNT_SELF_WRITE_SCOPE);
+    expect(e).toBeTruthy();
+    expect(e?.label.length).toBeGreaterThan(0);
+    expect(e?.label).not.toBe(explainScope(ACCOUNT_SELF_ADMIN_SCOPE)?.label);
+    expect(e?.label).not.toBe(explainScope(ACCOUNT_SELF_READ_SCOPE)?.label);
+    expect(e?.label).toMatch(/create/i);
+    expect(e?.label).toMatch(/cannot delete vaults/i);
+    expect(e?.label).toMatch(/mint access tokens/i);
+    expect(e?.risk).toBe("elevated");
+    expect(riskForExplanation(e!)).toBe("elevated");
   });
 
   test("a single vault's admin is ELEVATED, not high", () => {
@@ -104,6 +119,7 @@ describe("requestable is NOT the same as advertised", () => {
   test("account scopes stay requestable", () => {
     // A client that genuinely manages vaults must still be able to ask.
     expect(isRequestableScope(ACCOUNT_SELF_ADMIN_SCOPE)).toBe(true);
+    expect(isRequestableScope(ACCOUNT_SELF_WRITE_SCOPE)).toBe(true);
     expect(isRequestableScope(ACCOUNT_SELF_READ_SCOPE)).toBe(true);
   });
 
@@ -122,6 +138,7 @@ describe("requestable is NOT the same as advertised", () => {
           "vault:write",
           "vault:admin",
           ACCOUNT_SELF_READ_SCOPE,
+          ACCOUNT_SELF_WRITE_SCOPE,
           ACCOUNT_SELF_ADMIN_SCOPE,
         ]),
       loadServicesManifest: () => ({ services: [{ name: "parachute-vault", port: 1940 }] }),
@@ -132,6 +149,7 @@ describe("requestable is NOT the same as advertised", () => {
     expect(body.scopes_supported).toContain("vault:admin");
     // …account-wide authority is not.
     expect(body.scopes_supported).not.toContain(ACCOUNT_SELF_ADMIN_SCOPE);
+    expect(body.scopes_supported).not.toContain(ACCOUNT_SELF_WRITE_SCOPE);
     expect(body.scopes_supported).not.toContain(ACCOUNT_SELF_READ_SCOPE);
   });
 });

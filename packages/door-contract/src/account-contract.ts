@@ -5,7 +5,8 @@
  * in each file; this is the machine-readable spec both twins can assert against.
  *
  * Auth posture: `Authorization: Bearer <account token>`; every route gates on an
- * account scope (`read` for GETs, `admin` for mutations) via the grammar in
+ * account scope (`read` for GETs, `write` for create/configure mutations, and
+ * `admin` for destructive or credential-minting mutations) via the grammar in
  * `scopes.ts`. The account id comes from the TOKEN, never a request body — a
  * token for account A can only ever act on account A's vaults.
  */
@@ -51,7 +52,7 @@ export const ACCOUNT_ROUTES: readonly AccountRoute[] = [
   {
     method: "POST",
     path: "/account/vaults",
-    scope: "admin",
+    scope: "write",
     summary: "Create a vault (plan vault-count capped).",
   },
   {
@@ -78,7 +79,7 @@ export const ACCOUNT_ROUTES: readonly AccountRoute[] = [
   {
     method: "PUT",
     path: "/account/vaults/<name>/caps",
-    scope: "admin",
+    scope: "write",
     summary: "Set a vault's storage caps.",
     // Optional: hub-only, same reason as the GET above.
     optional: true,

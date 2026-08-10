@@ -23,6 +23,7 @@ describe("SCOPE_EXPLANATIONS", () => {
       "parachute:host:admin",
       // Account scopes (Parachute App campaign, Phase 2).
       "account:self:admin",
+      "account:self:write",
       "account:self:read",
     ];
     for (const s of expected) {
@@ -167,6 +168,7 @@ describe("NON_REQUESTABLE_SCOPES (#96)", () => {
     // "high" with the consequences named. See the [9b]/[9c] cap tests in
     // oauth-handlers.test.ts — those are what keep this safe.
     expect(NON_REQUESTABLE_SCOPES.has("account:self:admin")).toBe(false);
+    expect(NON_REQUESTABLE_SCOPES.has("account:self:write")).toBe(false);
     expect(NON_REQUESTABLE_SCOPES.has("account:self:read")).toBe(false);
   });
 
@@ -210,10 +212,12 @@ describe("isRequestableScope", () => {
 
   test("account scopes ARE requestable, and still read as admin for the consent gates", () => {
     expect(isRequestableScope("account:self:admin")).toBe(true);
+    expect(isRequestableScope("account:self:write")).toBe(true);
     expect(isRequestableScope("account:self:read")).toBe(true);
     // explainScope resolves them (direct SCOPE_EXPLANATIONS keys) with the
     // right levels, so scopeIsAdmin recognizes the admin form.
     expect(explainScope("account:self:admin")?.level).toBe("admin");
+    expect(explainScope("account:self:write")?.level).toBe("write");
     expect(explainScope("account:self:read")?.level).toBe("read");
     expect(scopeIsAdmin("account:self:admin")).toBe(true);
     expect(scopeIsAdmin("account:self:read")).toBe(false);

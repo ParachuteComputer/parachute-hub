@@ -8,8 +8,9 @@
  *   - 403 not_admin when a signed-in non-first-admin (friend) hits the endpoint.
  *   - 200 mint carrying the superset {account:self:admin, parachute:host:admin,
  *     parachute:host:auth}, aud="account", validating against the hub's keys.
- *   - scope-guard admin ⊇ read: account:self:read is inherited by the minted
- *     account:self:admin (the RS-side check the `/account/*` validator runs).
+ *   - scope-guard admin ⊇ write ⊇ read: the minted account:self:admin inherits
+ *     the account:self:write and account:self:read requirements
+ *     (the RS-side check the `/account/*` validator runs).
  *   - the superset actually unlocks a host-admin-gated endpoint (requireScope
  *     accepts parachute:host:admin even though aud="account" — SCOPE-b).
  *   - sliding session renewal on the success path.
@@ -34,7 +35,11 @@ import { requireScope } from "../admin-auth.ts";
 import { CSRF_FIELD_NAME, buildCsrfCookie, generateCsrfToken } from "../csrf.ts";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
 import { validateAccessToken } from "../jwt-sign.ts";
-import { ACCOUNT_SELF_ADMIN_SCOPE, ACCOUNT_SELF_READ_SCOPE } from "../scope-explanations.ts";
+import {
+  ACCOUNT_SELF_ADMIN_SCOPE,
+  ACCOUNT_SELF_READ_SCOPE,
+  ACCOUNT_SELF_WRITE_SCOPE,
+} from "../scope-explanations.ts";
 import {
   SESSION_TTL_MS,
   buildSessionCookie,
@@ -243,9 +248,9 @@ describe("handleAccountToken", () => {
     expect(scopes).toContain("parachute:host:auth");
   });
 
-  test("scope-guard: account:self:read is inherited by the minted account:self:admin", async () => {
-    // The `/account/*` validator (H2 / cloud) hand-rolls admin ⊇ read via
-    // scope-guard. The minted token carries account:self:admin; a read-gated
+  test("scope-guard: write/read are inherited by the minted account:self:admin", async () => {
+    // The `/account/*` validator (H2 / cloud) hand-rolls admin ⊇ write ⊇ read via
+    // scope-guard. The minted token carries account:self:admin; a write/read-gated
     // account endpoint must accept it, an admin-gated one too, and neither a
     // different account id nor an unrelated resource must match.
     const { cookie, csrf } = await withAdminSession();
@@ -257,7 +262,8 @@ describe("handleAccountToken", () => {
     const { scopes } = (await res.json()) as { scopes: string[] };
 
     expect(hasScope(scopes, ACCOUNT_SELF_ADMIN_SCOPE)).toBe(true);
-    expect(hasScope(scopes, ACCOUNT_SELF_READ_SCOPE)).toBe(true); // admin ⊇ read
+    expect(hasScope(scopes, ACCOUNT_SELF_WRITE_SCOPE)).toBe(true);
+    expect(hasScope(scopes, ACCOUNT_SELF_READ_SCOPE)).toBe(true); // admin ⊇ write ⊇ read
     // A different account id must NOT be satisfied (name-pinned inheritance).
     expect(hasScope(scopes, "account:other:read")).toBe(false);
     // account:self:admin must never satisfy a vault scope.

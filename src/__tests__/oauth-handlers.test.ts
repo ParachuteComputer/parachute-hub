@@ -10140,6 +10140,29 @@ describe("single OAuth consent + grantable vault admin + delegate-only cap (2026
     }
   });
 
+  test("grantable extras offer the account read/write/admin ladder to an admin", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const admin = await createUser(db, "admin", "pw");
+      const extras = grantableExtraScopes(db, admin.id, {
+        userIsAdmin: true,
+        requested: [],
+        vaultName: undefined,
+      });
+      expect(extras).toContain("account:self:read");
+      expect(extras).toContain("account:self:write");
+      expect(extras).toContain("account:self:admin");
+      expect(extras.indexOf("account:self:read")).toBeLessThan(
+        extras.indexOf("account:self:write"),
+      );
+      expect(extras.indexOf("account:self:write")).toBeLessThan(
+        extras.indexOf("account:self:admin"),
+      );
+    } finally {
+      cleanup();
+    }
+  });
+
   // Test 1 — pending client + session → consent renders (200), client flipped approved.
   test("[1] pending client + session → consent renders (200) + client flipped approved", async () => {
     const { db, cleanup } = await makeDb();
@@ -10385,6 +10408,39 @@ describe("single OAuth consent + grantable vault admin + delegate-only cap (2026
       const { scope } = await redeemToScopeAud(db, code ?? "", reg.client.clientId, verifier);
       expect(scope).not.toContain("account:self");
       expect(scope.split(" ")).toContain("vault:work:read");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("[9d] non-admin requesting account:self:write → also DROPPED", async () => {
+    // Write is more capable than read, but it is still account-wide on a
+    // self-host hub, so the same account-prefix cap must drop it.
+    const { db, cleanup } = await makeDb();
+    try {
+      await createUser(db, "owner", "pw");
+      const friend = await createUser(db, "friend", "pw", { allowMulti: true });
+      setUserVaults(db, friend.id, ["work"]);
+      const session = createSession(db, { userId: friend.id });
+      const reg = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        status: "approved",
+      });
+      const { verifier, challenge } = makePkce();
+      const consentRes = await submitConsent(
+        db,
+        session.id,
+        reg.client.clientId,
+        "account:self:write vault:work:read",
+        challenge,
+      );
+      expect(consentRes.status).toBe(302);
+      const code = new URL(consentRes.headers.get("location") ?? "").searchParams.get("code");
+      const { scope } = await redeemToScopeAud(db, code ?? "", reg.client.clientId, verifier);
+      expect(scope).not.toContain("account:self:write");
+      expect(scope.split(" ")).toContain("vault:work:read");
+      const grant = findGrant(db, friend.id, reg.client.clientId);
+      expect(grant?.scopes ?? "").not.toContain("account:self:write");
     } finally {
       cleanup();
     }

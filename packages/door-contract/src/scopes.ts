@@ -1,5 +1,5 @@
 /**
- * The account-door scope grammar — `account:<id>:<verb>`, `admin ⊇ read`.
+ * The account-door scope grammar — `account:<id>:<verb>`, `admin ⊇ write ⊇ read`.
  *
  * Both doors gate their `/account/*` surface on this grammar and re-implement it
  * separately today: the self-host hub pins `<id>` to the `self` sentinel
@@ -13,22 +13,28 @@
  * contract, not the resource-server JWT-validation surface scope-guard owns.
  */
 
-/** The two-rung account verb ladder. */
-export type AccountVerb = "read" | "admin";
+/** The three-rung account verb ladder. */
+export type AccountVerb = "read" | "write" | "admin";
 
-/** `admin ⊇ read`. */
-export const ACCOUNT_VERB_RANK: Record<AccountVerb, number> = { read: 0, admin: 1 };
+/** `admin ⊇ write ⊇ read`. */
+export const ACCOUNT_VERB_RANK: Record<AccountVerb, number> = {
+  read: 0,
+  write: 1,
+  admin: 2,
+};
 
 /** The self-host account sentinel — on a hub the account IS the box. */
 export const ACCOUNT_SELF_ID = "self";
 
 /** `account:self:admin` — the self-host canonical admin scope. */
 export const ACCOUNT_SELF_ADMIN_SCOPE = "account:self:admin";
+/** `account:self:write` — the self-host canonical write scope. */
+export const ACCOUNT_SELF_WRITE_SCOPE = "account:self:write";
 /** `account:self:read` — the self-host canonical read scope. */
 export const ACCOUNT_SELF_READ_SCOPE = "account:self:read";
 
 export function isAccountVerb(s: string): s is AccountVerb {
-  return s === "read" || s === "admin";
+  return s === "read" || s === "write" || s === "admin";
 }
 
 /** Build the `account:<id>:<verb>` scope string. */
@@ -51,9 +57,9 @@ export function parseAccountScope(scope: string): { id: string; verb: AccountVer
 
 /**
  * Does the granted scope set satisfy `verb` on `accountId`? `admin` satisfies a
- * `read` requirement; a scope for a different `<id>` never matches. Identical to
- * cloud's `hasAccountScope` and the semantics the hub's exact-string gate
- * assumes (`account:self:admin` covers `account:self:read`).
+ * `write` or `read` requirement, and `write` satisfies `read`; a scope for a
+ * different `<id>` never matches. Identical to cloud's `hasAccountScope` and
+ * the semantics the hub's exact-string gate assumes.
  */
 export function hasAccountScope(
   granted: readonly string[],
@@ -72,7 +78,7 @@ export function hasAccountScope(
 
 /**
  * The account-vaults scope family (Wave A) — the SINGLE deliberate exception to
- * the account wall. `account:<id>:{admin,read}` stay non-requestable (an OAuth
+ * the account wall. `account:<id>:{admin,write,read}` stay non-requestable (an OAuth
  * client can never ask for the whole account); the ONE requestable account scope
  * is the account-MCP connection scope `account:<id>:vaults`, which opens exactly
  * the narrow account-MCP surface (list-vaults + create-vault + query-across).
@@ -108,7 +114,7 @@ export function accountVaultsScope(id: string): string {
  * everything except the account-vaults connection scope:
  *   - `account:vaults` (un-narrowed, PRM form) → requestable.
  *   - `account:<id>:vaults` (consent-bound blanket) → requestable.
- *   - `account:<id>:{admin,read}`, `account:admin`, `account:read` → NOT.
+ *   - `account:<id>:{admin,write,read}`, `account:admin`, `account:read` → NOT.
  *   - `account:<id>:vaults:<vault>` (4-part, consent-narrowed) → NOT (consent
  *     narrows; a client can't pre-narrow itself).
  *
@@ -214,7 +220,8 @@ export function accountVaultsGrant(
  *   - `account:<id>:mod:<module>:<verb>`   — a MODULE grant (future modules).
  *
  * `<verb>` here is the three-rung vault/module ladder `read|write|admin` (NOT the
- * two-rung account ladder `read|admin` — a composed vault grant can be `write`).
+ * plain account ladder `read|write|admin` — a composed vault grant can be
+ * `write`).
  *
  * The LEGACY Wave A forms keep their exact meaning, frozen — existing tokens and
  * refresh families must parse identically:
@@ -360,7 +367,7 @@ export function composedModuleScope(id: string, module: string, verb: ComposedVa
  * gate must already extract their `<id>`. Recognizing every family HERE is what
  * lets the gate reject a foreign-id composed scope then.
  *
- * The `account:<id>:{read|admin}` account-verb ladder is intentionally NOT a
+ * The `account:<id>:{read|write|admin}` account-verb ladder is intentionally NOT a
  * composed form (it is `parseAccountScope`'s domain) and yields `null` here.
  *
  * Fail-closed rules: `account` resource required, `<id>` non-empty, verbs from the

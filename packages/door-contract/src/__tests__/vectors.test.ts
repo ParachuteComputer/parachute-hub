@@ -5,6 +5,7 @@ import {
   ACCOUNT_ROUTES,
   ACCOUNT_SELF_ADMIN_SCOPE,
   ACCOUNT_SELF_READ_SCOPE,
+  ACCOUNT_SELF_WRITE_SCOPE,
   ACCOUNT_VAULTS_UNNARROWED,
   ACCOUNT_VAULTS_VERB,
   COMPOSED_MODULE_SEGMENT,
@@ -67,22 +68,28 @@ describe("token constants", () => {
 describe("account scope grammar", () => {
   test("canonical self scopes match the builder", () => {
     expect(ACCOUNT_SELF_ADMIN_SCOPE).toBe(accountScope("self", "admin"));
+    expect(ACCOUNT_SELF_WRITE_SCOPE).toBe(accountScope("self", "write"));
     expect(ACCOUNT_SELF_READ_SCOPE).toBe(accountScope("self", "read"));
   });
 
   test("parse rejects non-account and malformed scopes", () => {
     expect(parseAccountScope("account:self:admin")).toEqual({ id: "self", verb: "admin" });
+    expect(parseAccountScope("account:self:write")).toEqual({ id: "self", verb: "write" });
     expect(parseAccountScope("account:u_123:read")).toEqual({ id: "u_123", verb: "read" });
     expect(parseAccountScope("account:admin")).toBeNull(); // 2-part
     expect(parseAccountScope("vault:work:read")).toBeNull(); // wrong resource
-    expect(parseAccountScope("account:self:write")).toBeNull(); // no write rung
     expect(parseAccountScope("account::read")).toBeNull(); // empty id
   });
 
-  test("admin ⊇ read, and a different id never matches", () => {
+  test("admin ⊇ write ⊇ read, and a different id never matches", () => {
     expect(hasAccountScope(["account:self:admin"], "self", "read")).toBe(true);
+    expect(hasAccountScope(["account:self:admin"], "self", "write")).toBe(true);
     expect(hasAccountScope(["account:self:admin"], "self", "admin")).toBe(true);
+    expect(hasAccountScope(["account:self:write"], "self", "read")).toBe(true);
+    expect(hasAccountScope(["account:self:write"], "self", "write")).toBe(true);
+    expect(hasAccountScope(["account:self:write"], "self", "admin")).toBe(false);
     expect(hasAccountScope(["account:self:read"], "self", "admin")).toBe(false);
+    expect(hasAccountScope(["account:self:read"], "self", "write")).toBe(false);
     expect(hasAccountScope(["account:u_1:admin"], "u_2", "read")).toBe(false);
     expect(hasAccountScope(["vault:x:admin"], "self", "read")).toBe(false);
   });
@@ -104,7 +111,7 @@ describe("account-vaults scope grammar (Wave A)", () => {
     for (const scope of ["account:vaults", "account:self:vaults", "account:u_123:vaults"]) {
       expect(isRequestableAccountScope(scope)).toBe(true);
     }
-    // Refused: the account wall (admin/read, 2- and 3-part), the 4-part
+    // Refused: the account wall (admin/write/read, 2- and 3-part), the 4-part
     // consent-NARROWED form (consent narrows; a client can't pre-narrow itself),
     // casing variants (exact-lowercase, fail closed), and non-account scopes.
     for (const scope of [
@@ -416,10 +423,10 @@ describe("composed account-scope grammar (unified /mcp — Phase 1)", () => {
   });
 
   test("parseComposedAccountScope — the account-verb ladder is NOT a composed form", () => {
-    // `account:<id>:{read,admin}` belong to parseAccountScope, not here.
+    // `account:<id>:{read,write,admin}` belong to parseAccountScope, not here.
     expect(parseComposedAccountScope("account:self:admin")).toBeNull();
     expect(parseComposedAccountScope("account:self:read")).toBeNull();
-    // `write` is not even an account verb — still null.
+    // `write` is a plain account verb, not a composed form — still null.
     expect(parseComposedAccountScope("account:self:write")).toBeNull();
   });
 
@@ -637,16 +644,18 @@ describe("account route table", () => {
     expect(ACCOUNT_ROUTES.length).toBeGreaterThan(0);
     for (const r of ACCOUNT_ROUTES) {
       expect(r.path.startsWith("/account")).toBe(true);
-      expect(["read", "admin"]).toContain(r.scope);
+      expect(["read", "write", "admin"]).toContain(r.scope);
       expect(["GET", "POST", "DELETE", "PUT"]).toContain(r.method);
     }
   });
 
-  test("mutations require admin, reads require read", () => {
+  test("create/configure mutations require write, destructive/mint mutations require admin", () => {
     const byKey = (m: string, p: string) =>
       ACCOUNT_ROUTES.find((r) => r.method === m && r.path === p);
-    expect(byKey("POST", "/account/vaults")?.scope).toBe("admin");
+    expect(byKey("POST", "/account/vaults")?.scope).toBe("write");
     expect(byKey("DELETE", "/account/vaults/<name>")?.scope).toBe("admin");
+    expect(byKey("POST", "/account/vaults/<name>/token")?.scope).toBe("admin");
+    expect(byKey("PUT", "/account/vaults/<name>/caps")?.scope).toBe("write");
     expect(byKey("GET", "/account/vaults")?.scope).toBe("read");
   });
 });

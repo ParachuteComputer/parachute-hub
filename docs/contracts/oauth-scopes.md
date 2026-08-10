@@ -36,8 +36,9 @@ Parachute OAuth tokens carry **whitespace-separated scope strings**
 | `surface:<name>:read` | Fetch/clone the named surface's hub-hosted git repo (Surface Git Transport) |
 | `surface:<name>:write` | Push to the named surface's repo (write ⊇ read at the git endpoint) |
 | `surface:admin` | surface-host module admin — the hub↔surface-host notify bearer + the credential endpoint |
-| `account:<id>:read` | Read the account: list the owner's vaults, read their caps/usage (Parachute App campaign, Phase 2 — the `/account/*` door contract). Cookie-minted only via `POST /account/token`; **not requestable** from third-party clients. On self-host `<id>` is the sentinel `self` (account ≡ box). |
-| `account:<id>:admin` | Every account mutation: create/delete/import vaults, mint per-vault tokens, set caps. `admin ⊇ read`. Cookie-minted only via `POST /account/token`; **not requestable**. |
+| `account:<id>:read` | Read the account: list the owner's vaults, read their caps/usage (Parachute App campaign, Phase 2 — the `/account/*` door contract). Requestable under the account-authority cap. On self-host `<id>` is the sentinel `self` (account ≡ box). |
+| `account:<id>:write` | Create vaults and change their settings, but not delete vaults or mint access tokens that outlive the app's access. Requestable under the account-authority cap. |
+| `account:<id>:admin` | Delete vaults and mint per-vault access tokens, in addition to write and read. `admin ⊇ write ⊇ read`. Requestable under the account-authority cap. |
 
 Third-party modules declare their own namespace (`my-service:read`, etc.)
 and the hub renders consent for those scopes the same way.
@@ -53,7 +54,7 @@ Migration records remain under
 ```
 admin ⊇ write ⊇ read       (vault)
 write ⊇ read               (surface:<name>, at the git endpoint)
-admin ⊇ read               (account:<id>, at the /account/* validator)
+admin ⊇ write ⊇ read       (account:<id>, at the /account/* validator)
 ```
 
 - `vault:<name>:admin` satisfies any check for `vault:<name>:write` or
