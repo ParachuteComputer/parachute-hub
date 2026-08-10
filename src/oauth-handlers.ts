@@ -502,12 +502,18 @@ function advertisedScopes(declared: ReadonlySet<string>, manifest: ServicesManif
  *     Admin is what MCP clients need to manage tag schemas, so the gap made a
  *     core workflow unreachable over MCP.
  *
- *   - **Hub-level scopes could never appear at all.** Vault has no concept of
- *     them, so no edit to vault could have surfaced them here.
+ *   - **Hub-level scopes now have an explicit door boundary.** The root PRM
+ *     starts from hub's authoritative requestable/module-installed catalog,
+ *     then filters to vault scopes because root `/mcp` only accepts
+ *     vault-audience tokens. This keeps the root advertisement honest while
+ *     the bare PRM continues to describe the full hub resource.
  *
- * Sharing `advertisedScopes` with the bare PRM is the point: one scope
- * registry, filtered by one rule (requestable ∧ module-installed), so the two
- * documents cannot drift apart again.
+ * Both documents start from `advertisedScopes`: one scope registry, filtered
+ * by one rule (requestable ∧ module-installed). The root document then applies
+ * `narrowRootMcpScopes` because the root door only ever mints vault-audience
+ * tokens; advertising a non-vault scope that this authorize branch drops would
+ * mislead a spec-following client into requesting something the door cannot
+ * accept.
  */
 export function rootMcpProtectedResourceMetadata(deps: OAuthDeps): Response {
   const iss = deps.issuer;
@@ -518,9 +524,8 @@ export function rootMcpProtectedResourceMetadata(deps: OAuthDeps): Response {
     // matches against the endpoint it got the 401 from.
     resource: `${iss}/mcp`,
     authorization_servers: [iss],
-    scopes_supported: advertisedScopes(
-      declared,
-      (deps.loadServicesManifest ?? readServicesManifest)(),
+    scopes_supported: narrowRootMcpScopes(
+      advertisedScopes(declared, (deps.loadServicesManifest ?? readServicesManifest)()),
     ),
     bearer_methods_supported: ["header"],
     resource_documentation: "https://parachute.computer",
@@ -587,6 +592,81 @@ export function authorizationServerMetadata(deps: OAuthDeps): Response {
 /** Find any requested scopes that the public flow refuses to mint. */
 function findNonRequestableScopes(scopes: readonly string[]): string[] {
   return scopes.filter(isNonRequestableScope);
+}
+
+/** Every `vault:<name>:<verb>` name actually present in `scopes` (verb ∈ VAULT_VERBS). */
+function namedVaultScopeNames(scopes: readonly string[]): Set<string> {
+  const out = new Set<string>();
+  for (const s of scopes) {
+    const parts = s.split(":");
+    if (
+      parts.length === 3 &&
+      parts[0] === "vault" &&
+      parts[1] &&
+      parts[2] &&
+      VAULT_VERBS.has(parts[2])
+    ) {
+      out.add(parts[1]);
+    }
+  }
+  return out;
+}
+
+function invalidTargetResponse(resource: string): Response {
+  return jsonResponse(
+    {
+      error: "invalid_target",
+      error_description: `resource "${resource}" does not match the resource this token was granted for`,
+    },
+    400,
+  );
+}
+
+/**
+ * RFC 8707 §2.2 resource validation + audience resolution at /oauth/token.
+ * `requestResource` is optional; absent → return `fallbackAudience`
+ * UNCHANGED (today's `inferAudience` behavior, byte-for-byte — no client
+ * that never sends `resource` observes any difference).
+ *
+ * When present, it must resolve (via `resolveResourceVault` /
+ * `isRootMcpResource`, the SAME shape-recognition the authorize side uses)
+ * to a resource this token can actually serve:
+ *   - names a specific vault → that vault's name must be among
+ *     `grantedVaultNames`; audience becomes `vault.<name>` EXPLICITLY
+ *     (this is the "override inferAudience" the design calls for: a grant
+ *     can legally carry more than one named vault scope — a client can ask
+ *     for e.g. `vault:read` bound to one resource while also naming another
+ *     vault's scope explicitly — and inferAudience's first-scope-wins scan
+ *     can't tell which one the CALLER wants THIS token bound to; an explicit
+ *     `resource` disambiguates).
+ *   - names the vault-agnostic root door → allowed as long as at least one
+ *     named vault scope is present (root tokens are vault tokens whose
+ *     target the resource server derives from the token itself); audience
+ *     stays `fallbackAudience` (unchanged — root doesn't rename anything).
+ *   - resolves to neither (off-origin, malformed, non-MCP path, or a vault
+ *     name not in `grantedVaultNames`) → reject.
+ */
+function resolveTokenResourceAudience(
+  requestResource: string | null,
+  grantedVaultNames: ReadonlySet<string>,
+  boundOrigins: readonly string[],
+  fallbackAudience: string,
+): { audience: string } | { errorResponse: Response } {
+  if (!requestResource) return { audience: fallbackAudience };
+  const boundVault = resolveResourceVault(requestResource, boundOrigins);
+  if (boundVault) {
+    if (!grantedVaultNames.has(boundVault)) {
+      return { errorResponse: invalidTargetResponse(requestResource) };
+    }
+    return { audience: `vault.${boundVault}` };
+  }
+  if (isRootMcpResource(requestResource, boundOrigins)) {
+    if (grantedVaultNames.size === 0) {
+      return { errorResponse: invalidTargetResponse(requestResource) };
+    }
+    return { audience: fallbackAudience };
+  }
+  return { errorResponse: invalidTargetResponse(requestResource) };
 }
 
 // --- /oauth/authorize ------------------------------------------------------
@@ -1020,6 +1100,7 @@ export function handleAuthorizeGet(db: Database, req: Request, deps: OAuthDeps):
   // No resource, or one that isn't an MCP resource we front (off-origin,
   // malformed, non-vault path) → neither branch fires and the flow is
   // byte-for-byte the pre-#461 behavior (manual picker, etc.).
+  let rootNarrowedToEmpty = false;
   const boundOrigins = resolveBoundOrigins(deps);
   const boundVault = resolveResourceVault(parsed.resource, boundOrigins);
   if (boundVault) {
@@ -1029,9 +1110,10 @@ export function handleAuthorizeGet(db: Database, req: Request, deps: OAuthDeps):
     ).join(" ");
     url.searchParams.set("scope", parsed.scope);
   } else if (isRootMcpResource(parsed.resource, boundOrigins)) {
-    parsed.scope = narrowRootMcpScopes(parsed.scope.split(" ").filter((s) => s.length > 0)).join(
-      " ",
-    );
+    const preNarrow = parsed.scope.split(" ").filter((s) => s.length > 0);
+    const narrowed = narrowRootMcpScopes(preNarrow);
+    rootNarrowedToEmpty = preNarrow.length > 0 && narrowed.length === 0;
+    parsed.scope = narrowed.join(" ");
     url.searchParams.set("scope", parsed.scope);
   }
 
@@ -1074,6 +1156,15 @@ export function handleAuthorizeGet(db: Database, req: Request, deps: OAuthDeps):
       parsed.redirectUri,
       "invalid_request",
       "PKCE S256 is required",
+      parsed.state,
+    );
+  }
+
+  if (rootNarrowedToEmpty) {
+    return oauthErrorRedirect(
+      parsed.redirectUri,
+      "invalid_scope",
+      "none of the requested scopes are usable at the root MCP resource",
       parsed.state,
     );
   }
@@ -1712,6 +1803,7 @@ async function handleConsentSubmit(
   // semantics as the GET path: only when `resource` resolves to one of our
   // MCP resources — per-vault (narrow + name) or root (drop foreign scopes,
   // picker still names); no-op otherwise (manual-pick path unchanged).
+  let rootNarrowedToEmpty = false;
   const boundOrigins = resolveBoundOrigins(deps);
   const boundVault = resolveResourceVault(params.resource, boundOrigins);
   if (boundVault) {
@@ -1720,9 +1812,10 @@ async function handleConsentSubmit(
       boundVault,
     ).join(" ");
   } else if (isRootMcpResource(params.resource, boundOrigins)) {
-    params.scope = narrowRootMcpScopes(params.scope.split(" ").filter((s) => s.length > 0)).join(
-      " ",
-    );
+    const preNarrow = params.scope.split(" ").filter((s) => s.length > 0);
+    const narrowed = narrowRootMcpScopes(preNarrow);
+    rootNarrowedToEmpty = preNarrow.length > 0 && narrowed.length === 0;
+    params.scope = narrowed.join(" ");
   }
   const approve = String(form.get("approve") ?? "") === "yes";
   const sessionId = parseSessionCookie(req.headers.get("cookie"));
@@ -1769,6 +1862,14 @@ async function handleConsentSubmit(
       "Redirect mismatch",
       "The redirect_uri does not match any URI registered for this app.",
       400,
+    );
+  }
+  if (rootNarrowedToEmpty) {
+    return oauthErrorRedirect(
+      params.redirectUri,
+      "invalid_scope",
+      "none of the requested scopes are usable at the root MCP resource",
+      params.state,
     );
   }
   if (!approve) {
@@ -2439,7 +2540,15 @@ async function handleTokenAuthorizationCode(
       400,
     );
   }
-  const audience = inferAudience(redeemed.scopes);
+  const requestResource = (form.get("resource") as string | null) ?? null;
+  const audienceResolution = resolveTokenResourceAudience(
+    requestResource,
+    namedVaultScopeNames(redeemed.scopes),
+    resolveBoundOrigins(deps),
+    inferAudience(redeemed.scopes),
+  );
+  if ("errorResponse" in audienceResolution) return audienceResolution.errorResponse;
+  const audience = audienceResolution.audience;
   const access = await signAccessToken(db, {
     sub: redeemed.userId,
     scopes: redeemed.scopes,
@@ -2498,6 +2607,7 @@ async function handleTokenRefresh(
 ): Promise<Response> {
   const refreshToken = String(form.get("refresh_token") ?? "");
   const clientId = String(form.get("client_id") ?? "");
+  const requestResource = (form.get("resource") as string | null) ?? null;
   if (!refreshToken || !clientId) {
     return jsonResponse(
       { error: "invalid_request", error_description: "missing required parameter" },
@@ -2574,7 +2684,7 @@ async function handleTokenRefresh(
       // hand the client the new pair — it converges on the current lineage
       // (single live token preserved), no family revocation. Equivalent to
       // what the client would have received had it presented the tip itself.
-      return await rotateAndRespond(db, tip, deps, now);
+      return await rotateAndRespond(db, tip, deps, now, requestResource);
     }
     // Genuine theft (or a too-late replay): revoke every descendant so the
     // attacker can't keep refreshing, and force re-authorization.
@@ -2590,7 +2700,7 @@ async function handleTokenRefresh(
       400,
     );
   }
-  return await rotateAndRespond(db, row, deps, now);
+  return await rotateAndRespond(db, row, deps, now, requestResource);
 }
 
 /**
@@ -2609,6 +2719,7 @@ async function rotateAndRespond(
   row: RefreshTokenRow,
   deps: OAuthDeps,
   now: Date,
+  requestResource: string | null,
 ): Promise<Response> {
   const refreshUserId = row.userId ?? "";
   // Mint the access token *before* opening the rotation transaction. JWT
@@ -2618,7 +2729,17 @@ async function rotateAndRespond(
   // (revoke old) + INSERT (mint new refresh row) + link (rotated_to) commit
   // or roll back as a unit, so a mid-rotation crash can't
   // dead-old-without-replacement (#107).
-  const audience = inferAudience(row.scopes);
+  // A refresh row has no separate authorization artifact to consult. Its
+  // final named vault scopes are the resource binding already baked into the
+  // grant, so resource validation derives from the row itself.
+  const audienceResolution = resolveTokenResourceAudience(
+    requestResource,
+    namedVaultScopeNames(row.scopes),
+    resolveBoundOrigins(deps),
+    inferAudience(row.scopes),
+  );
+  if ("errorResponse" in audienceResolution) return audienceResolution.errorResponse;
+  const audience = audienceResolution.audience;
   const access = await signAccessToken(db, {
     sub: refreshUserId,
     scopes: row.scopes,

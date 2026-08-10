@@ -345,8 +345,9 @@ describe("rootMcpProtectedResourceMetadata (hub#789)", () => {
     expect(body.scopes_supported as string[]).not.toContain("parachute:host:admin");
   });
 
-  test("shares the bare PRM's scope set, so the two documents can't drift apart", async () => {
-    // The point of authoring locally: one registry, one filter, two documents.
+  test("shares the bare PRM's requestable-scope filter, narrowed further to vault-only", async () => {
+    // Both documents start from one registry and requestable-scope filter; the
+    // root document applies its additional vault-only door constraint.
     const root = (await call().json()) as Record<string, unknown>;
     const bare = (await protectedResourceMetadata({
       issuer: ISSUER,
@@ -356,6 +357,25 @@ describe("rootMcpProtectedResourceMetadata (hub#789)", () => {
     expect([...(root.scopes_supported as string[])].sort()).toEqual(
       [...(bare.scopes_supported as string[])].sort(),
     );
+  });
+
+  test("narrows the bare PRM's requestable catalog to vault scopes at the root door", async () => {
+    // `agent:send` represents a requestable module-defined scope that the bare
+    // hub resource can advertise, while the root `/mcp` authorize branch drops
+    // it because root tokens are vault-audience tokens.
+    const declaredWithModuleScope = new Set([...declared, "agent:send"]);
+    const root = (await rootMcpProtectedResourceMetadata({
+      issuer: ISSUER,
+      loadDeclaredScopes: () => declaredWithModuleScope,
+      loadServicesManifest: fixtureLoadServicesManifest,
+    }).json()) as Record<string, unknown>;
+    const bare = (await protectedResourceMetadata({
+      issuer: ISSUER,
+      loadDeclaredScopes: () => declaredWithModuleScope,
+      loadServicesManifest: fixtureLoadServicesManifest,
+    }).json()) as Record<string, unknown>;
+    expect(bare.scopes_supported as string[]).toContain("agent:send");
+    expect(root.scopes_supported as string[]).not.toContain("agent:send");
   });
 
   test("conforms to the door contract, same as its sibling", async () => {
@@ -9266,6 +9286,245 @@ describe("RFC 8707 resource binding — vault-bound MCP (fix #461)", () => {
     });
   }
 
+  /**
+   * Drive a real resource-bound authorize → consent exchange and return the
+   * one-use code. Each caller owns the returned database cleanup so token
+   * tests can exercise a fresh grant without hand-crafting auth artifacts.
+   */
+  async function setupJonAuthorizationCode() {
+    const { db, cleanup } = await makeDb();
+    try {
+      const user = await createUser(db, "owner", "pw");
+      const session = createSession(db, { userId: user.id });
+      const cookie = `${CSRF_COOKIE}; ${buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000))}`;
+      const registrationRes = await handleRegister(
+        db,
+        new Request(`${ISSUER}/oauth/register`, {
+          method: "POST",
+          body: JSON.stringify({
+            redirect_uris: ["https://app.example/cb"],
+            scope: "vault:read vault:write",
+          }),
+          headers: { "content-type": "application/json" },
+        }),
+        RESOURCE_DEPS,
+      );
+      expect(registrationRes.status).toBe(201);
+      const registration = (await registrationRes.json()) as { client_id: string };
+      approveClient(db, registration.client_id);
+
+      const resource = `${ISSUER}/vault/jon/mcp`;
+      const { verifier, challenge } = makePkce();
+      const authorizeRes = handleAuthorizeGet(
+        db,
+        new Request(
+          authorizeUrl({
+            client_id: registration.client_id,
+            redirect_uri: "https://app.example/cb",
+            response_type: "code",
+            code_challenge: challenge,
+            code_challenge_method: "S256",
+            scope: "vault:read vault:write",
+            resource,
+          }),
+          { headers: { cookie } },
+        ),
+        RESOURCE_DEPS,
+      );
+      expect(authorizeRes.status).toBe(200);
+      const consentHtml = await authorizeRes.text();
+      expect(consentHtml).toContain("vault:jon:read");
+      expect(consentHtml).toContain("vault:jon:write");
+
+      const consentRes = await handleAuthorizePost(
+        db,
+        new Request(`${ISSUER}/oauth/authorize`, {
+          method: "POST",
+          body: new URLSearchParams({
+            __action: "consent",
+            __csrf: TEST_CSRF,
+            approve: "yes",
+            client_id: registration.client_id,
+            redirect_uri: "https://app.example/cb",
+            response_type: "code",
+            scope: "vault:jon:read vault:jon:write",
+            code_challenge: challenge,
+            code_challenge_method: "S256",
+            resource,
+          }),
+          headers: { "content-type": "application/x-www-form-urlencoded", cookie },
+        }),
+        RESOURCE_DEPS,
+      );
+      expect(consentRes.status).toBe(302);
+      const code = new URL(consentRes.headers.get("location") ?? "").searchParams.get("code");
+      expect(code).toBeTruthy();
+      return {
+        db,
+        cleanup,
+        clientId: registration.client_id,
+        code: code ?? "",
+        verifier,
+        resource,
+      };
+    } catch (err) {
+      cleanup();
+      throw err;
+    }
+  }
+
+  function resourceTokenRequest(form: URLSearchParams): Request {
+    return new Request(`${ISSUER}/oauth/token`, {
+      method: "POST",
+      body: form,
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+    });
+  }
+
+  test("token resource matching the authorization binding → 200 with explicit vault audience", async () => {
+    const flow = await setupJonAuthorizationCode();
+    try {
+      const tokenRes = await handleToken(
+        flow.db,
+        resourceTokenRequest(
+          new URLSearchParams({
+            grant_type: "authorization_code",
+            code: flow.code,
+            client_id: flow.clientId,
+            redirect_uri: "https://app.example/cb",
+            code_verifier: flow.verifier,
+            resource: flow.resource,
+          }),
+        ),
+        RESOURCE_DEPS,
+      );
+      expect(tokenRes.status).toBe(200);
+      const token = (await tokenRes.json()) as {
+        access_token: string;
+        scope: string;
+      };
+      expect(token.scope).toBe("vault:jon:read vault:jon:write");
+      const { payload } = await validateAccessToken(flow.db, token.access_token, ISSUER);
+      expect(payload.aud).toBe("vault.jon");
+      expect(payload.scope).toBe("vault:jon:read vault:jon:write");
+    } finally {
+      flow.cleanup();
+    }
+  });
+
+  test("token resource that is off-origin or not an MCP resource → 400 invalid_target", async () => {
+    const flow = await setupJonAuthorizationCode();
+    try {
+      const tokenRes = await handleToken(
+        flow.db,
+        resourceTokenRequest(
+          new URLSearchParams({
+            grant_type: "authorization_code",
+            code: flow.code,
+            client_id: flow.clientId,
+            redirect_uri: "https://app.example/cb",
+            code_verifier: flow.verifier,
+            resource: "https://evil.example/vault/jon/mcp",
+          }),
+        ),
+        RESOURCE_DEPS,
+      );
+      expect(tokenRes.status).toBe(400);
+      const error = (await tokenRes.json()) as { error: string; error_description: string };
+      expect(error.error).toBe("invalid_target");
+      expect(error.error_description).toContain("https://evil.example/vault/jon/mcp");
+    } finally {
+      flow.cleanup();
+    }
+  });
+
+  test("token resource naming another vault than the authorization grant → 400 invalid_target", async () => {
+    const flow = await setupJonAuthorizationCode();
+    try {
+      const tokenRes = await handleToken(
+        flow.db,
+        resourceTokenRequest(
+          new URLSearchParams({
+            grant_type: "authorization_code",
+            code: flow.code,
+            client_id: flow.clientId,
+            redirect_uri: "https://app.example/cb",
+            code_verifier: flow.verifier,
+            resource: `${ISSUER}/vault/boulder/mcp`,
+          }),
+        ),
+        RESOURCE_DEPS,
+      );
+      expect(tokenRes.status).toBe(400);
+      const error = (await tokenRes.json()) as { error: string };
+      expect(error.error).toBe("invalid_target");
+    } finally {
+      flow.cleanup();
+    }
+  });
+
+  test("refresh_token resource validation matches the row's named vault and rejects another vault", async () => {
+    const flow = await setupJonAuthorizationCode();
+    try {
+      const initialRes = await handleToken(
+        flow.db,
+        resourceTokenRequest(
+          new URLSearchParams({
+            grant_type: "authorization_code",
+            code: flow.code,
+            client_id: flow.clientId,
+            redirect_uri: "https://app.example/cb",
+            code_verifier: flow.verifier,
+          }),
+        ),
+        RESOURCE_DEPS,
+      );
+      expect(initialRes.status).toBe(200);
+      const initial = (await initialRes.json()) as { refresh_token: string };
+
+      // A rejected target is checked before rotation, so the same refresh row
+      // remains usable for the matching resource immediately afterward.
+      const mismatchRes = await handleToken(
+        flow.db,
+        resourceTokenRequest(
+          new URLSearchParams({
+            grant_type: "refresh_token",
+            refresh_token: initial.refresh_token,
+            client_id: flow.clientId,
+            resource: `${ISSUER}/vault/boulder/mcp`,
+          }),
+        ),
+        RESOURCE_DEPS,
+      );
+      expect(mismatchRes.status).toBe(400);
+      const mismatch = (await mismatchRes.json()) as { error: string };
+      expect(mismatch.error).toBe("invalid_target");
+
+      const matchingRes = await handleToken(
+        flow.db,
+        resourceTokenRequest(
+          new URLSearchParams({
+            grant_type: "refresh_token",
+            refresh_token: initial.refresh_token,
+            client_id: flow.clientId,
+            resource: flow.resource,
+          }),
+        ),
+        RESOURCE_DEPS,
+      );
+      expect(matchingRes.status).toBe(200);
+      const matching = (await matchingRes.json()) as {
+        access_token: string;
+        scope: string;
+      };
+      expect(matching.scope).toBe("vault:jon:read vault:jon:write");
+      const { payload } = await validateAccessToken(flow.db, matching.access_token, ISSUER);
+      expect(payload.aud).toBe("vault.jon");
+    } finally {
+      flow.cleanup();
+    }
+  });
+
   test("E2E GATE: DCR → /authorize?resource=…/vault/jon/mcp → consent → code → /token mints aud=vault.jon + NAMED narrow scopes that a current-line vault accepts", async () => {
     const { db, cleanup } = await makeDb();
     try {
@@ -9609,6 +9868,45 @@ describe("RFC 8707 resource binding — vault-bound MCP (fix #461)", () => {
       const html = await consentFor();
       expect(html).toContain("scribe:transcribe");
       expect(html).toContain("Pick a vault");
+    });
+
+    test("root-only non-vault request redirects with invalid_scope instead of rendering empty consent", async () => {
+      // CONTROL: the no-resource test above proves this same catalog reaches
+      // consent normally; only the root resource's vault-only narrowing makes
+      // this request unusable.
+      const { db, cleanup } = await makeDb();
+      try {
+        const user = await createUser(db, "owner", "pw");
+        const session = createSession(db, { userId: user.id });
+        const reg = registerClient(db, { redirectUris: ["https://app.example/cb"] });
+        const { challenge } = makePkce();
+        const res = handleAuthorizeGet(
+          db,
+          new Request(
+            authorizeUrl({
+              client_id: reg.client.clientId,
+              redirect_uri: "https://app.example/cb",
+              response_type: "code",
+              code_challenge: challenge,
+              code_challenge_method: "S256",
+              scope: "scribe:transcribe agent:send",
+              resource: `${ISSUER}/mcp`,
+            }),
+            {
+              headers: {
+                cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000))}`,
+              },
+            },
+          ),
+          RESOURCE_DEPS,
+        );
+        expect(res.status).toBe(302);
+        const location = res.headers.get("location");
+        expect(location).toBeTruthy();
+        expect(new URL(location ?? "").searchParams.get("error")).toBe("invalid_scope");
+      } finally {
+        cleanup();
+      }
     });
 
     test("resource=<origin>/mcp drops foreign scopes but KEEPS the picker", async () => {
