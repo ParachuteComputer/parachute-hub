@@ -28,6 +28,7 @@ import {
 import {
   authorizationServerMetadata,
   buildServicesCatalog,
+  grantableExtraScopes,
   handleApproveClientPost,
   handleAuthorizeGet,
   handleAuthorizePost,
@@ -9811,6 +9812,36 @@ describe("single OAuth consent + grantable vault admin + delegate-only cap (2026
     return { scope: body.scope, aud: payload.aud };
   }
 
+  test("grantable extras suppress an already-requested named vault scope for an admin", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const admin = await createUser(db, "admin", "pw");
+      const extras = grantableExtraScopes(db, admin.id, {
+        userIsAdmin: true,
+        requested: ["vault:u:read"],
+        vaultName: undefined,
+      });
+      expect(extras).not.toContain("vault:read");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("grantable extras suppress an already-requested unnamed vault scope when named", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const admin = await createUser(db, "admin", "pw");
+      const extras = grantableExtraScopes(db, admin.id, {
+        userIsAdmin: true,
+        requested: ["vault:read"],
+        vaultName: "u",
+      });
+      expect(extras).not.toContain("vault:u:read");
+    } finally {
+      cleanup();
+    }
+  });
+
   // Test 1 — pending client + session → consent renders (200), client flipped approved.
   test("[1] pending client + session → consent renders (200) + client flipped approved", async () => {
     const { db, cleanup } = await makeDb();
@@ -10423,16 +10454,11 @@ describe("single OAuth consent + grantable vault admin + delegate-only cap (2026
 });
 
 // ───────────────────────────────────────────────────────────────────────────
-// hub#689 — owner-on-own-vault VERB SELECTOR. The consent screen offers an
-// owner of the picked vault a read/write/admin selector (pre-selected to
-// admin) when the client requested an UNNAMED `vault:read`/`vault:write`. On
-// submit, the owner's selection widens the unnamed verb to the chosen level
-// on the picked vault — BEFORE `capScopesToUserAuthority`, which remains the
-// backstop. The selector value is an UNTRUSTED hint: the handler re-derives
-// ownership of the picked vault server-side, and the cap drops any verb the
-// user doesn't actually hold.
+// Retired consent form field + stale-submit compatibility. The selector was
+// removed from the rendered form, but a cached or forged `verb_select` field
+// must remain harmless because the POST path does not read it.
 // ───────────────────────────────────────────────────────────────────────────
-describe("hub#689 — owner-on-own-vault verb selector + widening", () => {
+describe("retired verb selector form field", () => {
   const TTL_S = Math.floor(SESSION_TTL_MS / 1000);
   const SEL_MANIFEST: ServicesManifest = {
     services: [
@@ -10511,10 +10537,7 @@ describe("hub#689 — owner-on-own-vault verb selector + widening", () => {
     return body.scope;
   }
 
-  // GET render: owner of the picked vault sees the selector. A non-admin
-  // assigned to exactly one vault gets the locked picker → the selector is
-  // offered (they hold admin on their assigned vault).
-  test("selector RENDERED for an owner (assigned user) of the picked vault", async () => {
+  test("an assigned owner consent page never renders the retired selector", async () => {
     const { db, cleanup } = await makeDb();
     try {
       await createUser(db, "owner", "pw"); // consumes the admin slot
@@ -10543,153 +10566,11 @@ describe("hub#689 — owner-on-own-vault verb selector + widening", () => {
       );
       expect(res.status).toBe(200);
       const html = await res.text();
-      expect(html).toContain("Access level");
-      expect(html).toContain('name="verb_select"');
-      // Admin pre-selected, still visibly flagged.
-      expect(html).toMatch(/name="verb_select" value="admin"[^>]*checked/);
-      expect(html).toContain("badge-admin");
+      expect(html.match(/name="verb_select"/g) ?? []).toHaveLength(0);
     } finally {
       cleanup();
     }
   });
-
-  // GET render: a read-only-assigned user (role=read → holds read, NOT admin)
-  // does NOT see the selector — offering admin pre-selected would promise an
-  // upgrade the cap silently demotes. They hold the vault but not admin on it.
-  test("selector NOT rendered for a read-only-assigned user (holds read, not admin)", async () => {
-    const { db, cleanup } = await makeDb();
-    try {
-      await createUser(db, "owner", "pw");
-      const reader = await createUser(db, "reader", "pw", { allowMulti: true });
-      // role=read directly (setUserVaults hardcodes write) → holds read only.
-      db.prepare(
-        "INSERT INTO user_vaults (user_id, vault_name, role, created_at) VALUES (?, ?, 'read', ?)",
-      ).run(reader.id, "work", new Date().toISOString());
-      const session = createSession(db, { userId: reader.id });
-      const reg = registerClient(db, {
-        redirectUris: ["https://app.example/cb"],
-        status: "approved",
-      });
-      const { challenge } = makePkce();
-      const res = handleAuthorizeGet(
-        db,
-        new Request(
-          authorizeUrl({
-            client_id: reg.client.clientId,
-            redirect_uri: "https://app.example/cb",
-            response_type: "code",
-            code_challenge: challenge,
-            code_challenge_method: "S256",
-            scope: "vault:read",
-          }),
-          { headers: { cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, TTL_S)}` } },
-        ),
-        selDeps,
-      );
-      expect(res.status).toBe(200);
-      const html = await res.text();
-      expect(html).not.toContain("Access level");
-      expect(html).not.toContain('name="verb_select"');
-    } finally {
-      cleanup();
-    }
-  });
-
-  // GET render (hub#703, folded into hub#314): a user with MIXED authority —
-  // admin on vault A (role=write → holds admin) but only read on vault B
-  // (direct INSERT role=read) — does NOT see the selector. The user could pick
-  // either vault, but doesn't own (hold admin on) EVERY pickable vault, so the
-  // `userHoldsAdminOnPickable` predicate (`assignedVaults.every(v => verbs
-  // includes "admin")`) fails on vault B and the selector is suppressed. The
-  // suppression logic already ships + is correct (oauth-handlers.ts ~2963 +
-  // ~1226); this test closes the coverage gap with no code change.
-  test("selector NOT rendered for a mixed-authority user (admin on A, read-only on B)", async () => {
-    const { db, cleanup } = await makeDb();
-    try {
-      await createUser(db, "owner", "pw");
-      const mixed = await createUser(db, "mixed", "pw", { allowMulti: true });
-      // Vault A ("work"): role=write → vaultVerbsForRole maps to [read,write,
-      // admin], so the user holds admin on A. (setUserVaults hardcodes write.)
-      setUserVaults(db, mixed.id, ["work"]);
-      // Vault B ("other"): direct INSERT role=read → holds read only, NOT admin.
-      // setUserVaults DELETEs first, so this INSERT must come after it to keep A.
-      db.prepare(
-        "INSERT INTO user_vaults (user_id, vault_name, role, created_at) VALUES (?, ?, 'read', ?)",
-      ).run(mixed.id, "other", new Date().toISOString());
-      const session = createSession(db, { userId: mixed.id });
-      const reg = registerClient(db, {
-        redirectUris: ["https://app.example/cb"],
-        status: "approved",
-      });
-      const { challenge } = makePkce();
-      const res = handleAuthorizeGet(
-        db,
-        new Request(
-          authorizeUrl({
-            client_id: reg.client.clientId,
-            redirect_uri: "https://app.example/cb",
-            response_type: "code",
-            code_challenge: challenge,
-            code_challenge_method: "S256",
-            scope: "vault:read",
-          }),
-          { headers: { cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, TTL_S)}` } },
-        ),
-        selDeps,
-      );
-      expect(res.status).toBe(200);
-      const html = await res.text();
-      // Suppressed: the `.every(v => verbs includes "admin")` check fails on B.
-      expect(html).not.toContain("Access level");
-      expect(html).not.toContain('name="verb_select"');
-      // Sanity: the multi-vault picker DID render (two assigned vaults), so the
-      // suppression is specifically the verb selector, not the whole flow.
-      expect(html).toContain('name="vault_pick" value="work"');
-      expect(html).toContain('name="vault_pick" value="other"');
-    } finally {
-      cleanup();
-    }
-  });
-
-  // GET render: a non-owner (non-admin with ZERO assigned vaults) does NOT
-  // see the selector — they can't authorize a vault scope at all.
-  test("selector NOT rendered for a non-owner (zero-vault non-admin)", async () => {
-    const { db, cleanup } = await makeDb();
-    try {
-      await createUser(db, "owner", "pw");
-      const stranger = await createUser(db, "stranger", "pw", { allowMulti: true });
-      // No setUserVaults → zero assignments → not an owner of anything.
-      const session = createSession(db, { userId: stranger.id });
-      const reg = registerClient(db, {
-        redirectUris: ["https://app.example/cb"],
-        status: "approved",
-      });
-      const { challenge } = makePkce();
-      const res = handleAuthorizeGet(
-        db,
-        new Request(
-          authorizeUrl({
-            client_id: reg.client.clientId,
-            redirect_uri: "https://app.example/cb",
-            response_type: "code",
-            code_challenge: challenge,
-            code_challenge_method: "S256",
-            scope: "vault:read",
-          }),
-          { headers: { cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, TTL_S)}` } },
-        ),
-        selDeps,
-      );
-      expect(res.status).toBe(200);
-      const html = await res.text();
-      expect(html).not.toContain("Access level");
-      expect(html).not.toContain('name="verb_select"');
-    } finally {
-      cleanup();
-    }
-  });
-
-  // Submit: owner (first admin) + client requested unnamed vault:read + selects
 
   // SECURITY: a non-owner who holds only READ on the picked vault forges
   // verb_select=admin → the server re-derives ownership (no admin held) and

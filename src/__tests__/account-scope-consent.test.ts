@@ -203,4 +203,29 @@ describe("consent checkbox posts the WIRE scope, not the display scope", () => {
     expect(html).toContain("vault:unforced:read");
     expect(html).not.toContain('value="vault:unforced:read"');
   });
+
+  test("one consent row survives a named/unnamed vault-scope collision", async () => {
+    const { renderConsent } = await import("../oauth-ui.ts");
+    const html = renderConsent({
+      params: {
+        clientId: "c",
+        redirectUri: "https://app.example/cb",
+        responseType: "code",
+        scope: "vault:unforced:read vault:read",
+        codeChallenge: "x",
+        codeChallengeMethod: "S256",
+        state: null,
+        resource: null,
+      },
+      csrfToken: "t",
+      clientId: "c",
+      clientName: "App",
+      scopes: ["vault:unforced:read", "vault:read"],
+      displayVault: "unforced",
+    });
+    expect((html.match(/<li class="scope/g) ?? []).length).toBe(1);
+    // The first wire value is retained for the POST, even though both forms
+    // normalize to the same displayed permission.
+    expect(html).toContain('name="granted_scope" value="vault:unforced:read"');
+  });
 });

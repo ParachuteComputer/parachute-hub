@@ -65,6 +65,7 @@ import {
 } from "./jwt-sign.ts";
 import {
   type AuthorizeFormParams,
+  canonicalConsentScope,
   renderApprovePending,
   renderConsent,
   renderError,
@@ -1302,20 +1303,6 @@ export function handleAuthorizeGet(db: Database, req: Request, deps: OAuthDeps):
     return issueAuthCodeRedirect(db, parsed, requestedScopes, session.userId, deps);
   }
 
-  // hub#689 — does the user hold ADMIN on every vault they could pick? Admin
-  // (isFirstAdmin) owns the whole hub. A non-admin owns a vault only if their
-  // `user_vaults` role grants admin there (today role=write does; a role=read
-  // assignment would NOT). Re-derived from the DB so the owner-verb-selector
-  // is offered only to a genuine owner — the submit path re-checks the PICKED
-  // vault and the cap is the backstop, but rendering it precisely avoids
-  // promising an admin upgrade the cap would silently demote.
-  const userHoldsAdminOnPickable =
-    userIsAdmin ||
-    (assignedVaults.length > 0 &&
-      assignedVaults.every((v) =>
-        (vaultVerbsForUserVault(db, session.userId, v) ?? []).includes("admin"),
-      ));
-
   return htmlResponse(
     renderConsent(
       consentProps(
@@ -1325,7 +1312,6 @@ export function handleAuthorizeGet(db: Database, req: Request, deps: OAuthDeps):
         csrf.token,
         assignedVaults,
         userIsAdmin,
-        userHoldsAdminOnPickable,
         grantableExtraScopes(db, session.userId, {
           userIsAdmin,
           requested: parsed.scope.split(" ").filter((s) => s.length > 0),
@@ -1455,11 +1441,28 @@ export function grantableExtraScopes(
     ACCOUNT_SELF_READ_SCOPE,
     ACCOUNT_SELF_ADMIN_SCOPE,
   ];
-  const already = new Set(opts.requested);
+
+  // Compare both naming shapes in one canonical key space. When an admin's
+  // candidate list is unnamed but the request was already narrowed to a
+  // named vault, include that requested name as a display context too; the
+  // shared normalizer then maps the unnamed candidate to the same key. When a
+  // vault name is resolved, the ordinary context handles the reverse case
+  // (unnamed request versus named candidate).
+  const comparisonVaults: Array<string | undefined> = [v];
+  for (const requested of opts.requested) {
+    const parts = requested.split(":");
+    const requestedVault = parts.length === 3 && parts[0] === "vault" ? parts[1] : undefined;
+    if (requestedVault !== undefined && !comparisonVaults.includes(requestedVault)) {
+      comparisonVaults.push(requestedVault);
+    }
+  }
+  const canonicalKeys = (scope: string): string[] =>
+    comparisonVaults.map((displayVault) => canonicalConsentScope(scope, displayVault));
+  const already = new Set(opts.requested.flatMap(canonicalKeys));
   return capScopesToUserAuthority(
     db,
     userId,
-    candidates.filter((c) => !already.has(c)),
+    candidates.filter((candidate) => canonicalKeys(candidate).every((key) => !already.has(key))),
     { userIsAdmin: opts.userIsAdmin },
   );
 }
@@ -3026,24 +3029,20 @@ function consentProps(
   csrfToken: string,
   assignedVaults: readonly string[],
   userIsAdmin: boolean,
-  // hub#689 — true when the user holds admin on every vault they could pick
-  // (admin owns the hub; an assigned non-admin only if their role grants admin
-  // on each assigned vault). Gates whether the owner-verb-selector renders.
-  userHoldsAdminOnPickable = userIsAdmin,
   // The additional-access menu, already capped to this user's authority.
   // Passed IN rather than computed here because it needs the db + userId,
   // which this pure props builder deliberately doesn't take.
   grantableExtras: readonly string[] = [],
 ) {
-  const scopes = params.scope.split(" ").filter((s) => s.length > 0);
-  const unnamedVerbs = unnamedVaultVerbs(scopes);
+  const requestedScopes = params.scope.split(" ").filter((s) => s.length > 0);
+  const unnamedVerbs = unnamedVaultVerbs(requestedScopes);
   // Zero-vault non-admin can't authorize a vault-scoped request (hub#431).
   // The POST handler already 400s this case ("No vaults assigned"); this
   // flag lets the consent screen render Approve disabled + explain why,
   // instead of showing an enabled button that lands the user on an error.
   // Mirrors the vault-scope detection in `handleConsentSubmit`'s zero-vault
   // gate. Non-vault scopes (`scribe:transcribe`, etc.) stay authorizable.
-  const requestsVaultScope = scopes.some((s) => {
+  const requestsVaultScope = requestedScopes.some((s) => {
     if (s === "vault:read" || s === "vault:write" || s === "vault:admin") return true;
     const parts = s.split(":");
     return (
@@ -3080,7 +3079,7 @@ function consentProps(
   // consent into a token that fails at the resource server.
   const hasNamedStaleVaultScope =
     hasStaleAssignment &&
-    scopes.some((s) => {
+    requestedScopes.some((s) => {
       const parts = s.split(":");
       if (
         parts.length !== 3 ||
@@ -3163,25 +3162,16 @@ function consentProps(
     const only = vaultNames[0];
     if (only) displayVault = only;
   }
-  // hub#689 — owner-on-own-vault verb selector. The client requested an
-  // unnamed `vault:read`/`vault:write` verb, and the consenting user owns
-  // (holds admin on) every vault they could pick — first admin owns the whole
-  // hub; an assigned non-admin holds admin on each of their assigned vaults
-  // (vaultVerbsForRole('write') → [read,write,admin]). Offer the selector so
-  // they can grant the level their client actually needs (or downgrade), with
-  // admin pre-selected. Suppressed when the request can't be authorized (zero-
-  // vault non-admin) or the assignment is stale (no valid vault to own).
-  //
-  // SECURITY: this only DECIDES WHETHER TO RENDER. The actual widening is
-  // re-derived server-side in `handleConsentSubmit` against the *picked* vault
-  // and capped by `capScopesToUserAuthority`. The selector value is a hint.
-  const upgradeableUnnamedVerbs = unnamedVerbs.filter((v) => v === "read" || v === "write");
-  const userOwnsEveryPickableVault =
-    !hasStaleAssignment && userCanAuthorizeRequest && userHoldsAdminOnPickable;
-  const ownerVerbSelector =
-    upgradeableUnnamedVerbs.length > 0 && userOwnsEveryPickableVault
-      ? { requestedVerbs: upgradeableUnnamedVerbs }
-      : undefined;
+  // Keep the first wire value for each display-normalized scope. Resource
+  // narrowing can produce the same named value from distinct requested forms,
+  // and the consent page should offer one row/checkbox for that permission.
+  const seenScopeKeys = new Set<string>();
+  const scopes = requestedScopes.filter((scope) => {
+    const key = canonicalConsentScope(scope, displayVault);
+    if (seenScopeKeys.has(key)) return false;
+    seenScopeKeys.add(key);
+    return true;
+  });
   return {
     params,
     clientId: client.clientId,
@@ -3190,7 +3180,6 @@ function consentProps(
     csrfToken,
     vaultPicker,
     displayVault,
-    ownerVerbSelector,
     staleAssignedVault,
     // Approve stays enabled for non-vault scopes even when assigned_vault
     // is stale — the user can still consent to e.g. `scribe:transcribe`

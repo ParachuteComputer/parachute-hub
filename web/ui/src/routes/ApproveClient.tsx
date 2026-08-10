@@ -338,5 +338,5 @@ function isUnnamedVaultScope(scope: string): boolean {
   const parts = scope.split(":");
   if (parts.length !== 2 || parts[0] !== "vault") return false;
   const verb = parts[1];
-  return verb === "read" || verb === "write";
+  return verb === "read" || verb === "write" || verb === "admin";
 }
