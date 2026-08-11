@@ -18,11 +18,17 @@ import {
   handleAccountRoot,
   handleAccountSetVaultCaps,
 } from "../account-api.ts";
+import { ACCOUNT_VAULT_TOKEN_TTL_SECONDS } from "../account-home-ui.ts";
 import { handleCreateInvite } from "../api-invites.ts";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
 import { getSetting } from "../hub-settings.ts";
 import { findInviteByRawToken, recordInviteRedemption, revokeInvite } from "../invites.ts";
-import { signAccessToken, validateAccessToken } from "../jwt-sign.ts";
+import {
+  ACCESS_TOKEN_TTL_SECONDS,
+  findTokenRowByJti,
+  signAccessToken,
+  validateAccessToken,
+} from "../jwt-sign.ts";
 import { upsertService } from "../services-manifest.ts";
 import { rotateSigningKey } from "../signing-keys.ts";
 import { createUser } from "../users.ts";
@@ -577,6 +583,65 @@ describe("handleAccountCreateVault", () => {
         deps(h, { runCommand }),
       );
       expect(res.status).toBe(201);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  // REGRESSION (security review, finding 2 — "credential outliving access").
+  // On the unfixed code `POST /account/vaults` forwarded `createJson.token` —
+  // the CLI's `vault:<name>:admin` bootstrap credential — verbatim, to a caller
+  // holding ONLY `account:self:write`, whose consent label says the app
+  // "cannot ... mint access tokens that outlive this app's access". This test
+  // pins all four properties the returned credential must now have:
+  //   1. it is NOT the CLI bootstrap token,
+  //   2. its scope is the granted tier (read+write), never `admin`,
+  //   3. its lifetime is one access-token lifetime, not the 90-day
+  //      `ACCOUNT_VAULT_TOKEN_TTL_SECONDS` the admin-only mint route uses, and
+  //   4. it has a token-registry row attributed to the REQUESTING client_id,
+  //      so it is revocable (the CLI bootstrap token has no registry row).
+  test("account:self:write create returns a bounded vault read/write token, not the CLI admin token", async () => {
+    const h = makeHarness(["default"]);
+    try {
+      const token = await bearer(h, [ACCOUNT_WRITE_SCOPE]);
+      const runCommand = async (_cmd: readonly string[]): Promise<RunResult> => {
+        upsertService(
+          {
+            name: "parachute-vault",
+            port: 4101,
+            paths: ["/vault/default", "/vault/work"],
+            health: "/health",
+            version: "0.4.2",
+          },
+          h.manifestPath,
+        );
+        return {
+          exitCode: 0,
+          stdout: vaultCreateJson("work", "hubjwt.work.admin-long-lived"),
+          stderr: "",
+        };
+      };
+      const res = await handleAccountCreateVault(
+        jsonReq("/account/vaults", token, "POST", { name: "work" }),
+        deps(h, { runCommand }),
+      );
+      expect(res.status).toBe(201);
+      const body = (await res.json()) as { vault_token: string };
+      expect(body.vault_token).not.toBe("hubjwt.work.admin-long-lived");
+
+      const validated = await validateAccessToken(h.db, body.vault_token, ISSUER);
+      expect(validated.payload.scope).toBe("vault:work:read vault:work:write");
+      expect(validated.payload.aud).toBe("vault.work");
+      expect(validated.payload.client_id).toBe("parachute-hub-spa");
+      // Bounded to ONE access-token lifetime (cloud's account-door value), not
+      // the 90-day admin-route TTL — the "outlives the app's access" half.
+      const lifetime = (validated.payload.exp ?? 0) - (validated.payload.iat ?? 0);
+      expect(lifetime).toBe(ACCESS_TOKEN_TTL_SECONDS);
+      expect(lifetime).toBeLessThan(ACCOUNT_VAULT_TOKEN_TTL_SECONDS);
+      const row = findTokenRowByJti(h.db, validated.payload.jti ?? "");
+      expect(row?.createdVia).toBe("cli_mint");
+      expect(row?.clientId).toBe("parachute-hub-spa");
+      expect(row?.scopes).toEqual(["vault:work:read", "vault:work:write"]);
     } finally {
       h.cleanup();
     }
