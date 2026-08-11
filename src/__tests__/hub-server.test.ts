@@ -4241,7 +4241,16 @@ describe("hubFetch publicExposure layer-gate (proxyToVault)", () => {
     return { port: server.port as number, stop: () => server.stop(true) };
   }
 
-  test("path-inserted PRM is byte-identical to the pre-existing suffix-form PRM, both spellings (#776)", async () => {
+  test("hub forwards the path-inserted PRM without mangling it — body matches the suffix-form fetch byte-for-byte, both spellings (#776)", async () => {
+    // This pins that HUB doesn't corrupt/rewrite the body in transit — it
+    // does NOT independently establish that the two well-known spellings
+    // describe "the same resource" at the protocol level. That invariant is
+    // the vault DAEMON's: both spellings route into the same
+    // `handleProtectedResource` call (parachute-vault `src/routing.ts:290-
+    // 323`, the path-insertion block ahead of the path-append route further
+    // down in the same file). Here we just prove hub's proxy is transparent:
+    // whatever the (fake, in-test) upstream returns for the suffix form is
+    // exactly what comes back through hub's new path-inserted route too.
     const h = makeHarness();
     const upstream = startVaultPrmUpstream("private");
     try {
@@ -4367,6 +4376,15 @@ describe("hubFetch publicExposure layer-gate (proxyToVault)", () => {
       expect(options.status).toBe(204);
       expect(options.headers.get("access-control-allow-origin")).toBe("*");
       expect(options.headers.get("access-control-allow-methods")).toBe("GET, OPTIONS");
+
+      // Advertised Allow-Methods is GET, OPTIONS only — a POST should 405,
+      // not fall through to the proxy (matches the advertised surface).
+      const posted = await fetcher(
+        req("/.well-known/oauth-protected-resource/vault/private", { method: "POST" }),
+      );
+      expect(posted.status).toBe(405);
+      expect(posted.headers.get("allow")).toBe("GET, OPTIONS");
+      expect(posted.headers.get("access-control-allow-origin")).toBe("*");
     } finally {
       upstream.stop();
       h.cleanup();
@@ -4412,8 +4430,69 @@ describe("hubFetch publicExposure layer-gate (proxyToVault)", () => {
         req("/.well-known/oauth-protected-resource/vault/private"),
         fakeServer("198.51.100.4"),
       );
+      // Same shape as the unknown-name 404 below — see the indistinguishability
+      // test for why a different shape here would be a private-vault existence
+      // oracle.
       expect(res.status).toBe(404);
-      expect(await res.text()).toBe("not found");
+      expect(res.headers.get("content-type")).toContain("application/json");
+      expect(await res.json()).toEqual({ error: "Vault not found", vault: "private" });
+      expect(res.headers.get("access-control-allow-origin")).toBe("*");
+      expect(res.headers.get("access-control-allow-methods")).toBe("GET, OPTIONS");
+    } finally {
+      upstream.stop();
+      h.cleanup();
+    }
+  });
+
+  test("path-inserted per-vault PRM: a cloaked private vault's 404 is byte-for-byte indistinguishable from an unknown vault's 404 (#776)", async () => {
+    // The whole point of the loopback cloak is that an unauthenticated /
+    // cross-origin caller cannot use this route to confirm a private vault
+    // exists by name. That requires the cloaked-vault 404 and the
+    // unknown-vault 404 to match on status, body, content-type, AND CORS
+    // headers — any observable difference is a name-existence oracle.
+    const h = makeHarness();
+    const upstream = startVaultUpstream("vault-oracle-check");
+    try {
+      writeManifest(
+        {
+          services: [
+            {
+              name: "parachute-vault-oracle-check",
+              port: upstream.port,
+              paths: ["/vault/oracle-check"],
+              health: "/vault/oracle-check/health",
+              version: "0.4.0",
+              publicExposure: "loopback",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      const fetcher = hubFetch(h.dir, { manifestPath: h.manifestPath });
+
+      const cloaked = await fetcher(
+        req("/.well-known/oauth-protected-resource/vault/oracle-check"),
+        fakeServer("198.51.100.4"),
+      );
+      const unknown = await fetcher(
+        req("/.well-known/oauth-protected-resource/vault/definitely-does-not-exist"),
+        fakeServer("198.51.100.4"),
+      );
+
+      expect(cloaked.status).toBe(unknown.status);
+      expect(cloaked.headers.get("content-type")).toBe(unknown.headers.get("content-type"));
+      expect(cloaked.headers.get("access-control-allow-origin")).toBe(
+        unknown.headers.get("access-control-allow-origin"),
+      );
+      expect(cloaked.headers.get("access-control-allow-methods")).toBe(
+        unknown.headers.get("access-control-allow-methods"),
+      );
+      // Bodies are only equal after normalizing the vault name back out — the
+      // point is the SHAPE is identical, not that the two names collide.
+      const cloakedBody = (await cloaked.json()) as { error: string; vault: string };
+      const unknownBody = (await unknown.json()) as { error: string; vault: string };
+      expect(cloakedBody.error).toBe(unknownBody.error);
+      expect(Object.keys(cloakedBody).sort()).toEqual(Object.keys(unknownBody).sort());
     } finally {
       upstream.stop();
       h.cleanup();
