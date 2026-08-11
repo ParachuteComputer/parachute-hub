@@ -146,6 +146,69 @@ describe("renderConsent", () => {
     expect(html).toContain("scope-unknown");
     expect(html).toContain("mystery.module:do-thing");
     expect(html).toContain("no built-in description");
+    // Unknown is UNASSESSED, not low. `forcesExplicitConsent` fails closed on a
+    // scope with no explanation, so the row the user reads must carry the same
+    // posture the gate does rather than presenting it as ordinary.
+    expect(html).toContain("risk-elevated");
+  });
+
+  // An `elevated` `account:*` scope used to render indistinguishably from
+  // `vault:<name>:write` — same `write` badge, and the consequence line fired
+  // only at `high`. One reaches a single vault; the other reaches every vault
+  // in the account. The words have to say which.
+  test("account:self:write gets the account-wide consequence line; vault:work:write does not", () => {
+    const accountHtml = renderConsent({
+      params: PARAMS,
+      csrfToken: CSRF,
+      clientId: "c",
+      clientName: "App",
+      scopes: ["account:self:write"],
+    });
+    expect(accountHtml).toContain("Account-wide.");
+    expect(accountHtml).toContain("every vault in this account");
+    // But it must NOT borrow the high tier's warning: the write tier's own
+    // label promises it cannot mint credentials that outlive the app's access.
+    expect(accountHtml).not.toContain("keep working even after you disconnect");
+    // Danger red stays reserved for `high`, so red keeps meaning one thing.
+    // (Assert on the rendered BADGE, not the class name — the stylesheet
+    // inlines a `.badge-danger` rule on every page.)
+    expect(accountHtml).not.toContain(`badge-danger">account-wide`);
+
+    const vaultHtml = renderConsent({
+      params: PARAMS,
+      csrfToken: CSRF,
+      clientId: "c",
+      clientName: "App",
+      scopes: ["vault:work:write"],
+    });
+    expect(vaultHtml).not.toContain("Account-wide.");
+  });
+
+  test("account:self:admin keeps the high-risk account-wide warning and danger badge", () => {
+    const html = renderConsent({
+      params: PARAMS,
+      csrfToken: CSRF,
+      clientId: "c",
+      clientName: "App",
+      scopes: ["account:self:admin"],
+    });
+    expect(html).toContain("Account-wide.");
+    expect(html).toContain("keep working even after you disconnect");
+    expect(html).toContain(`badge-danger">account-wide`);
+  });
+
+  test("an unknown grantable extra is offered as elevated, not low", () => {
+    const html = renderConsent({
+      params: PARAMS,
+      csrfToken: CSRF,
+      clientId: "c",
+      clientName: "App",
+      scopes: ["vault:read"],
+      grantableExtras: ["mystery.module:do-thing"],
+    });
+    expect(html).toContain("mystery.module:do-thing");
+    expect(html).toContain("risk-elevated extra-scope");
+    expect(html).not.toContain("risk-low extra-scope");
   });
 
   test("a no-scope request says the token would do nothing, and points at the picker", () => {

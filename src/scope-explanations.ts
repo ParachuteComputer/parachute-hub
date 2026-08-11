@@ -177,8 +177,14 @@ export const SCOPE_EXPLANATIONS: Record<string, ScopeExplanation> = {
     risk: "high",
   },
   "account:self:write": {
+    // "change their settings" read as "the settings of the vaults this app
+    // created" — it does not. `PUT /account/vaults/<name>/caps` is not scoped
+    // to app-created vaults, so this grant reaches the settings of EVERY vault
+    // in the account. The label must say so; narrowing the grant to
+    // app-created vaults is an open Phase 2 design question, and until it is
+    // answered the consent screen has to describe what is actually granted.
     label:
-      "Manage your Parachute account — create new vaults and change their settings. Cannot delete vaults or mint access tokens that outlive this app's access.",
+      "Manage your Parachute account — create new vaults, and change the settings of any vault in this account. Cannot delete vaults or mint access tokens that outlive this app's access.",
     level: "write",
     risk: "elevated",
   },
@@ -490,6 +496,14 @@ export function forcesExplicitConsent(scope: string): boolean {
  * function needs to consult the live module-scope registry too — otherwise
  * a `runner:admin` (or similar) grant would silently bypass the admin-
  * scope guardrails. See the regression test pinning this gap.
+ *
+ * NO PRODUCTION CALLERS as of the account-write-scope change. Its three former
+ * consumers were the trusted-client consent gates in `oauth-handlers.ts`, which
+ * now use the risk-based `forcesExplicitConsent` instead — a verb test could
+ * not see that `account:self:write` is elevated. Kept exported because it is
+ * the canonical "is this scope an admin scope" predicate and is pinned by
+ * tests; do NOT reintroduce it as a consent gate. If you need "must this scope
+ * be consented to explicitly", the answer is `forcesExplicitConsent`.
  */
 export function scopeIsAdmin(scope: string): boolean {
   return explainScope(scope)?.level === "admin";

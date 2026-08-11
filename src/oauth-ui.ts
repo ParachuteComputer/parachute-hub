@@ -999,7 +999,10 @@ function renderScopeRow(scope: string, displayScope: string = scope): string {
   const lookup = tbdMatch ? `vault:${tbdMatch[1]}` : displayScope;
   const explanation = explainScope(lookup);
   if (!explanation) {
-    return `<li class="scope scope-unknown">
+    // `risk-elevated`, not neutral: an unexplained scope is what
+    // `forcesExplicitConsent` fails closed on, so the row the user reads should
+    // carry the same posture the gate does.
+    return `<li class="scope scope-unknown risk-elevated">
       <code class="scope-name">${escapeHtml(displayScope)}</code>
       <span class="scope-label scope-label-muted">Defined by the requesting app — no built-in description.</span>
     </li>`;
@@ -1019,13 +1022,10 @@ function renderScopeRow(scope: string, displayScope: string = scope): string {
   const pendingNote = tbdMatch
     ? `<span class="scope-pending-note">A specific vault is picked below before approving.</span>`
     : "";
-  // A high-risk scope gets an explicit consequence line, not just a colour.
+  // An account-wide scope gets an explicit consequence line, not just a colour.
   // Colour alone is invisible to a screen reader and to anyone who doesn't
   // know the convention, and this is the decision most worth slowing down.
-  const riskNote =
-    risk === "high"
-      ? `<span class="scope-risk-note"><strong>Account-wide.</strong> This is not limited to one vault, and tokens this app creates keep working even after you disconnect it.</span>`
-      : "";
+  const riskNote = accountWideRiskNote(lookup, risk);
   // One checkbox per requested scope — granular consent. Pre-checked for
   // ordinary scopes (the app asked for them and approving is the common case),
   // but a `high` tier scope starts UNCHECKED: account-wide authority should be
@@ -1066,7 +1066,13 @@ function renderGrantableExtras(extras: readonly string[], expanded: boolean): st
   const rows = extras
     .map((scope) => {
       const e = explainScope(scope);
-      const risk = e ? riskForExplanation(e) : "low";
+      // Unknown scopes fail CLOSED here, matching the gate. `forcesExplicitConsent`
+      // treats a scope with no explanation as consent-forcing precisely because
+      // the hub cannot vouch for its blast radius; rendering that same scope as
+      // `risk-low` told the user the opposite of what the gate believes, in the
+      // one place a user acts on the information. Unknown is not low — it is
+      // unassessed, and unassessed is shown as elevated.
+      const risk = e ? riskForExplanation(e) : "elevated";
       const label = e ? e.label : "Defined by the requesting app — no built-in description.";
       const badge = e ? badgeForLevel(e) : "";
       return `<li class="scope risk-${risk} extra-scope">
@@ -1078,11 +1084,7 @@ function renderGrantableExtras(extras: readonly string[], expanded: boolean): st
                 ${badge}
               </span>
               <span class="scope-label">${escapeHtml(label)}</span>
-              ${
-                risk === "high"
-                  ? `<span class="scope-risk-note"><strong>Account-wide.</strong> This is not limited to one vault, and tokens this app creates keep working even after you disconnect it.</span>`
-                  : ""
-              }
+              ${accountWideRiskNote(scope, risk)}
             </span>
           </label>
         </li>`;
@@ -1093,6 +1095,33 @@ function renderGrantableExtras(extras: readonly string[], expanded: boolean): st
       <p class="extras-note">The app didn't request these. Only grant what you actually want it to have.</p>
       <ul class="scopes-list">${rows}</ul>
     </details>`;
+}
+
+/**
+ * The account-wide consequence line — stated in words, because colour alone is
+ * invisible to a screen reader and to anyone who doesn't know the convention.
+ *
+ * Fires for `high` (as it always has) AND for an `elevated` `account:*` scope.
+ * Without the second case `account:self:write` rendered identically to
+ * `vault:work:write` — same `write` badge, same absence of a consequence line —
+ * even though one reaches a single vault and the other reaches every vault in
+ * the account. The two texts differ because the consequences differ: the
+ * elevated tier explicitly CANNOT mint credentials that outlive the app's
+ * access (that is what its label promises), so it must not borrow the `high`
+ * tier's warning about tokens that keep working after you disconnect.
+ *
+ * Deliberately NOT extended to the `badge-danger` "account-wide" badge: danger
+ * red is reserved for the `high` tier so red keeps meaning exactly one thing
+ * (see the `.badge-danger` note in the stylesheet).
+ */
+function accountWideRiskNote(scope: string, risk: "low" | "elevated" | "high"): string {
+  if (risk === "high") {
+    return `<span class="scope-risk-note"><strong>Account-wide.</strong> This is not limited to one vault, and tokens this app creates keep working even after you disconnect it.</span>`;
+  }
+  if (risk === "elevated" && scope.startsWith("account:")) {
+    return `<span class="scope-risk-note"><strong>Account-wide.</strong> This is not limited to one vault — it reaches every vault in this account, including ones created later.</span>`;
+  }
+  return "";
 }
 
 function badgeForLevel(explanation: ScopeExplanation): string {
