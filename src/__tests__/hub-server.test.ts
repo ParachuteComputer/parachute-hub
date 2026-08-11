@@ -4194,8 +4194,8 @@ describe("hubFetch publicExposure layer-gate (proxyToVault)", () => {
     const server = Bun.serve({
       port: 0,
       hostname: "127.0.0.1",
-      fetch: () =>
-        new Response(JSON.stringify({ tag: replyTag }), {
+      fetch: (request) =>
+        new Response(JSON.stringify({ tag: replyTag, pathname: new URL(request.url).pathname }), {
           status: 200,
           headers: { "content-type": "application/json" },
         }),
@@ -4206,6 +4206,219 @@ describe("hubFetch publicExposure layer-gate (proxyToVault)", () => {
   // Item E / #526 — fake Bun Server handle exposing `requestIP` for the peer-
   // address discriminator (see the proxyToService block for the rationale).
   const fakeServer = (address: string) => ({ requestIP: () => ({ address }) });
+
+  // Mirrors the REAL vault daemon's `handleProtectedResource` (vault's
+  // `src/oauth-discovery.ts`): the document is a pure function of the vault
+  // name + forwarded host, NOT of which well-known spelling the client used
+  // to reach it. `startVaultUpstream` above (which echoes the request
+  // pathname into the body) is right for pinning "the exact path was
+  // forwarded verbatim"; this one is right for pinning "the two spellings
+  // describe the same resource" — using it, the two path-inserted spellings
+  // and the suffix form all collapse to the same bytes, exactly like the
+  // real daemon.
+  function startVaultPrmUpstream(vaultName: string): { port: number; stop: () => void } {
+    const server = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch: (request) => {
+        const forwardedHost = request.headers.get("x-forwarded-host");
+        const forwardedProto = request.headers.get("x-forwarded-proto") ?? "http";
+        const base = forwardedHost
+          ? `${forwardedProto}://${forwardedHost}`
+          : new URL(request.url).origin;
+        return Response.json({
+          resource: `${base}/vault/${vaultName}/mcp`,
+          authorization_servers: ["http://hub.example"],
+          scopes_supported: [
+            `vault:${vaultName}:read`,
+            `vault:${vaultName}:write`,
+            `vault:${vaultName}:admin`,
+          ],
+          bearer_methods_supported: ["header"],
+        });
+      },
+    });
+    return { port: server.port as number, stop: () => server.stop(true) };
+  }
+
+  test("path-inserted PRM is byte-identical to the pre-existing suffix-form PRM, both spellings (#776)", async () => {
+    const h = makeHarness();
+    const upstream = startVaultPrmUpstream("private");
+    try {
+      writeManifest(
+        {
+          services: [
+            {
+              name: "parachute-vault-private",
+              port: upstream.port,
+              paths: ["/vault/private"],
+              health: "/vault/private/health",
+              version: "0.4.0",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      const fetcher = hubFetch(h.dir, { manifestPath: h.manifestPath });
+
+      // Ground truth: the suffix/path-append form (`/vault/<name>/.well-
+      // known/...`) is NOT this PR's route — it's routed by the pre-existing
+      // generic `/vault/<name>/*` proxy (`proxyToVault`). It has worked since
+      // #774 and is what the vault instance being "reachable at
+      // /vault/<name>/..." (per #776) means in practice.
+      const suffixRes = await fetcher(req("/vault/private/.well-known/oauth-protected-resource"));
+      expect(suffixRes.status).toBe(200);
+      const suffixBody = await suffixRes.text();
+
+      // Both path-inserted spellings — this PR's new route — must describe
+      // the exact same resource.
+      for (const path of [
+        "/.well-known/oauth-protected-resource/vault/private",
+        "/.well-known/oauth-protected-resource/vault/private/mcp",
+      ]) {
+        const res = await fetcher(req(path));
+        expect(res.status).toBe(200);
+        expect(await res.text()).toBe(suffixBody);
+      }
+    } finally {
+      upstream.stop();
+      h.cleanup();
+    }
+  });
+
+  test("path-inserted per-vault PRM 404s before the vault is registered, 200s after — no hub restart (#776)", async () => {
+    const h = makeHarness();
+    const upstream = startVaultUpstream("vault-techne");
+    try {
+      writeManifest({ services: [] }, h.manifestPath);
+      const fetcher = hubFetch(h.dir, { manifestPath: h.manifestPath });
+
+      // Before: no service backs "techne" yet — the exact bug shape from
+      // #776 (the hub has no route to reach a vault instance that will,
+      // once created, be reachable at /vault/techne/...).
+      const before = await fetcher(req("/.well-known/oauth-protected-resource/vault/techne"));
+      expect(before.status).toBe(404);
+
+      // Simulate `parachute vault create techne` — services.json mutates,
+      // no hub restart (same dynamism `findVaultUpstream`'s docstring
+      // promises for /vault/<name>/* proxying).
+      writeManifest(
+        {
+          services: [
+            {
+              name: "parachute-vault-techne",
+              port: upstream.port,
+              paths: ["/vault/techne"],
+              health: "/vault/techne/health",
+              version: "0.4.0",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+
+      // After: same hubFetch instance — the path-inserted form is now
+      // reachable, matching the pre-existing suffix form's dynamism.
+      const after = await fetcher(req("/.well-known/oauth-protected-resource/vault/techne"));
+      expect(after.status).toBe(200);
+      const body = (await after.json()) as { tag: string };
+      expect(body.tag).toBe("vault-techne");
+    } finally {
+      upstream.stop();
+      h.cleanup();
+    }
+  });
+
+  test("path-inserted per-vault PRM forwards both forms unchanged with wildcard CORS (#776)", async () => {
+    const h = makeHarness();
+    const upstream = startVaultUpstream("vault-prm");
+    try {
+      writeManifest(
+        {
+          services: [
+            {
+              name: "parachute-vault-private",
+              port: upstream.port,
+              paths: ["/vault/private"],
+              health: "/vault/private/health",
+              version: "0.4.0",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      const fetcher = hubFetch(h.dir, { manifestPath: h.manifestPath });
+      for (const path of [
+        "/.well-known/oauth-protected-resource/vault/private",
+        "/.well-known/oauth-protected-resource/vault/private/mcp",
+      ]) {
+        const res = await fetcher(req(path));
+        expect(res.status).toBe(200);
+        expect(res.headers.get("access-control-allow-origin")).toBe("*");
+        expect(res.headers.get("access-control-allow-methods")).toBe("GET, OPTIONS");
+        const body = (await res.json()) as { tag: string; pathname: string };
+        expect(body.tag).toBe("vault-prm");
+        expect(body.pathname).toBe(path);
+      }
+
+      const options = await fetcher(
+        req("/.well-known/oauth-protected-resource/vault/private", { method: "OPTIONS" }),
+      );
+      expect(options.status).toBe(204);
+      expect(options.headers.get("access-control-allow-origin")).toBe("*");
+      expect(options.headers.get("access-control-allow-methods")).toBe("GET, OPTIONS");
+    } finally {
+      upstream.stop();
+      h.cleanup();
+    }
+  });
+
+  test("path-inserted per-vault PRM returns the vault daemon's not-found shape for unknown names (#776)", async () => {
+    const h = makeHarness();
+    try {
+      writeManifest({ services: [] }, h.manifestPath);
+      const res = await hubFetch(h.dir, { manifestPath: h.manifestPath })(
+        req("/.well-known/oauth-protected-resource/vault/missing"),
+      );
+      expect(res.status).toBe(404);
+      expect(await res.json()).toEqual({ error: "Vault not found", vault: "missing" });
+      expect(res.headers.get("access-control-allow-origin")).toBe("*");
+      expect(res.headers.get("access-control-allow-methods")).toBe("GET, OPTIONS");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("path-inserted per-vault PRM applies the loopback publicExposure cloak (#776)", async () => {
+    const h = makeHarness();
+    const upstream = startVaultUpstream("vault-private");
+    try {
+      writeManifest(
+        {
+          services: [
+            {
+              name: "parachute-vault-private",
+              port: upstream.port,
+              paths: ["/vault/private"],
+              health: "/vault/private/health",
+              version: "0.4.0",
+              publicExposure: "loopback",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      const res = await hubFetch(h.dir, { manifestPath: h.manifestPath })(
+        req("/.well-known/oauth-protected-resource/vault/private"),
+        fakeServer("198.51.100.4"),
+      );
+      expect(res.status).toBe(404);
+      expect(await res.text()).toBe("not found");
+    } finally {
+      upstream.stop();
+      h.cleanup();
+    }
+  });
 
   test("vault publicExposure: loopback + tailnet header → 404", async () => {
     const h = makeHarness();
