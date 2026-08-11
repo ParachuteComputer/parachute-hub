@@ -56,6 +56,7 @@
  *                                                FORWARDED from the vault daemon
  *                                                (not built locally like the
  *                                                hub-issued PRM)
+ *   /.well-known/oauth-protected-resource/vault/<name>[/mcp] → RFC 9728 per-vault PRM, forwarded from vault daemon
  *
  *   # OAuth issuer.
  *   /oauth/authorize  (GET + POST)             → login → consent → auth code
@@ -2978,6 +2979,55 @@ export function hubFetch(
           return new Response(null, { status: 204, headers: corsHeaders });
         }
         const res = rootMcpProtectedResourceMetadata(oauthDeps(req));
+        const merged = new Headers(res.headers);
+        for (const [k, v] of Object.entries(corsHeaders)) merged.set(k, v);
+        return new Response(res.body, { status: res.status, headers: merged });
+      }
+
+      // /.well-known/oauth-protected-resource/vault/<name>[/mcp] — the
+      // path-insertion PRM for a per-vault resource. The vault daemon owns this
+      // document because it authors the vault-specific resource URL and scopes;
+      // forward the exact path it expects rather than rebuilding the metadata
+      // in hub.
+      const protectedResourceVaultInsert = pathname.match(
+        /^\/\.well-known\/oauth-protected-resource\/vault\/([^/]+)(?:\/mcp)?$/,
+      );
+      if (protectedResourceVaultInsert) {
+        const corsHeaders = {
+          "access-control-allow-origin": "*",
+          "access-control-allow-methods": "GET, OPTIONS",
+        };
+        if (req.method === "OPTIONS") {
+          return new Response(null, { status: 204, headers: corsHeaders });
+        }
+        if (req.method !== "GET") {
+          return new Response("method not allowed", {
+            status: 405,
+            headers: { ...corsHeaders, allow: "GET, OPTIONS" },
+          });
+        }
+
+        const vaultName = protectedResourceVaultInsert[1]!;
+        const services = readManifestLenient(manifestPath).services;
+        const match = findVaultUpstream(services, `/vault/${vaultName}`);
+        let res: Response;
+        if (!match) {
+          res = Response.json({ error: "Vault not found", vault: vaultName }, { status: 404 });
+        } else if (
+          effectivePublicExposure(match.entry) === "loopback" &&
+          layerOf(req, peerAddr) !== "loopback"
+        ) {
+          // Cloaked exactly like "no such vault" — same JSON body, status, and
+          // (via the shared merge below) the same CORS headers. A cloaked
+          // private vault must be indistinguishable from an unknown name to an
+          // unauthenticated caller; an early-return with a different body
+          // shape here would turn this route into a private-vault existence
+          // oracle (name it and see whether the 404 looks "loopback-shaped").
+          res = Response.json({ error: "Vault not found", vault: vaultName }, { status: 404 });
+        } else {
+          // No targetPath: the vault daemon matches this RFC path verbatim.
+          res = await proxyRequest(req, match.port, "vault", "vault", deps?.supervisor, peerAddr);
+        }
         const merged = new Headers(res.headers);
         for (const [k, v] of Object.entries(corsHeaders)) merged.set(k, v);
         return new Response(res.body, { status: res.status, headers: merged });
