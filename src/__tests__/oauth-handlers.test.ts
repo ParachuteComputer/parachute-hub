@@ -7444,6 +7444,54 @@ describe("DCR same-hub auto-trust (hub#312)", () => {
     }
   });
 
+  // REGRESSION (security review, finding 1 — "consent-gate bypass"). The gate
+  // used to read `!requestedScopes.some(scopeIsAdmin)`, a VERB test. The new
+  // `account:self:write` rung has verb `write`, so it slipped straight past:
+  // a same-hub client + a session got account-wide vault-CREATION authority
+  // minted with NO consent screen. On the unfixed code this returns 302 with a
+  // `code=` in the Location — the silent mint. It must render consent instead.
+  test("authorize: same_hub=true + account:self:write → elevated risk forces consent (not silent-mint)", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const owner = await createUser(db, "owner", "pw");
+      const session = createSession(db, { userId: owner.id });
+      const reg = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        status: "approved",
+        sameHub: true,
+      });
+      const { challenge } = makePkce();
+      const res = handleAuthorizeGet(
+        db,
+        new Request(
+          authorizeUrl({
+            client_id: reg.client.clientId,
+            redirect_uri: "https://app.example/cb",
+            response_type: "code",
+            scope: "account:self:write",
+            code_challenge: challenge,
+            code_challenge_method: "S256",
+          }),
+          {
+            headers: {
+              cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, SESSION_COOKIE_TTL_S)}`,
+            },
+          },
+        ),
+        { issuer: ISSUER },
+      );
+      expect(res.status).toBe(200);
+      expect(res.headers.get("content-type")).toContain("text/html");
+      // No auth code was handed out, and no grant was silently recorded.
+      expect(res.headers.get("location")).toBeNull();
+      expect(findGrant(db, owner.id, reg.client.clientId)).toBeNull();
+      // It is the CONSENT screen (naming the scope), not some error page.
+      expect(await res.text()).toContain("Manage your Parachute account");
+    } finally {
+      cleanup();
+    }
+  });
+
   test("authorize: same_hub=true + non-admin scope → grant recorded for follow-up flows", async () => {
     // Subsequent flows (same scopes, even if the same-hub gate ever moves)
     // should hit the standard #75 skip-consent gate uniformly. We pin that
@@ -8495,6 +8543,62 @@ describe("handleAuthorizeGet — trust-by-client_name auto-approve (hub#409)", (
       expect(after?.status).toBe("approved");
       // A grant was recorded for the new client_id
       expect(findGrant(db, user.id, fresh.client.clientId)).not.toBeNull();
+    } finally {
+      cleanup();
+    }
+  });
+
+  // REGRESSION (security review, finding 1 — "consent-gate bypass", second
+  // trusted-client path). Trust-by-client_name (hub#409) carries a prior grant
+  // held under the SAME client_name onto a FRESH client_id and then falls
+  // through to the skip-consent mint. Its guard was also verb-based
+  // (`scopeIsAdmin`), so `account:self:write` — verb `write` — carried over
+  // silently: a brand-new, still-`pending` client_id walked away with
+  // account-wide vault-creation authority on the strength of a name match, no
+  // consent screen. On the unfixed code this returns 302 with a `code=`.
+  test("account:self:write prior client_name grant → elevated risk still renders consent", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const owner = await createUser(db, "owner", "pw");
+      const session = createSession(db, { userId: owner.id });
+      const prior = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        status: "approved",
+        clientName: "Claude",
+      });
+      recordGrant(db, owner.id, prior.client.clientId, ["account:self:write"]);
+      const fresh = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        status: "pending",
+        clientName: "Claude",
+      });
+      const { challenge } = makePkce();
+      const res = handleAuthorizeGet(
+        db,
+        new Request(
+          authorizeUrl({
+            client_id: fresh.client.clientId,
+            redirect_uri: "https://app.example/cb",
+            response_type: "code",
+            scope: "account:self:write",
+            code_challenge: challenge,
+            code_challenge_method: "S256",
+          }),
+          {
+            headers: {
+              cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000))}`,
+              origin: ISSUER,
+            },
+          },
+        ),
+        { issuer: ISSUER },
+      );
+      expect(res.status).toBe(200);
+      expect(res.headers.get("content-type")).toContain("text/html");
+      // No auth code, and the prior grant was NOT carried onto the fresh id.
+      expect(res.headers.get("location")).toBeNull();
+      expect(findGrant(db, owner.id, fresh.client.clientId)).toBeNull();
+      expect(await res.text()).toContain("Manage your Parachute account");
     } finally {
       cleanup();
     }
@@ -10550,8 +10654,8 @@ describe("single OAuth consent + grantable vault admin + delegate-only cap (2026
   });
 
   // Test 13 — same-hub client + session + vault:<name>:admin → does NOT
-  // silently mint; consent renders (relies on scopeIsAdmin recognizing the
-  // named admin form).
+  // silently mint; consent renders (the risk-based consent guard classifies
+  // the named admin form as elevated).
   test("[13] same-hub client + vault:work:admin → consent renders (not silent-mint)", async () => {
     const { db, cleanup } = await makeDb();
     try {
@@ -10609,8 +10713,8 @@ describe("single OAuth consent + grantable vault admin + delegate-only cap (2026
       });
       const { challenge } = makePkce();
       // New request includes admin — even though a prior same-name grant
-      // happens to list it, the trust gate excludes admin (scopeIsAdmin), so
-      // it must not silently carry over.
+      // happens to list it, the risk-based trust gate excludes it, so it must
+      // not silently carry over.
       const res = handleAuthorizeGet(
         db,
         new Request(

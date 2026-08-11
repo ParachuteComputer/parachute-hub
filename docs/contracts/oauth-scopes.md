@@ -92,6 +92,20 @@ Canonical implementations:
 - **Per-vault audience binding.** Hub-issued vault JWTs carry
   `aud=vault.<name>` and vault strict-checks it on each request — a token
   scoped for one vault cannot be replayed against another.
+- **Risk, not verb, decides whether consent can be skipped.** The hub has two
+  trusted-client shortcuts that mint an auth code without rendering the consent
+  screen: same-hub auto-trust (a client DCR-registered by the operator) and
+  trust-by-`client_name` carry-over (a fresh `client_id` re-linking under a
+  name the user already granted). Neither may be taken when ANY requested scope
+  carries an `elevated` or `high` blast-radius risk in
+  `SCOPE_EXPLANATIONS` — `account:<id>:write` is `elevated` and
+  `account:<id>:admin` is `high`, so both always reach an explicit consent
+  screen even though `write` is not an admin verb. Scopes with no explanation
+  entry fail closed (they force consent) until they get a risk tier. The gate
+  is `forcesExplicitConsent` in `parachute-hub/src/scope-explanations.ts`; a
+  verb-shaped test (`scopeIsAdmin`) is NOT sufficient and was the bypass this
+  rule exists to close. These shortcuts are hub-only — the cloud door has
+  neither, so it has no counterpart gate.
 - **Vault-bound consent drops foreign scopes.** When a client sends an
   RFC 8707 `resource=<origin>/vault/<name>/mcp` indicator (an MCP client
   connecting to one vault), the hub narrows the consent — and the minted

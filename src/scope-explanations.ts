@@ -309,8 +309,8 @@ export const NON_REQUESTABLE_SCOPES: ReadonlySet<string> = new Set([
  * enumerate them. It is still used by `isVaultAdminScope` (the mint-token
  * de-escalation recognizer) and `explainScope` / `VAULT_VERB_RE` (so the
  * consent screen renders the admin badge and `scopeIsAdmin` recognizes the
- * named admin form — load-bearing: the same-hub and trust-by-name auto-mint
- * gates rely on `scopeIsAdmin` to keep admin consent-gated).
+ * named admin form). The trusted-client consent shortcuts use the risk-based
+ * `forcesExplicitConsent` helper below instead of this verb classifier.
  */
 const VAULT_ADMIN_RE = /^vault:[a-zA-Z0-9_-]+:admin$/;
 
@@ -435,12 +435,11 @@ export function isRequestableScope(scope: string): boolean {
  * is now requestable via OAuth, so it reaches the consent screen and MUST get
  * the `vault:admin` explanation (level `"admin"`) — both so the consent UI
  * renders the admin badge and so `scopeIsAdmin("vault:<name>:admin")` returns
- * true. That second effect is LOAD-BEARING: the same-hub auto-trust gate
- * (`!hasAdminScope`) and the trust-by-client_name gate
- * (`!requestedScopes.some(scopeIsAdmin)`) rely on `scopeIsAdmin` recognizing
- * the named admin form to keep admin grants consent-gated (never silently
- * auto-minted). If this regex dropped `admin`, those gates would treat a
- * named admin scope as non-admin and auto-mint it.
+ * true. The consent shortcuts use the risk-based `forcesExplicitConsent`
+ * helper, which resolves this same explanation and keeps the elevated admin
+ * form consent-gated (never silently auto-minted). If this regex dropped
+ * `admin`, the consent screen would lose its admin explanation and the
+ * risk-based guard would no longer have the intended classification.
  */
 const VAULT_VERB_RE = /^vault:[a-zA-Z0-9_*-]+:(read|write|admin)$/;
 
@@ -468,6 +467,17 @@ export function explainScope(scope: string): ScopeExplanation | null {
     return SCOPE_EXPLANATIONS[`surface:${verb}`] ?? null;
   }
   return null;
+}
+
+/**
+ * Whether a trusted-client consent shortcut must show the consent screen for
+ * this scope. The shortcut is safe only for scopes whose blast-radius risk is
+ * explicitly or implicitly `low`; unknown scopes fail closed until they have
+ * a known explanation and risk tier.
+ */
+export function forcesExplicitConsent(scope: string): boolean {
+  const explanation = explainScope(scope);
+  return explanation === null || riskForExplanation(explanation) !== "low";
 }
 
 /**

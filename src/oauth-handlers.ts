@@ -91,9 +91,9 @@ import {
   ACCOUNT_SELF_ADMIN_SCOPE,
   ACCOUNT_SELF_READ_SCOPE,
   ACCOUNT_SELF_WRITE_SCOPE,
+  forcesExplicitConsent,
   isNonRequestableScope,
   isRequestableScope,
-  scopeIsAdmin,
 } from "./scope-explanations.ts";
 import { findUnknownScopes, loadDeclaredScopes } from "./scope-registry.ts";
 import { shortNameForManifest } from "./service-spec.ts";
@@ -779,23 +779,17 @@ function pendingClientResponse(
   //      for scopes the prior grant didn't cover) falls through to the
   //      approve-pending screen so the operator explicitly approves the
   //      addition.
-  //   5. Non-admin scopes only — `*:admin` scopes (hub:admin, vault:*:admin
-  //      if it ever becomes requestable) require explicit per-session
-  //      consent. This guard mirrors the same-hub-auto-trust gate's
-  //      treatment of admin scopes (handleAuthorizeGet ~line 854).
-  //      NOTE: `scopeIsAdmin` has a documented blind spot for
-  //      module-declared admin scopes (e.g. a hypothetical `runner:admin`
-  //      registered via a module manifest's scopes.defines). See
-  //      `src/scope-explanations.ts:191`. A future module that makes a
-  //      module-admin scope requestable via public DCR would silently
-  //      bypass this guard. Worth a tighter scope-classification helper
-  //      when that becomes a real risk.
+  //   5. Low-risk scopes only — any scope with elevated/high blast-radius risk
+  //      requires explicit per-session consent, even when its verb is merely
+  //      `write` (for example, account:self:write). Unknown scopes also fail
+  //      closed through `forcesExplicitConsent` until they have a known risk
+  //      classification.
   if (
     session &&
     sameOrigin &&
     client.clientName &&
     requestedScopes.length > 0 &&
-    !requestedScopes.some(scopeIsAdmin) &&
+    !requestedScopes.some(forcesExplicitConsent) &&
     isCoveredByGrantForClientName(db, session.userId, client.clientName, requestedScopes)
   ) {
     console.log(
@@ -1203,16 +1197,16 @@ export function handleAuthorizeGet(db: Database, req: Request, deps: OAuthDeps):
     // The mint downstream goes through `issueAuthCodeRedirect`, which caps to
     // held authority, so this carry-over can never silently re-grant an
     // un-held verb. Guarded identically to the in-`pendingClientResponse`
-    // block: same-origin + non-empty client_name + non-admin requested scopes
-    // (`scopeIsAdmin` recognizes the named admin form now — load-bearing) +
-    // prior-grant coverage. When it doesn't apply, fall through to the consent
-    // render (the single-consent payoff: one consent screen, then silent).
+    // block: same-origin + non-empty client_name + low-risk requested scopes
+    // (`forcesExplicitConsent` is risk-based, not verb-based) + prior-grant
+    // coverage. When it doesn't apply, fall through to the consent render (the
+    // single-consent payoff: one consent screen, then silent).
     const earlyRequested = parsed.scope.split(" ").filter((s) => s.length > 0);
     if (
       isSameOriginRequest(req, resolveBoundOrigins(deps)) &&
       client.clientName &&
       earlyRequested.length > 0 &&
-      !earlyRequested.some(scopeIsAdmin) &&
+      !earlyRequested.some(forcesExplicitConsent) &&
       isCoveredByGrantForClientName(db, earlySession.userId, client.clientName, earlyRequested)
     ) {
       console.log(
@@ -1343,6 +1337,23 @@ export function handleAuthorizeGet(db: Database, req: Request, deps: OAuthDeps):
     return issueAuthCodeRedirect(db, parsed, requestedScopes, session.userId, deps);
   }
 
+  // -------------------------------------------------------------------------
+  // HUB/CLOUD DRIFT #2 — consent-shortcut surface at /oauth/authorize.
+  // Cloud twin: `workers/identity/src/oauth-authorize.ts`.
+  //
+  // The same-hub auto-trust gate (#312) and the trust-by-client_name carry-over
+  // (#409, in `pendingClientResponse` and the early block above) are hub-only
+  // self-host / single-operator shortcuts: they exist because the operator who
+  // installed the app IS the account. Cloud is multi-tenant and has NEITHER —
+  // no `same_hub` DCR marker, no client-name trust path — so every cloud
+  // authorize reaches an explicit consent render.
+  //
+  // Consequence for `forcesExplicitConsent`: it has no cloud counterpart to
+  // keep in step. It is a hub-side compensating control for hub-only
+  // shortcuts, not half of a two-door contract, so a change here does NOT
+  // imply a matching cloud change. Adding a `same_hub`-style shortcut to cloud
+  // later would need its own copy of this risk gate.
+  //
   // Same-hub auto-trust gate (hub#312, parachute-app design §6). When the
   // DCR registrant authenticated as the operator (bearer hub:admin OR
   // session-cookie + same-origin), the resulting client is "owned by this
@@ -1351,10 +1362,10 @@ export function handleAuthorizeGet(db: Database, req: Request, deps: OAuthDeps):
   // code immediately, but only when:
   //
   //   1. The client is marked same_hub=true in the DB (set at DCR time).
-  //   2. None of the requested scopes are admin-level — admin scopes
-  //      (`*:admin`, `hub:admin`, per-vault `vault:<name>:admin` is non-
-  //      requestable so never reaches here) are high-power enough that we
-  //      still want explicit consent as a sanity gate.
+  //   2. Every requested scope is low-risk. Elevated/high-risk scopes require
+  //      explicit consent even when their verb is `write`; account-wide
+  //      `account:self:write` is the motivating example. Unknown scopes also
+  //      force consent through `forcesExplicitConsent`.
   //   3. No unnamed vault verbs are requested — those need the picker to
   //      narrow `vault:<verb>` → `vault:<name>:<verb>` before mint.
   //   4. The user's assigned_vaults list is not stale (hub#284 reviewer
@@ -1374,10 +1385,10 @@ export function handleAuthorizeGet(db: Database, req: Request, deps: OAuthDeps):
   // The grant is also recorded so subsequent flows with the same scopes
   // hit the standard skip-consent gate above. Logged so an operator
   // auditing "who did this" can trace it back to a same-hub DCR.
-  const hasAdminScope = requestedScopes.some(scopeIsAdmin);
+  const hasExplicitConsentScope = requestedScopes.some(forcesExplicitConsent);
   if (
     client.sameHub &&
-    !hasAdminScope &&
+    !hasExplicitConsentScope &&
     !hasUnnamedVault &&
     !hasStaleAssignment &&
     userHasVaultPosture
@@ -1389,9 +1400,10 @@ export function handleAuthorizeGet(db: Database, req: Request, deps: OAuthDeps):
     // scopes (single choke-point, single source of truth) so the next
     // /authorize for this (user, client, scopes) hits the standard
     // skip-consent path (#75) — and can never replay an un-held verb. The
-    // `!hasAdminScope` guard above already keeps admin scopes off this path
-    // (they fall through to consent), so the cap is a no-op here for the
-    // common case, but it still runs unconditionally for defense in depth.
+    // `hasExplicitConsentScope` above already keeps elevated/high-risk scopes
+    // off this path (they fall through to consent), so the cap is a no-op here
+    // for the common case, but it still runs unconditionally for defense in
+    // depth.
     return issueAuthCodeRedirect(db, parsed, requestedScopes, session.userId, deps);
   }
 
@@ -1584,10 +1596,11 @@ export function grantableExtraScopes(
  * Not the ONLY `recordGrant` call in this module, though: two other guarded
  * fast-path records exist — the trust-by-client_name auto-promote in
  * `pendingClientResponse` (~L585) and the auto-approve carry-over in
- * `handleAuthorizeGet` (~L895). Both are gated by `!some(scopeIsAdmin)`, so
- * neither can ever record an admin verb, and any mint they unlock still flows
- * back through this function's cap. So the invariant "no minted token, and no
- * grant row, ever carries an un-held admin verb" holds across all paths.
+ * `handleAuthorizeGet` (~L895). Both are gated by
+ * `!some(forcesExplicitConsent)`, so neither can record an elevated/high-risk
+ * scope without explicit consent, and any mint they unlock still flows back
+ * through this function's cap. So the invariant "no trusted-client shortcut
+ * silently records a non-low-risk scope" holds across all paths.
  */
 function issueAuthCodeRedirect(
   db: Database,
@@ -2993,7 +3006,8 @@ function resolveBoundOrigins(deps: OAuthDeps): readonly string[] {
  *   anything else                 → same_hub=false
  *
  * The same_hub marker drives the consent-screen auto-trust path at
- * `/oauth/authorize` for non-admin scopes (parachute-app design §6).
+ * `/oauth/authorize` for low-risk scopes (parachute-app design §6); elevated
+ * and high-risk scopes still require explicit consent.
  */
 export async function handleRegister(
   db: Database,
@@ -3033,7 +3047,7 @@ export async function handleRegister(
   //
   // Both operator-authenticated paths (bearer + session-cookie) also mark
   // same_hub=true so the consent-screen gate at /oauth/authorize can auto-
-  // trust the client for non-admin scopes (hub#312).
+  // trust the client for low-risk scopes (hub#312).
   let status: ClientStatus = "pending";
   let sameHub = false;
   if (req.headers.get("authorization")) {
