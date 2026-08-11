@@ -20,13 +20,15 @@
  *   GET    /.well-known/parachute-account → the public capabilities descriptor
  *
  * Auth posture: `Authorization: Bearer` + scope, adopting the hub's admin shape
- * (NOT the console session-cookie + CSRF + HTML-form shape). Mutations accept
- * `account:self:admin` OR `parachute:host:admin`; reads additionally accept
- * `account:self:read`. Per PLAN-DECISION SCOPE-b the hub's account token is a
- * SUPERSET that carries both the `account:self:*` string AND the host scopes,
- * so the wrapped cores (which still gate on `parachute:host:admin`) accept it
- * unchanged and this facade works whether or not the H1 scope-registry PR has
- * landed — a plain host-admin token is always sufficient.
+ * (NOT the console session-cookie + CSRF + HTML-form shape). Create-vault and
+ * set-caps accept `account:self:write` or its stronger `:admin` scope;
+ * delete-vault and token-minting remain admin-only. Reads accept `:read` and
+ * stronger account scopes. Every route also accepts `parachute:host:admin`.
+ * Per PLAN-DECISION SCOPE-b the hub's account token is a SUPERSET that carries
+ * both the `account:self:*` string AND the host scopes, so the wrapped cores
+ * (which still gate on `parachute:host:admin`) accept it unchanged and this
+ * facade works whether or not the H1 scope-registry PR has landed — a plain
+ * host-admin token is always sufficient.
  *
  * On self-host the account IS the box (operator ≡ account ≡ box): the account
  * id is the sentinel `self`, and the operator owns every vault, so the
@@ -35,7 +37,7 @@
 import type { Database } from "bun:sqlite";
 // NOTE: this is a VALUE import — hub can't run without
 // `@openparachute/door-contract` resolving at runtime, so it's a real
-// `^0.6.0` runtime `dependency` (package.json, mirroring `@openparachute/depcheck`)
+// `^0.7.0` runtime `dependency` (package.json, mirroring `@openparachute/depcheck`)
 // and NOT a `workspace:*` devDependency. The published hub tarball doesn't ship
 // `packages/`, so the npm-installed hub resolves door-contract from the registry.
 // See RELEASING.md → "Releasing door-contract".
@@ -55,36 +57,93 @@ import { HOST_ADMIN_SCOPE, provisionVault } from "./admin-vaults.ts";
 import { SERVICES_MANIFEST_PATH } from "./config.ts";
 import { activePublicSignupPath } from "./invites.ts";
 import { inferAudience } from "./jwt-audience.ts";
-import { recordTokenMint, signAccessToken, validateAccessToken } from "./jwt-sign.ts";
-import { ACCOUNT_SELF_ADMIN_SCOPE, ACCOUNT_SELF_READ_SCOPE } from "./scope-explanations.ts";
+import {
+  ACCESS_TOKEN_TTL_SECONDS,
+  recordTokenMint,
+  signAccessToken,
+  validateAccessToken,
+} from "./jwt-sign.ts";
+import {
+  ACCOUNT_SELF_ADMIN_SCOPE,
+  ACCOUNT_SELF_READ_SCOPE,
+  ACCOUNT_SELF_WRITE_SCOPE,
+} from "./scope-explanations.ts";
 import { readManifestLenient } from "./services-manifest.ts";
 import { getUserById } from "./users.ts";
 import { getVaultCap, setVaultCap } from "./vault-caps.ts";
 import { VAULT_NAME_CHARSET_RE } from "./vault-name.ts";
 import { isVaultEntry, vaultInstanceNameFor } from "./well-known.ts";
 
-// The `account:self:{admin,read}` scope strings are defined once in
-// scope-explanations.ts (H1, #746) — the same registry that makes them
-// non-OAuth-requestable — and imported here so the two never drift.
+// The `account:self:{admin,write,read}` scope strings are defined once in
+// scope-explanations.ts (H1, #746) and imported here so the two never drift.
 /** client_id stamped on per-vault tokens this surface mints + their registry rows. */
 const ACCOUNT_API_CLIENT_ID = "parachute-account";
 
 /**
- * Scopes that satisfy a `/account/*` MUTATION. The account superset token
- * carries `account:self:admin`; a plain operator/host-admin token carries
- * `parachute:host:admin`. Either is accepted so H2 works independent of H1's
- * merge order (SCOPE-b).
+ * Lifetime of the create-time vault credential handed to a WRITE-tier caller
+ * (`POST /account/vaults`, the D2 handoff). One access-token lifetime — NOT the
+ * 90-day `ACCOUNT_VAULT_TOKEN_TTL_SECONDS` the admin-gated
+ * `POST /account/vaults/<name>/token` route uses.
+ *
+ * The write tier's consent label promises the app "cannot ... mint access
+ * tokens that outlive this app's access". A 90-day vault credential handed to
+ * an app whose own bearer lasts 15 minutes breaks that promise: revoking the
+ * grant tomorrow would leave a working vault credential behind for three
+ * months. Bounding the handoff to one access-token lifetime keeps the
+ * credential inside the window the user consented to, and matches cloud, whose
+ * `ACCOUNT_VAULT_TOKEN_TTL_SECONDS` IS `ACCESS_TOKEN_TTL_SECONDS`
+ * (`workers/identity/src/account-api.ts`).
+ *
+ * Bounded residual: the handoff is minted fresh at create time, so it can
+ * outlive the caller's *current* bearer by up to one full access-token
+ * lifetime. It is registry-recorded against the caller's own `client_id`
+ * (unlike the CLI bootstrap token, which never reaches the hub token
+ * registry), so an operator can revoke it explicitly within that window.
+ */
+const WRITE_TIER_VAULT_HANDOFF_TTL_SECONDS = ACCESS_TOKEN_TTL_SECONDS;
+
+/**
+ * Scopes that satisfy an admin-only `/account/*` mutation (delete / mint). The
+ * account superset token carries `account:self:admin`; a plain
+ * operator/host-admin token carries `parachute:host:admin`. Either is accepted
+ * so H2 works independent of H1's merge order (SCOPE-b).
  *
  * ORDER IS LOAD-BEARING: `requireAnyScope` puts `[0]` in the RFC 6750 `scope`
  * challenge, so the narrowest scope an account-door client should request must
  * come first.
  */
 const ADMIN_SCOPES: readonly string[] = [ACCOUNT_SELF_ADMIN_SCOPE, HOST_ADMIN_SCOPE];
-/** Scopes that satisfy a `/account/*` READ. `admin ⊇ read`, spelled explicitly
+/** Scopes that satisfy a `/account/*` WRITE mutation (create, set-caps) — the
+ * middle rung: provision/configure without delete or credential-minting
+ * authority. ORDER IS LOAD-BEARING (see ADMIN_SCOPES doc) — narrowest first.
+ *
+ * `parachute:host:admin` is the self-host operator bypass and is hub-only:
+ * cloud is multi-tenant and has no "host" authority, so its account mutations
+ * can only be authorized by the tenant's own `account:<id>:*` scopes. It rides
+ * along here for the same reason it rides along in ADMIN_SCOPES/READ_SCOPES
+ * (SCOPE-b) — not a new grant of authority. */
+const WRITE_SCOPES: readonly string[] = [
+  ACCOUNT_SELF_WRITE_SCOPE,
+  ACCOUNT_SELF_ADMIN_SCOPE,
+  HOST_ADMIN_SCOPE,
+];
+/** Scopes that satisfy a `/account/*` READ. `admin ⊇ write ⊇ read`, spelled explicitly
  * because the hub's `requireScope` does an exact-string membership check (no
- * inheritance expansion at validate time). Narrowest-first, per ADMIN_SCOPES. */
+ * inheritance expansion at validate time). Narrowest-first, per ADMIN_SCOPES.
+ *
+ * `ACCOUNT_SELF_WRITE_SCOPE` is listed because the ladder is a LATTICE, not
+ * three disjoint sets: door-contract's `hasAccountScope(["account:self:write"],
+ * "self", "read")` is `true`, and `docs/contracts/oauth-scopes.md` publishes
+ * that inheritance. Omitting it here contradicted both — and because
+ * `requireAnyScope` tests exact membership rather than expanding inheritance,
+ * the contradiction was live: a write-tier app 403'd on `GET /account`, the
+ * bootstrap call that is the FIRST request in the account-door flow. The
+ * door-contract parity test did not catch it because it exercises the shared
+ * checker (`hasAccountScope`) and never these constants. Any future rung must
+ * be added to every set it is a superset of. */
 const READ_SCOPES: readonly string[] = [
   ACCOUNT_SELF_READ_SCOPE,
+  ACCOUNT_SELF_WRITE_SCOPE,
   ACCOUNT_SELF_ADMIN_SCOPE,
   HOST_ADMIN_SCOPE,
 ];
@@ -184,7 +243,7 @@ export async function requireAnyScope(
   return { sub, scopes, clientId, audience: aud };
 }
 
-/** Scope set for a `/account/*` mutation (create / delete / mint / set-caps). */
+/** Scope set for admin-only `/account/*` mutations (delete / mint). */
 export const ACCOUNT_MUTATION_SCOPES = ADMIN_SCOPES;
 /** Scope set for a `/account/*` read (list / get-caps / bootstrap). */
 export const ACCOUNT_READ_SCOPES = READ_SCOPES;
@@ -400,18 +459,54 @@ async function parseNameBody(req: Request): Promise<NameBody | BodyErr> {
  * Create a vault and return a ready-to-use vault token (the hinge, D2): the app
  * lands the user IN the vault with zero extra round-trips. Wraps the auth-free
  * `provisionVault` core (this facade already ran the scope gate). The hub's
- * create already mints a `vault:<name>:admin` token; post-`pvt_*`-DROP that
- * token can be `""` when no hub origin was reachable — the response forwards
- * whatever the vault minted (+ `token_guidance`), and the app falls back to
- * `POST /account/vaults/<name>/token` on an empty `vault_token` (risk #5).
+ * create CLI mints a `vault:<name>:admin` bootstrap token; admin-tier account
+ * callers receive that raw token unchanged. A write-tier-only caller instead
+ * receives a fresh hub-signed `vault:<name>:{read,write}` token for the new
+ * vault, registry-recorded against the REQUESTING client and capped at
+ * `WRITE_TIER_VAULT_HANDOFF_TTL_SECONDS`.
+ *
+ * This is the credential-de-escalation the write tier's consent label
+ * requires. Without it the write tier hands back the CLI's full-admin
+ * bootstrap credential — an unbounded, hub-registry-invisible
+ * `vault:<name>:admin` token — for a grant whose label says the app "cannot
+ * ... mint access tokens that outlive this app's access". The de-escalated
+ * token matches the tier the user actually granted (write, not admin), lives
+ * one access-token lifetime, and is revocable because it has a registry row.
+ *
+ * Post-`pvt_*`-DROP the CLI token can be `""` when no hub origin was
+ * reachable; `token_guidance` remains forwarded verbatim, and an empty CLI
+ * token stays empty (nothing to de-escalate).
+ *
+ * ---------------------------------------------------------------------------
+ * HUB/CLOUD DRIFT #1 — create-vault authority and the returned credential.
+ * Cloud twin: `handleAccountVaultCreate`, `workers/identity/src/account-api.ts`.
+ *
+ *   - Tier: cloud gates create on `requireAccount(..., "admin")` — it has no
+ *     write rung yet. Hub accepts `account:self:write` (E1). Until cloud grows
+ *     the middle rung, an `account:self:write` bearer opens create on the hub
+ *     door and is refused on the cloud door. The door contract's
+ *     `ACCOUNT_ROUTES` now says `write` for this route (door-contract 0.7.0),
+ *     so cloud is the side that must catch up.
+ *   - Credential: cloud ALWAYS mints `vault:<name>:{read,write}` and never
+ *     returns an admin credential, because it has no host filesystem and no
+ *     `parachute-vault create --json` CLI to bootstrap from. Hub's admin-tier
+ *     branch below deliberately keeps forwarding the CLI bootstrap token
+ *     (existing behavior, hub-only); the write-tier branch converges on
+ *     cloud's read+write shape.
+ *   - Lifetime: hub's `ACCOUNT_VAULT_TOKEN_TTL_SECONDS` is 90 days (the
+ *     friend-mint default) where cloud's is `ACCESS_TOKEN_TTL_SECONDS`. The
+ *     write-tier handoff below uses the cloud value; the admin-gated
+ *     `POST /account/vaults/<name>/token` route keeps hub's 90 days. That
+ *     older TTL drift is pre-existing and deliberately untouched here.
  */
 export async function handleAccountCreateVault(
   req: Request,
   deps: AccountApiDeps,
 ): Promise<Response> {
   if (req.method !== "POST") return methodNotAllowed("POST");
+  let auth: AdminAuthContext;
   try {
-    await requireAnyScope(deps.db, req, ADMIN_SCOPES, deps.knownIssuers ?? [deps.issuer]);
+    auth = await requireAnyScope(deps.db, req, WRITE_SCOPES, deps.knownIssuers ?? [deps.issuer]);
   } catch (err) {
     return adminAuthErrorResponse(err);
   }
@@ -432,9 +527,25 @@ export async function handleAccountCreateVault(
   // existing name — it converges on cloud's exact 409 `vault_taken` shape.
   // `provisionVault` itself is UNCHANGED (still idempotent for its other
   // caller, the invite-redeem flow, which doesn't route through this
-  // facade) — only this facade's wire answer changes. A scripted consumer
-  // that relied on 200-on-existing must follow up with
-  // `POST /account/vaults/<name>/token` to get a usable token.
+  // facade) — only this facade's wire answer changes.
+  //
+  // What a consumer that relied on 200-on-existing can do here depends on its
+  // tier, and the two answers differ:
+  //
+  //   - admin tier: follow up with `POST /account/vaults/<name>/token` to mint
+  //     a credential for the existing vault.
+  //   - write tier: that route is NOT available. It gates on ADMIN_SCOPES
+  //     (`handleAccountMintVaultToken`), so an `account:self:write` bearer —
+  //     the tier this route now accepts — gets 403 there. The only path
+  //     forward at write tier is to retry create with a name that is free.
+  //
+  // This asymmetry is deliberate, not an oversight. Minting a fresh credential
+  // for an ALREADY-EXISTING vault is the "mint access tokens that outlive this
+  // app's access" authority the write-tier consent label explicitly disclaims;
+  // it is also unbounded renewal, which would defeat the 15-minute
+  // WRITE_TIER_VAULT_HANDOFF_TTL_SECONDS bound the create path below is careful
+  // to impose. A write-tier app gets one bounded handoff at the moment IT
+  // creates a vault, and no way to re-arm. Renewal is an admin decision.
   if (!provisioned.created) {
     return json(409, {
       error: "vault_taken",
@@ -444,6 +555,74 @@ export async function handleAccountCreateVault(
 
   const entry = provisioned.entry;
   const meta: VaultMeta = { name: entry.name, url: entry.url, version: entry.version };
+  const authorizedWithAdminScope = ADMIN_SCOPES.some((scope) => auth.scopes.includes(scope));
+  let vaultToken = provisioned.createJson?.token ?? "";
+  if (!authorizedWithAdminScope && vaultToken.length > 0) {
+    const scopes = [`vault:${entry.name}:read`, `vault:${entry.name}:write`];
+    // OAuth bearers carry their requesting client_id. Legacy self-issued
+    // account bearers may omit it; retain the existing account-surface id only
+    // for that fallback while preserving the caller's id whenever present.
+    const clientId = auth.clientId ?? ACCOUNT_API_CLIENT_ID;
+    // NOT ATOMIC WITH THE PROVISION ABOVE, deliberately surfaced rather than
+    // hidden. `provisionVault` has already committed — the vault exists on disk
+    // and in the services manifest — and there is no rollback seam to undo it
+    // (deleting a just-created vault on a mint failure would be a second
+    // destructive action taken on a guess). So a throw here MUST NOT surface as
+    // a generic 500: the caller would read it as "create failed", retry, and
+    // get a 409 `vault_taken` for a vault it does own but has no credential
+    // for — and at write tier `POST /account/vaults/<name>/token` is
+    // admin-gated, so there is no way to recover a credential. That is a dead
+    // end. The distinguishable error below tells caller and operator exactly
+    // what state the box is in: the vault EXISTS, only the handoff failed.
+    try {
+      const minted = await signAccessToken(deps.db, {
+        sub: auth.sub,
+        scopes,
+        audience: inferAudience(scopes),
+        clientId,
+        issuer: deps.issuer,
+        ttlSeconds: WRITE_TIER_VAULT_HANDOFF_TTL_SECONDS,
+        vaultScope: [entry.name],
+        ...(deps.now !== undefined ? { now: deps.now } : {}),
+      });
+      const subjectIsUser = getUserById(deps.db, auth.sub) !== null;
+      recordTokenMint(deps.db, {
+        jti: minted.jti,
+        createdVia: "cli_mint",
+        subject: auth.sub,
+        ...(subjectIsUser ? { userId: auth.sub } : {}),
+        clientId,
+        scopes,
+        expiresAt: minted.expiresAt,
+        ...(deps.now !== undefined ? { now: deps.now } : {}),
+      });
+      vaultToken = minted.token;
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      console.error(
+        `[account-api] vault "${entry.name}" was created but the write-tier token handoff failed: ${detail}`,
+      );
+      return json(500, {
+        error: "vault_created_token_mint_failed",
+        vault: entry.name,
+        message: `The vault "${entry.name}" WAS created, but minting its access token failed. The vault exists — do not retry create (it will report the name as taken). An operator must mint a token for it with \`POST /account/vaults/${entry.name}/token\` (requires ${ACCOUNT_SELF_ADMIN_SCOPE}) or delete the vault.`,
+      });
+    }
+  }
+  // `token_guidance` is the CLI's prose for the bootstrap token it returns, and
+  // it points at the admin-gated per-vault mint route. Forwarding it verbatim to
+  // a write-tier caller hands out advice that 403s for that caller (see the
+  // 409 branch above for why that route stays admin-only). Forward it only to
+  // the tier it is true for; write tier gets guidance matching what it actually
+  // holds. This matters most on the empty-token path (no reachable hub origin
+  // for the CLI to mint against), where the response would otherwise be a 201
+  // shaped exactly like a working handoff — empty credential, plus instructions
+  // the caller cannot follow.
+  const tokenGuidance = authorizedWithAdminScope
+    ? provisioned.createJson?.token_guidance
+    : vaultToken.length > 0
+      ? `This token grants read+write access to this vault only, and expires in ${Math.round(WRITE_TIER_VAULT_HANDOFF_TTL_SECONDS / 60)} minutes. It is the one credential this vault hands you at creation — it cannot be renewed at this tier.`
+      : "No access token could be issued for this vault. The vault WAS created, but your grant does not permit minting a credential for it after the fact. Ask an operator to mint one for you.";
   const body: {
     name: string;
     url: string;
@@ -453,10 +632,8 @@ export async function handleAccountCreateVault(
   } = {
     name: entry.name,
     url: entry.url,
-    vault_token: provisioned.createJson?.token ?? "",
-    ...(provisioned.createJson?.token_guidance
-      ? { token_guidance: provisioned.createJson.token_guidance }
-      : {}),
+    vault_token: vaultToken,
+    ...(tokenGuidance ? { token_guidance: tokenGuidance } : {}),
     services: servicesBlock(meta),
   };
   return json(201, body);
@@ -671,8 +848,9 @@ export async function handleAccountSetVaultCaps(
   deps: AccountApiDeps,
 ): Promise<Response> {
   if (req.method !== "PUT") return methodNotAllowed("PUT");
+  let auth: AdminAuthContext;
   try {
-    await requireAnyScope(deps.db, req, ADMIN_SCOPES, deps.knownIssuers ?? [deps.issuer]);
+    auth = await requireAnyScope(deps.db, req, WRITE_SCOPES, deps.knownIssuers ?? [deps.issuer]);
   } catch (err) {
     return adminAuthErrorResponse(err);
   }
@@ -691,6 +869,17 @@ export async function handleAccountSetVaultCaps(
   if (!parsed.ok) return json(parsed.status, { error: parsed.error, message: parsed.message });
 
   const cap = setVaultCap(deps.db, vaultName, parsed.cap_bytes);
+  // Audit line, matching the operator route's (`api-vault-caps.ts`) but naming
+  // the CALLER too. This route is reachable at write tier by a third-party
+  // OAuth client, and nothing scopes it to vaults that client created — so a
+  // client granted `account:self:write` for its own vault can retune the quota
+  // of ANY vault on the box. Whether that should be restricted to app-created
+  // vaults is an open design question (Phase 2); until it is answered, the
+  // change must at minimum leave a trace naming who made it.
+  console.log(
+    `vault cap set: vault=${vaultName} cap_bytes=${cap.capBytes} ` +
+      `via=account-api subject=${auth.sub} client_id=${auth.clientId ?? "none"}`,
+  );
   return json(200, {
     name: vaultName,
     caps: { cap_bytes: cap.capBytes, created_at: cap.createdAt, updated_at: cap.updatedAt },

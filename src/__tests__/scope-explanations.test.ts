@@ -4,6 +4,7 @@ import {
   NON_REQUESTABLE_SCOPES,
   SCOPE_EXPLANATIONS,
   explainScope,
+  forcesExplicitConsent,
   isNonRequestableScope,
   isRequestableScope,
   isWellFormedOrNonVaultScope,
@@ -23,6 +24,7 @@ describe("SCOPE_EXPLANATIONS", () => {
       "parachute:host:admin",
       // Account scopes (Parachute App campaign, Phase 2).
       "account:self:admin",
+      "account:self:write",
       "account:self:read",
     ];
     for (const s of expected) {
@@ -84,9 +86,8 @@ describe("explainScope", () => {
 
   // Single-consent change (2026-05-29): vault:<name>:admin is now REQUESTABLE
   // and reaches the consent screen, so explainScope MUST resolve it to the
-  // vault:admin explanation (level "admin"). This is load-bearing: it makes
-  // scopeIsAdmin("vault:<name>:admin") return true, which the same-hub and
-  // trust-by-name auto-mint gates rely on to keep admin consent-gated.
+  // vault:admin explanation (level "admin"). The trusted-client gates use
+  // the resulting elevated risk to keep it consent-gated.
   test("resolves a per-vault admin (vault:<name>:admin) to the vault:admin explanation", () => {
     expect(explainScope("vault:default:admin")?.label).toBe(
       SCOPE_EXPLANATIONS["vault:admin"]?.label,
@@ -121,9 +122,8 @@ describe("scopeIsAdmin", () => {
   });
 
   // Single-consent change (2026-05-29): the named per-vault admin form must
-  // be recognized as admin. LOAD-BEARING — the same-hub auto-trust gate
-  // (`!hasAdminScope`) and the trust-by-client_name gate
-  // (`!requestedScopes.some(scopeIsAdmin)`) rely on this to keep a named admin
+  // be recognized as admin. Its explanation's elevated risk is load-bearing —
+  // the same-hub and trust-by-client_name gates use that risk to keep the
   // grant consent-gated instead of silently auto-minting it.
   test("true for named per-vault admin (vault:<name>:admin)", () => {
     expect(scopeIsAdmin("vault:work:admin")).toBe(true);
@@ -139,6 +139,16 @@ describe("scopeIsAdmin", () => {
 
   test("scopeIsAdmin('runner:admin') returns false — module-declared admin scopes don't participate (deliberate; see scope-explanations.ts comment)", () => {
     expect(scopeIsAdmin("runner:admin")).toBe(false);
+  });
+});
+
+describe("forcesExplicitConsent", () => {
+  test("allows low-risk vault scopes but forces elevated/high/unknown scopes", () => {
+    expect(forcesExplicitConsent("vault:read")).toBe(false);
+    expect(forcesExplicitConsent("vault:work:write")).toBe(false);
+    expect(forcesExplicitConsent("account:self:write")).toBe(true);
+    expect(forcesExplicitConsent("account:self:admin")).toBe(true);
+    expect(forcesExplicitConsent("unknown:anything")).toBe(true);
   });
 });
 
@@ -167,6 +177,7 @@ describe("NON_REQUESTABLE_SCOPES (#96)", () => {
     // "high" with the consequences named. See the [9b]/[9c] cap tests in
     // oauth-handlers.test.ts — those are what keep this safe.
     expect(NON_REQUESTABLE_SCOPES.has("account:self:admin")).toBe(false);
+    expect(NON_REQUESTABLE_SCOPES.has("account:self:write")).toBe(false);
     expect(NON_REQUESTABLE_SCOPES.has("account:self:read")).toBe(false);
   });
 
@@ -208,12 +219,14 @@ describe("isRequestableScope", () => {
     expect(isRequestableScope("vault:my-techne_2:admin")).toBe(true);
   });
 
-  test("account scopes ARE requestable, and still read as admin for the consent gates", () => {
+  test("account scopes ARE requestable, with risk-aware consent gating", () => {
     expect(isRequestableScope("account:self:admin")).toBe(true);
+    expect(isRequestableScope("account:self:write")).toBe(true);
     expect(isRequestableScope("account:self:read")).toBe(true);
     // explainScope resolves them (direct SCOPE_EXPLANATIONS keys) with the
-    // right levels, so scopeIsAdmin recognizes the admin form.
+    // right levels and risk tiers.
     expect(explainScope("account:self:admin")?.level).toBe("admin");
+    expect(explainScope("account:self:write")?.level).toBe("write");
     expect(explainScope("account:self:read")?.level).toBe("read");
     expect(scopeIsAdmin("account:self:admin")).toBe(true);
     expect(scopeIsAdmin("account:self:read")).toBe(false);

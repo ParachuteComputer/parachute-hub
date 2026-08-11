@@ -1,6 +1,6 @@
 {
   "name": "@openparachute/door-contract",
-  "version": "0.6.1",
+  "version": "0.7.0",
   "description": "The Parachute door contract: shared OAuth-issuer + /account/* wire types, constants, and conformance vectors that both doors (self-host hub + hosted cloud) implement.",
   "license": "AGPL-3.0",
   "type": "module",
@@ -17,11 +17,7 @@
       "import": "./dist/index.js"
     }
   },
-  "files": [
-    "dist",
-    "README.md",
-    "CHANGELOG.md"
-  ],
+  "files": ["dist", "README.md", "CHANGELOG.md"],
   "repository": {
     "type": "git",
     "url": "https://github.com/ParachuteComputer/parachute-hub.git",

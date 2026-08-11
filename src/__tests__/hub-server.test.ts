@@ -18,6 +18,7 @@ import {
   stripHopByHopHeaders,
 } from "../hub-server.ts";
 import { defaultRootModeFor, setNotesRedirectDisabled, setRootMode } from "../hub-settings.ts";
+import { signAccessToken } from "../jwt-sign.ts";
 import { clearNotesRedirectLogState } from "../notes-redirect.ts";
 import { mintOperatorToken } from "../operator-token.ts";
 import { pidPath } from "../process-state.ts";
@@ -5391,6 +5392,79 @@ describe("hubFetch persistent chrome strip injection (workstream G)", () => {
   });
 });
 
+// ===========================================================================
+// DELETE /account/vaults/<name> — admin-only destructive account mutation
+// ===========================================================================
+describe("DELETE /account/vaults/<name> — account scope tiering", () => {
+  const ACCOUNT_ADMIN_SCOPE = "account:self:admin";
+  const ACCOUNT_WRITE_SCOPE = "account:self:write";
+  const ACCOUNT_READ_SCOPE = "account:self:read";
+  const HOST_ADMIN_SCOPE = "parachute:host:admin";
+  const ISSUER = "https://hub.test";
+
+  test("write/read are refused while the existing admin superset still deletes", async () => {
+    const h = makeHarness();
+    writeManifest({ services: [vaultEntry("work")] }, h.manifestPath);
+    const db = openHubDb(hubDbPath(h.dir));
+    rotateSigningKey(db);
+    const runCommand = async (): Promise<{ exitCode: number; stdout: string; stderr: string }> => ({
+      exitCode: 0,
+      stdout: "",
+      stderr: "",
+    });
+    const fetcher = hubFetch(h.dir, {
+      getDb: () => db,
+      issuer: ISSUER,
+      manifestPath: h.manifestPath,
+      connectionsStorePath: join(h.dir, "connections.json"),
+      deleteVaultRunCommand: runCommand,
+    });
+
+    async function token(scopes: string[]): Promise<string> {
+      return (
+        await signAccessToken(db, {
+          sub: "operator-user",
+          scopes,
+          audience: "account",
+          clientId: "parachute-hub-spa",
+          issuer: ISSUER,
+          ttlSeconds: 600,
+        })
+      ).token;
+    }
+
+    function deleteRequest(bearer: string): Request {
+      return req("/account/vaults/work", {
+        method: "DELETE",
+        headers: { authorization: `Bearer ${bearer}`, "content-type": "application/json" },
+        body: JSON.stringify({ confirm: "work" }),
+      });
+    }
+
+    try {
+      const writeRes = await fetcher(await deleteRequest(await token([ACCOUNT_WRITE_SCOPE])));
+      expect(writeRes.status).toBe(403);
+
+      const readRes = await fetcher(await deleteRequest(await token([ACCOUNT_READ_SCOPE])));
+      expect(readRes.status).toBe(403);
+
+      // The real account token is an admin + host-admin superset; the second
+      // gate inside handleDeleteVault therefore still accepts it unchanged.
+      const adminRes = await fetcher(
+        await deleteRequest(await token([ACCOUNT_ADMIN_SCOPE, HOST_ADMIN_SCOPE])),
+      );
+      expect(adminRes.status).toBe(200);
+      expect(((await adminRes.json()) as { ok: boolean }).ok).toBe(true);
+    } finally {
+      db.close();
+      h.cleanup();
+    }
+  });
+});
+
+// ===========================================================================
+// POST /account/vault-token/<name> — friend scoped mint (routed end-to-end)
+// ===========================================================================
 describe("POST /account/vault-token/<name> — friend scoped mint (routed end-to-end)", () => {
   // Drive the real dispatch (`hubFetch`) so the route wiring + precedence
   // (the `/account/vault-token/` prefix must win over `/account/` and the

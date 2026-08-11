@@ -36,8 +36,9 @@ Parachute OAuth tokens carry **whitespace-separated scope strings**
 | `surface:<name>:read` | Fetch/clone the named surface's hub-hosted git repo (Surface Git Transport) |
 | `surface:<name>:write` | Push to the named surface's repo (write ⊇ read at the git endpoint) |
 | `surface:admin` | surface-host module admin — the hub↔surface-host notify bearer + the credential endpoint |
-| `account:<id>:read` | Read the account: list the owner's vaults, read their caps/usage (Parachute App campaign, Phase 2 — the `/account/*` door contract). Cookie-minted only via `POST /account/token`; **not requestable** from third-party clients. On self-host `<id>` is the sentinel `self` (account ≡ box). |
-| `account:<id>:admin` | Every account mutation: create/delete/import vaults, mint per-vault tokens, set caps. `admin ⊇ read`. Cookie-minted only via `POST /account/token`; **not requestable**. |
+| `account:<id>:read` | Read the account: list the owner's vaults, read their caps/usage (Parachute App campaign, Phase 2 — the `/account/*` door contract). Requestable under the account-authority cap. On self-host `<id>` is the sentinel `self` (account ≡ box). |
+| `account:<id>:write` | Create vaults and change their settings, but not delete vaults or mint access tokens that outlive the app's access. Requestable under the account-authority cap. |
+| `account:<id>:admin` | Delete vaults and mint per-vault access tokens, in addition to write and read. `admin ⊇ write ⊇ read`. Requestable under the account-authority cap. |
 
 Third-party modules declare their own namespace (`my-service:read`, etc.)
 and the hub renders consent for those scopes the same way.
@@ -53,7 +54,7 @@ Migration records remain under
 ```
 admin ⊇ write ⊇ read       (vault)
 write ⊇ read               (surface:<name>, at the git endpoint)
-admin ⊇ read               (account:<id>, at the /account/* validator)
+admin ⊇ write ⊇ read       (account:<id>, at the /account/* validator)
 ```
 
 - `vault:<name>:admin` satisfies any check for `vault:<name>:write` or
@@ -72,6 +73,16 @@ admin ⊇ read               (account:<id>, at the /account/* validator)
   currently imply `scribe:transcribe` — each non-inheritance-tree scope
   stands alone. This is deliberate: we add inheritance per-service
   when the verb set clearly lines up as read/write/admin.
+- **The `/account/*` validator does not expand inheritance at check time.**
+  `requireAnyScope` tests exact membership against a per-tier list, so the
+  `admin ⊇ write ⊇ read` ladder above is realised by *spelling every superset
+  scope into every list it satisfies* (`READ_SCOPES` / `WRITE_SCOPES` /
+  `ADMIN_SCOPES` in `src/account-api.ts`), not by calling `hasAccountScope`.
+  Adding a rung means editing every list it is a superset of — miss one and
+  the published lattice and the enforced one diverge silently, which is
+  exactly how `account:self:write` came to 403 on `GET /account`. Note that
+  the door-contract parity test cannot catch this class of bug: it exercises
+  the shared `hasAccountScope` checker, never these lists.
 
 Canonical implementations:
 - vault — [`parachute-vault/src/scopes.ts`](https://github.com/ParachuteComputer/parachute-vault/blob/main/src/scopes.ts)
@@ -91,6 +102,20 @@ Canonical implementations:
 - **Per-vault audience binding.** Hub-issued vault JWTs carry
   `aud=vault.<name>` and vault strict-checks it on each request — a token
   scoped for one vault cannot be replayed against another.
+- **Risk, not verb, decides whether consent can be skipped.** The hub has two
+  trusted-client shortcuts that mint an auth code without rendering the consent
+  screen: same-hub auto-trust (a client DCR-registered by the operator) and
+  trust-by-`client_name` carry-over (a fresh `client_id` re-linking under a
+  name the user already granted). Neither may be taken when ANY requested scope
+  carries an `elevated` or `high` blast-radius risk in
+  `SCOPE_EXPLANATIONS` — `account:<id>:write` is `elevated` and
+  `account:<id>:admin` is `high`, so both always reach an explicit consent
+  screen even though `write` is not an admin verb. Scopes with no explanation
+  entry fail closed (they force consent) until they get a risk tier. The gate
+  is `forcesExplicitConsent` in `parachute-hub/src/scope-explanations.ts`; a
+  verb-shaped test (`scopeIsAdmin`) is NOT sufficient and was the bypass this
+  rule exists to close. These shortcuts are hub-only — the cloud door has
+  neither, so it has no counterpart gate.
 - **Vault-bound consent drops foreign scopes.** When a client sends an
   RFC 8707 `resource=<origin>/vault/<name>/mcp` indicator (an MCP client
   connecting to one vault), the hub narrows the consent — and the minted

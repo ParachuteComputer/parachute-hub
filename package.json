@@ -43,7 +43,7 @@
   "dependencies": {
     "@node-rs/argon2": "^2.0.2",
     "@openparachute/depcheck": "0.1.1",
-    "@openparachute/door-contract": "^0.6.0",
+    "@openparachute/door-contract": "^0.7.0",
     "jose": "^6.2.2",
     "otpauth": "^9.5.0",
     "qrcode": "^1.5.4"

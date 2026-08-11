@@ -34,21 +34,25 @@ export interface ScopeExplanation {
    * How much damage a compromised holder of this scope could do — orthogonal
    * to `level`, which describes the VERB.
    *
-   * The two come apart at exactly one place, which is why this field exists:
-   * `vault:<name>:admin` and `account:self:admin` are both level `"admin"`,
-   * but one can reshape a single vault while the other can delete every vault
-   * on the account and mint credentials for all of them. Rendering both with
-   * the same badge asks the user to make a much bigger decision with the same
-   * visual weight.
+   * The two come apart at the account boundary, which is why this field exists:
+   * `vault:<name>:admin` is level `"admin"` but only reaches one vault,
+   * `account:self:write` reaches the account for provision/configure authority,
+   * and `account:self:admin` can delete every vault and mint credentials for
+   * all of them. Rendering those grants with only their verb badge would ask
+   * the user to make decisions with different blast radii at the same visual
+   * weight.
    *
    *   - `"low"`      — reads, and writes bounded to one vault's content.
-   *   - `"elevated"` — full control of ONE vault (yellow). Risky but ordinary;
-   *                    this is what an MCP client needs to manage tag schemas.
-   *   - `"high"`     — account-wide authority (red). Reaches every vault, and
-   *                    can mint credentials that OUTLIVE this grant.
+   *   - `"elevated"` — full control of ONE vault, or account-wide
+   *                    provision/configure authority without delete or mint
+   *                    (yellow). Risky but bounded.
+   *   - `"high"`     — account-wide destructive authority (red). Reaches every
+   *                    vault and can mint credentials that OUTLIVE this grant.
    *
    * Defaults to a level-derived value when absent (see `riskForExplanation`),
-   * so existing entries keep their behaviour without restating it.
+   * so existing entries keep their behaviour without restating it. Account-wide
+   * destructive authority opts into `"high"`; account write is explicitly
+   * `"elevated"` because it cannot delete or mint.
    */
   risk?: "low" | "elevated" | "high";
 }
@@ -58,7 +62,7 @@ export interface ScopeExplanation {
  * is elevated and everything else is low.
  *
  * A default rather than a required field on purpose: the only scopes needing
- * `high` are the account-wide ones, and forcing every entry to restate a tier
+ * `high` are the account-wide destructive ones, and forcing every entry to restate a tier
  * it shares with its level invites drift between the two.
  */
 export function riskForExplanation(e: ScopeExplanation): "low" | "elevated" | "high" {
@@ -153,15 +157,15 @@ export const SCOPE_EXPLANATIONS: Record<string, ScopeExplanation> = {
     level: "admin",
   },
   // Account scopes (Parachute App campaign, Phase 2 — the `/account/*` door
-  // contract). `account:<id>:admin` authorizes every account mutation
-  // (create/delete/import vaults, mint per-vault tokens, set caps); `:read`
-  // authorizes the read side (list vaults, read caps/usage). On a self-host
-  // hub `<id>` is the sentinel `self` (account ≡ box). These are minted ONLY
-  // by the cookie→bearer `POST /account/token` exchange, NEVER via the public
-  // OAuth flow — they're in NON_REQUESTABLE_SCOPES below, like the host scopes.
-  // Listed here (a) so `NON_REQUESTABLE_SCOPES ⊆ FIRST_PARTY_SCOPES` holds and
-  // (b) so scope-guard's `admin ⊇ read` inheritance recognizes the grammar
-  // (`account:self:admin` satisfies `account:self:read`).
+  // contract). `account:<id>:write` authorizes create/configure mutations;
+  // `:admin` authorizes destructive and credential-minting mutations (delete
+  // vaults and mint per-vault tokens); `:read` authorizes the read side (list
+  // vaults, read caps/usage). On a self-host hub `<id>` is the sentinel `self`
+  // (account ≡ box). The first-party cookie→bearer `POST /account/token`
+  // exchange mints the admin superset; public OAuth may request these scopes
+  // under the account-authority cap in `capScopesToUserAuthority`.
+  // Listed here so `FIRST_PARTY_SCOPES` includes the full grammar and
+  // scope-guard's `admin ⊇ write ⊇ read` inheritance recognizes the ladder.
   "account:self:admin": {
     // Names DELETE and the token-minting explicitly. Minting is the part a
     // user cannot walk back: revoking this grant does not revoke tokens the
@@ -171,6 +175,18 @@ export const SCOPE_EXPLANATIONS: Record<string, ScopeExplanation> = {
       "Full control of your Parachute account — create and PERMANENTLY DELETE any of your vaults, change their settings, and mint access tokens for them. Tokens it creates keep working even after you disconnect this app.",
     level: "admin",
     risk: "high",
+  },
+  "account:self:write": {
+    // "change their settings" read as "the settings of the vaults this app
+    // created" — it does not. `PUT /account/vaults/<name>/caps` is not scoped
+    // to app-created vaults, so this grant reaches the settings of EVERY vault
+    // in the account. The label must say so; narrowing the grant to
+    // app-created vaults is an open Phase 2 design question, and until it is
+    // answered the consent screen has to describe what is actually granted.
+    label:
+      "Manage your Parachute account — create new vaults, and change the settings of any vault in this account. Cannot delete vaults or mint access tokens that outlive this app's access.",
+    level: "write",
+    risk: "elevated",
   },
   "account:self:read": {
     label: "View your Parachute account — list your vaults and read their settings and usage.",
@@ -184,6 +200,7 @@ export const SCOPE_EXPLANATIONS: Record<string, ScopeExplanation> = {
  * canonical constants rather than re-literaling the strings. `self` is the
  * self-host account sentinel (account ≡ box). */
 export const ACCOUNT_SELF_ADMIN_SCOPE = "account:self:admin";
+export const ACCOUNT_SELF_WRITE_SCOPE = "account:self:write";
 export const ACCOUNT_SELF_READ_SCOPE = "account:self:read";
 
 /**
@@ -258,8 +275,9 @@ export const NON_REQUESTABLE_SCOPES: ReadonlySet<string> = new Set([
   // that manages vaults for you couldn't be built at all, because the only
   // path to account authority was the first-party app's cookie exchange.
   // The answer to a dangerous-but-legitimate permission is informed consent,
-  // not prohibition — so these are requestable, and render at risk tier
-  // `"high"` with the consequences spelled out (see SCOPE_EXPLANATIONS).
+  // not prohibition — so these are requestable, and render at
+  // their defined risk tiers with the consequences spelled out (see
+  // SCOPE_EXPLANATIONS).
 ]);
 
 /**
@@ -297,8 +315,8 @@ export const NON_REQUESTABLE_SCOPES: ReadonlySet<string> = new Set([
  * enumerate them. It is still used by `isVaultAdminScope` (the mint-token
  * de-escalation recognizer) and `explainScope` / `VAULT_VERB_RE` (so the
  * consent screen renders the admin badge and `scopeIsAdmin` recognizes the
- * named admin form — load-bearing: the same-hub and trust-by-name auto-mint
- * gates rely on `scopeIsAdmin` to keep admin consent-gated).
+ * named admin form). The trusted-client consent shortcuts use the risk-based
+ * `forcesExplicitConsent` helper below instead of this verb classifier.
  */
 const VAULT_ADMIN_RE = /^vault:[a-zA-Z0-9_-]+:admin$/;
 
@@ -423,12 +441,11 @@ export function isRequestableScope(scope: string): boolean {
  * is now requestable via OAuth, so it reaches the consent screen and MUST get
  * the `vault:admin` explanation (level `"admin"`) — both so the consent UI
  * renders the admin badge and so `scopeIsAdmin("vault:<name>:admin")` returns
- * true. That second effect is LOAD-BEARING: the same-hub auto-trust gate
- * (`!hasAdminScope`) and the trust-by-client_name gate
- * (`!requestedScopes.some(scopeIsAdmin)`) rely on `scopeIsAdmin` recognizing
- * the named admin form to keep admin grants consent-gated (never silently
- * auto-minted). If this regex dropped `admin`, those gates would treat a
- * named admin scope as non-admin and auto-mint it.
+ * true. The consent shortcuts use the risk-based `forcesExplicitConsent`
+ * helper, which resolves this same explanation and keeps the elevated admin
+ * form consent-gated (never silently auto-minted). If this regex dropped
+ * `admin`, the consent screen would lose its admin explanation and the
+ * risk-based guard would no longer have the intended classification.
  */
 const VAULT_VERB_RE = /^vault:[a-zA-Z0-9_*-]+:(read|write|admin)$/;
 
@@ -459,6 +476,17 @@ export function explainScope(scope: string): ScopeExplanation | null {
 }
 
 /**
+ * Whether a trusted-client consent shortcut must show the consent screen for
+ * this scope. The shortcut is safe only for scopes whose blast-radius risk is
+ * explicitly or implicitly `low`; unknown scopes fail closed until they have
+ * a known explanation and risk tier.
+ */
+export function forcesExplicitConsent(scope: string): boolean {
+  const explanation = explainScope(scope);
+  return explanation === null || riskForExplanation(explanation) !== "low";
+}
+
+/**
  * Module-declared scopes (e.g. `runner:admin`) don't participate in
  * `scopeIsAdmin` because `SCOPE_EXPLANATIONS` only covers core scopes —
  * `explainScope` returns null for them, so `scopeIsAdmin` returns false.
@@ -468,6 +496,14 @@ export function explainScope(scope: string): ScopeExplanation | null {
  * function needs to consult the live module-scope registry too — otherwise
  * a `runner:admin` (or similar) grant would silently bypass the admin-
  * scope guardrails. See the regression test pinning this gap.
+ *
+ * NO PRODUCTION CALLERS as of the account-write-scope change. Its three former
+ * consumers were the trusted-client consent gates in `oauth-handlers.ts`, which
+ * now use the risk-based `forcesExplicitConsent` instead — a verb test could
+ * not see that `account:self:write` is elevated. Kept exported because it is
+ * the canonical "is this scope an admin scope" predicate and is pinned by
+ * tests; do NOT reintroduce it as a consent gate. If you need "must this scope
+ * be consented to explicitly", the answer is `forcesExplicitConsent`.
  */
 export function scopeIsAdmin(scope: string): boolean {
   return explainScope(scope)?.level === "admin";

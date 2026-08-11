@@ -18,11 +18,17 @@ import {
   handleAccountRoot,
   handleAccountSetVaultCaps,
 } from "../account-api.ts";
+import { ACCOUNT_VAULT_TOKEN_TTL_SECONDS } from "../account-home-ui.ts";
 import { handleCreateInvite } from "../api-invites.ts";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
 import { getSetting } from "../hub-settings.ts";
 import { findInviteByRawToken, recordInviteRedemption, revokeInvite } from "../invites.ts";
-import { signAccessToken, validateAccessToken } from "../jwt-sign.ts";
+import {
+  ACCESS_TOKEN_TTL_SECONDS,
+  findTokenRowByJti,
+  signAccessToken,
+  validateAccessToken,
+} from "../jwt-sign.ts";
 import { upsertService } from "../services-manifest.ts";
 import { rotateSigningKey } from "../signing-keys.ts";
 import { createUser } from "../users.ts";
@@ -31,6 +37,7 @@ import { getVaultCap } from "../vault-caps.ts";
 const ISSUER = "http://127.0.0.1:1939";
 const HOST_ADMIN_SCOPE = "parachute:host:admin";
 const ACCOUNT_ADMIN_SCOPE = "account:self:admin";
+const ACCOUNT_WRITE_SCOPE = "account:self:write";
 const ACCOUNT_READ_SCOPE = "account:self:read";
 
 type RunResult = { exitCode: number; stdout: string; stderr: string };
@@ -442,10 +449,10 @@ describe("account API — auth gates", () => {
     }
   });
 
-  // Mutations advertise the admin scope, not the read one — a client that got
-  // `account:self:read` from the list route and then tried to create a vault
-  // must be told to step UP, not handed the scope it already has.
-  test("a mutation 403 challenges for account:self:admin, not account:self:read", async () => {
+  // Create/configure mutations advertise the write scope, not the read one —
+  // a client that got `account:self:read` from the list route and then tried
+  // to create a vault must be told to step UP, not handed the scope it has.
+  test("a write mutation 403 challenges for account:self:write, not account:self:read", async () => {
     const h = makeHarness();
     try {
       const token = await bearer(h, [ACCOUNT_READ_SCOPE]);
@@ -463,7 +470,7 @@ describe("account API — auth gates", () => {
       expect(res.status).toBe(403);
       const challenge = res.headers.get("www-authenticate") ?? "";
       const scopeParam = /(?:^|[\s,])scope="([^"]*)"/.exec(challenge)?.[1];
-      expect(scopeParam).toBe(ACCOUNT_ADMIN_SCOPE);
+      expect(scopeParam).toBe(ACCOUNT_WRITE_SCOPE);
     } finally {
       h.cleanup();
     }
@@ -491,7 +498,7 @@ describe("account API — auth gates", () => {
     }
   });
 
-  test("account:self:read is accepted on reads but rejected (403) on mutations", async () => {
+  test("account:self:read is accepted on reads but rejected (403) on all mutations", async () => {
     const h = makeHarness();
     try {
       const token = await bearer(h, [ACCOUNT_READ_SCOPE]);
@@ -502,6 +509,63 @@ describe("account API — auth gates", () => {
         deps(h),
       );
       expect(write.status).toBe(403);
+      const setCaps = await handleAccountSetVaultCaps(
+        jsonReq("/account/vaults/beta/caps", token, "PUT", { cap_bytes: 1024 }),
+        "beta",
+        deps(h),
+      );
+      expect(setCaps.status).toBe(403);
+      const mint = await handleAccountMintVaultToken(
+        withBearer("/account/vaults/beta/token", token, { method: "POST" }),
+        "beta",
+        deps(h),
+      );
+      expect(mint.status).toBe(403);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  // The ladder is a LATTICE: `account:self:write` satisfies a READ check, per
+  // door-contract's `hasAccountScope` and docs/contracts/oauth-scopes.md. But
+  // `requireAnyScope` tests exact membership rather than expanding inheritance,
+  // so that only holds if the write scope is spelled into READ_SCOPES. It was
+  // not, and the first call a write-tier app makes — the `GET /account`
+  // bootstrap — 403'd. The door-contract parity test cannot catch this: it
+  // exercises the shared checker, never the hub's scope lists.
+  test("account:self:write satisfies every /account read route (write ⊇ read is enforced, not just published)", async () => {
+    const h = makeHarness(["beta"]);
+    try {
+      const token = await bearer(h, [ACCOUNT_WRITE_SCOPE]);
+
+      const bootstrap = await handleAccountRoot(withBearer("/account", token), deps(h));
+      expect(bootstrap.status).toBe(200);
+
+      const list = await handleAccountListVaults(withBearer("/account/vaults", token), deps(h));
+      expect(list.status).toBe(200);
+
+      const caps = await handleAccountGetVaultCaps(
+        withBearer("/account/vaults/beta/caps", token),
+        "beta",
+        deps(h),
+      );
+      expect(caps.status).toBe(200);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  // Read stays genuinely below write: inheritance runs one way only.
+  test("account:self:read still cannot reach a write route (the lattice widened, not collapsed)", async () => {
+    const h = makeHarness(["beta"]);
+    try {
+      const token = await bearer(h, [ACCOUNT_READ_SCOPE]);
+      const setCaps = await handleAccountSetVaultCaps(
+        jsonReq("/account/vaults/beta/caps", token, "PUT", { cap_bytes: 2048 }),
+        "beta",
+        deps(h),
+      );
+      expect(setCaps.status).toBe(403);
     } finally {
       h.cleanup();
     }
@@ -542,6 +606,217 @@ describe("handleAccountListVaults", () => {
 // POST /account/vaults — create (returns a ready-to-use vault token)
 // ===========================================================================
 describe("handleAccountCreateVault", () => {
+  test("account:self:write can create a vault", async () => {
+    const h = makeHarness(["default"]);
+    try {
+      const token = await bearer(h, [ACCOUNT_WRITE_SCOPE]);
+      const runCommand = async (_cmd: readonly string[]): Promise<RunResult> => {
+        upsertService(
+          {
+            name: "parachute-vault",
+            port: 4101,
+            paths: ["/vault/default", "/vault/work"],
+            health: "/health",
+            version: "0.4.2",
+          },
+          h.manifestPath,
+        );
+        return { exitCode: 0, stdout: vaultCreateJson("work", "hubjwt.work.access"), stderr: "" };
+      };
+      const res = await handleAccountCreateVault(
+        jsonReq("/account/vaults", token, "POST", { name: "work" }),
+        deps(h, { runCommand }),
+      );
+      expect(res.status).toBe(201);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  // REGRESSION (security review, finding 2 — "credential outliving access").
+  // On the unfixed code `POST /account/vaults` forwarded `createJson.token` —
+  // the CLI's `vault:<name>:admin` bootstrap credential — verbatim, to a caller
+  // holding ONLY `account:self:write`, whose consent label says the app
+  // "cannot ... mint access tokens that outlive this app's access". This test
+  // pins all four properties the returned credential must now have:
+  //   1. it is NOT the CLI bootstrap token,
+  //   2. its scope is the granted tier (read+write), never `admin`,
+  //   3. its lifetime is one access-token lifetime, not the 90-day
+  //      `ACCOUNT_VAULT_TOKEN_TTL_SECONDS` the admin-only mint route uses, and
+  //   4. it has a token-registry row attributed to the REQUESTING client_id,
+  //      so it is revocable (the CLI bootstrap token has no registry row).
+  test("account:self:write create returns a bounded vault read/write token, not the CLI admin token", async () => {
+    const h = makeHarness(["default"]);
+    try {
+      const token = await bearer(h, [ACCOUNT_WRITE_SCOPE]);
+      const runCommand = async (_cmd: readonly string[]): Promise<RunResult> => {
+        upsertService(
+          {
+            name: "parachute-vault",
+            port: 4101,
+            paths: ["/vault/default", "/vault/work"],
+            health: "/health",
+            version: "0.4.2",
+          },
+          h.manifestPath,
+        );
+        return {
+          exitCode: 0,
+          stdout: vaultCreateJson("work", "hubjwt.work.admin-long-lived"),
+          stderr: "",
+        };
+      };
+      const res = await handleAccountCreateVault(
+        jsonReq("/account/vaults", token, "POST", { name: "work" }),
+        deps(h, { runCommand }),
+      );
+      expect(res.status).toBe(201);
+      const body = (await res.json()) as { vault_token: string };
+      expect(body.vault_token).not.toBe("hubjwt.work.admin-long-lived");
+
+      const validated = await validateAccessToken(h.db, body.vault_token, ISSUER);
+      expect(validated.payload.scope).toBe("vault:work:read vault:work:write");
+      expect(validated.payload.aud).toBe("vault.work");
+      expect(validated.payload.client_id).toBe("parachute-hub-spa");
+      // Bounded to ONE access-token lifetime (cloud's account-door value), not
+      // the 90-day admin-route TTL — the "outlives the app's access" half.
+      const lifetime = (validated.payload.exp ?? 0) - (validated.payload.iat ?? 0);
+      expect(lifetime).toBe(ACCESS_TOKEN_TTL_SECONDS);
+      expect(lifetime).toBeLessThan(ACCOUNT_VAULT_TOKEN_TTL_SECONDS);
+      const row = findTokenRowByJti(h.db, validated.payload.jti ?? "");
+      expect(row?.createdVia).toBe("cli_mint");
+      expect(row?.clientId).toBe("parachute-hub-spa");
+      expect(row?.scopes).toEqual(["vault:work:read", "vault:work:write"]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  // `provisionVault` has already COMMITTED by the time the handoff is minted,
+  // and the two are not atomic. A generic 500 here reads to the caller as
+  // "create failed" — it retries, gets 409 `vault_taken` for a vault it does
+  // own, and at write tier has no route to a credential for it. Dead end. The
+  // error must name the vault and say it exists.
+  test("write-tier create whose token mint fails returns a distinguishable error naming the vault (not a bare 500)", async () => {
+    const h = makeHarness(["default"]);
+    try {
+      const token = await bearer(h, [ACCOUNT_WRITE_SCOPE]);
+      // Fault injection at the registry write, which is the second half of the
+      // handoff and the half that can realistically fail (constraint/IO). The
+      // caller's own bearer is signed but never registry-recorded, so this
+      // trigger cannot fire on it — only on the handoff mint.
+      h.db.run(
+        `CREATE TRIGGER fail_token_insert BEFORE INSERT ON tokens
+         BEGIN SELECT RAISE(ABORT, 'simulated registry failure'); END`,
+      );
+      const runCommand = async (_cmd: readonly string[]): Promise<RunResult> => {
+        upsertService(
+          {
+            name: "parachute-vault",
+            port: 4101,
+            paths: ["/vault/default", "/vault/work"],
+            health: "/health",
+            version: "0.4.2",
+          },
+          h.manifestPath,
+        );
+        return { exitCode: 0, stdout: vaultCreateJson("work", "hubjwt.work.admin"), stderr: "" };
+      };
+      const res = await handleAccountCreateVault(
+        jsonReq("/account/vaults", token, "POST", { name: "work" }),
+        deps(h, { runCommand }),
+      );
+      expect(res.status).toBe(500);
+      const body = (await res.json()) as { error: string; vault: string; message: string };
+      expect(body.error).toBe("vault_created_token_mint_failed");
+      expect(body.vault).toBe("work");
+      // The operator/caller must be able to tell the vault EXISTS from the body
+      // alone — that is the whole point of not returning a bare 500.
+      expect(body.message).toContain("WAS created");
+      // And it must NOT leak the CLI bootstrap admin token as a consolation.
+      expect(JSON.stringify(body)).not.toContain("hubjwt.work.admin");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  // The empty-token path (no reachable hub origin for the CLI to mint against)
+  // used to return a 201 shaped exactly like a working handoff: empty
+  // credential, plus the CLI's `token_guidance` pointing at
+  // `POST /account/vaults/<name>/token` — a route that 403s for this very tier.
+  test("write-tier create with an empty CLI token does not forward admin-route guidance", async () => {
+    const h = makeHarness(["default"]);
+    try {
+      const token = await bearer(h, [ACCOUNT_WRITE_SCOPE]);
+      const runCommand = async (_cmd: readonly string[]): Promise<RunResult> => {
+        upsertService(
+          {
+            name: "parachute-vault",
+            port: 4101,
+            paths: ["/vault/default", "/vault/work"],
+            health: "/health",
+            version: "0.4.2",
+          },
+          h.manifestPath,
+        );
+        return {
+          exitCode: 0,
+          stdout: vaultCreateJson("work", "", "Mint a token with POST /account/vaults/work/token."),
+          stderr: "",
+        };
+      };
+      const res = await handleAccountCreateVault(
+        jsonReq("/account/vaults", token, "POST", { name: "work" }),
+        deps(h, { runCommand }),
+      );
+      expect(res.status).toBe(201);
+      const body = (await res.json()) as { vault_token: string; token_guidance?: string };
+      expect(body.vault_token).toBe("");
+      // The admin-only route must not be recommended to a write-tier caller.
+      expect(body.token_guidance ?? "").not.toContain("/account/vaults/work/token");
+      expect(body.token_guidance ?? "").toContain("operator");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  // Admin tier is unchanged: it still gets the CLI's own guidance verbatim,
+  // because for admin the route that guidance points at actually works.
+  test("admin-tier create still forwards the CLI token_guidance verbatim", async () => {
+    const h = makeHarness(["default"]);
+    try {
+      const token = await bearer(h, [ACCOUNT_ADMIN_SCOPE]);
+      const guidance = "Mint a token with POST /account/vaults/work/token.";
+      const runCommand = async (_cmd: readonly string[]): Promise<RunResult> => {
+        upsertService(
+          {
+            name: "parachute-vault",
+            port: 4101,
+            paths: ["/vault/default", "/vault/work"],
+            health: "/health",
+            version: "0.4.2",
+          },
+          h.manifestPath,
+        );
+        return {
+          exitCode: 0,
+          stdout: vaultCreateJson("work", "hubjwt.work.admin", guidance),
+          stderr: "",
+        };
+      };
+      const res = await handleAccountCreateVault(
+        jsonReq("/account/vaults", token, "POST", { name: "work" }),
+        deps(h, { runCommand }),
+      );
+      expect(res.status).toBe(201);
+      const body = (await res.json()) as { vault_token: string; token_guidance?: string };
+      expect(body.vault_token).toBe("hubjwt.work.admin");
+      expect(body.token_guidance).toBe(guidance);
+    } finally {
+      h.cleanup();
+    }
+  });
+
   test("201 returns the vault token + services block on a fresh create", async () => {
     const h = makeHarness(["default"]);
     try {
@@ -654,6 +929,24 @@ describe("handleAccountCreateVault", () => {
 // POST /account/vaults/<name>/token — per-vault token mint
 // ===========================================================================
 describe("handleAccountMintVaultToken", () => {
+  test("account:self:write is rejected and the challenge remains account:self:admin", async () => {
+    const h = makeHarness(["field-notes"]);
+    try {
+      const token = await bearer(h, [ACCOUNT_WRITE_SCOPE]);
+      const res = await handleAccountMintVaultToken(
+        withBearer("/account/vaults/field-notes/token", token, { method: "POST" }),
+        "field-notes",
+        deps(h),
+      );
+      expect(res.status).toBe(403);
+      const challenge = res.headers.get("www-authenticate") ?? "";
+      const scopeParam = /(?:^|[\s,])scope="([^"]*)"/.exec(challenge)?.[1];
+      expect(scopeParam).toBe(ACCOUNT_ADMIN_SCOPE);
+    } finally {
+      h.cleanup();
+    }
+  });
+
   test("mints a vault token with aud=vault.<name> and default read+write scope", async () => {
     const h = makeHarness(["field-notes"]);
     try {
@@ -749,6 +1042,57 @@ describe("handleAccountMintVaultToken", () => {
 // GET / PUT /account/vaults/<name>/caps
 // ===========================================================================
 describe("account caps", () => {
+  test("account:self:write can set a vault's caps", async () => {
+    const h = makeHarness(["field-notes"]);
+    try {
+      const token = await bearer(h, [ACCOUNT_WRITE_SCOPE]);
+      const res = await handleAccountSetVaultCaps(
+        jsonReq("/account/vaults/field-notes/caps", token, "PUT", { cap_bytes: 1048576 }),
+        "field-notes",
+        deps(h),
+      );
+      expect(res.status).toBe(200);
+      expect(getVaultCap(h.db, "field-notes")?.capBytes).toBe(1048576);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  // Nothing scopes this route to vaults the caller created, so a third-party
+  // client holding `account:self:write` for its own vault can retune the quota
+  // of ANY vault on the box. Whether that should be narrowed is an open Phase 2
+  // design question; until it is answered the change must at least leave a
+  // trace naming who made it. The admin route (`api-vault-caps.ts`) always
+  // logged; this one did not.
+  test("a write-tier caps change is audit-logged with the caller's subject and client_id", async () => {
+    const h = makeHarness(["someone-elses-vault"]);
+    const logs: string[] = [];
+    const originalLog = console.log;
+    try {
+      const token = await bearer(h, [ACCOUNT_WRITE_SCOPE]);
+      console.log = (...args: unknown[]) => {
+        logs.push(args.map(String).join(" "));
+      };
+      const res = await handleAccountSetVaultCaps(
+        jsonReq("/account/vaults/someone-elses-vault/caps", token, "PUT", { cap_bytes: 4096 }),
+        "someone-elses-vault",
+        deps(h),
+      );
+      console.log = originalLog;
+      expect(res.status).toBe(200);
+      const line = logs.find((l) => l.includes("vault cap set:"));
+      expect(line).toBeDefined();
+      expect(line).toContain("vault=someone-elses-vault");
+      expect(line).toContain("cap_bytes=4096");
+      // WHO — without these the trace can't answer the question it exists for.
+      expect(line).toContain("subject=operator-user");
+      expect(line).toContain("client_id=parachute-hub-spa");
+    } finally {
+      console.log = originalLog;
+      h.cleanup();
+    }
+  });
+
   test("GET reports null cap for an uncapped vault; PUT sets it; GET reflects", async () => {
     const h = makeHarness(["field-notes"]);
     try {

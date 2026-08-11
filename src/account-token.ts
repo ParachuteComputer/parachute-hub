@@ -9,7 +9,8 @@
  * door mints from its own session cookie.
  *
  * Why a SUPERSET (SCOPE-b). The account bearer must drive both the net-new
- * `/account/*` REST surface (H2, gated on `account:self:admin`) AND — on a
+ * `/account/*` REST surface (H2, where create/configure uses
+ * `account:self:write` and delete/mint remain `:admin`) AND — on a
  * single-operator self-host box — the EXISTING hub admin endpoints it wraps
  * (`POST /vaults`, `/api/auth/*`, caps), all gated on `parachute:host:admin` /
  * `parachute:host:auth` via `requireScope`. Carrying all three scopes means no
