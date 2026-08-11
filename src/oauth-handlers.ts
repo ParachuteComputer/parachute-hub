@@ -1344,15 +1344,34 @@ export function handleAuthorizeGet(db: Database, req: Request, deps: OAuthDeps):
   // The same-hub auto-trust gate (#312) and the trust-by-client_name carry-over
   // (#409, in `pendingClientResponse` and the early block above) are hub-only
   // self-host / single-operator shortcuts: they exist because the operator who
-  // installed the app IS the account. Cloud is multi-tenant and has NEITHER —
-  // no `same_hub` DCR marker, no client-name trust path — so every cloud
-  // authorize reaches an explicit consent render.
+  // installed the app IS the account. Cloud is multi-tenant and has neither
+  // SHORTCUT, so every cloud authorize reaches an explicit consent render.
+  //
+  // Be precise about which half is missing, because it decides who inherits
+  // this bug:
+  //
+  //   - Client-name trust: absent from cloud outright. Cloud's `grants.ts`
+  //     keys every lookup on (user_id, client_id) — `findGrant`,
+  //     `isCoveredByGrant`, `revokeGrant` all take a `clientId` and there is
+  //     no name-based path to carry a grant onto a different client_id.
+  //   - Same-hub: cloud DOES have the `same_hub` MARKER. It is a column
+  //     (`migrations/0001_init.sql`), it is set at DCR when a same-origin
+  //     request carries a valid operator session (`oauth-register.ts` →
+  //     `status = "approved"`, `sameHub = true`), it is persisted and read
+  //     back by `clients.ts`, and it is echoed in the DCR 201 body. What
+  //     cloud lacks is the CONSUMER: `oauth-authorize.ts` never consults it,
+  //     so the marker is inert there today.
   //
   // Consequence for `forcesExplicitConsent`: it has no cloud counterpart to
   // keep in step. It is a hub-side compensating control for hub-only
   // shortcuts, not half of a two-door contract, so a change here does NOT
-  // imply a matching cloud change. Adding a `same_hub`-style shortcut to cloud
-  // later would need its own copy of this risk gate.
+  // imply a matching cloud change.
+  //
+  // But the same-hub asymmetry is dormant, not structural: the marker cloud
+  // would need is already populated on live rows. If cloud ever wires
+  // `same_hub` to a consent shortcut, it inherits THIS defect on day one
+  // rather than having to build its way into it, and it must port this risk
+  // gate in the same change — not the `scopeIsAdmin` verb test this replaced.
   //
   // Same-hub auto-trust gate (hub#312, parachute-app design §6). When the
   // DCR registrant authenticated as the operator (bearer hub:admin OR
