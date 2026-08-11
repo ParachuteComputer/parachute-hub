@@ -22,11 +22,22 @@ change for consumers that inspect `ACCOUNT_ROUTES` literally — a check for
 `scope === "admin"` on either route now sees `"write"` and must be updated.
 
 **Door drift this bump opens.** The self-host hub implements the new rung
-(`WRITE_SCOPES` in `src/account-api.ts`). The cloud door does NOT yet: its
-`handleAccountVaultCreate` / caps handlers still call
-`requireAccount(..., "admin")` (`workers/identity/src/account-api.ts`), so on
-cloud an `account:<id>:write` bearer is refused on both routes even though
-`ACCOUNT_ROUTES` now advertises `write`. Cloud is the side that must catch up;
+(`WRITE_SCOPES` in `src/account-api.ts`). The cloud door does NOT yet, but the
+drift is only on ONE of the two re-tiered routes:
+
+- `POST /account/vaults` — real drift. Cloud's `handleAccountVaultCreate` still
+  calls `requireAccount(db, req, deps, "admin")`
+  (`workers/identity/src/account-api.ts`), so an `account:<id>:write` bearer is
+  refused there even though `ACCOUNT_ROUTES` now advertises `write`. Cloud is
+  the side that must catch up.
+- `PUT /account/vaults/<name>/caps` — NOT drift. Cloud has no caps handler to
+  re-tier: its identity worker mounts exactly four `/account/vaults*` routes
+  (list, create, `<name>/token`, delete), and both caps routes are already
+  marked `optional: true` / hub-only in `account-contract.ts` because cloud's
+  caps are plan-derived. A write bearer there gets 404 from a door cloud never
+  mounted, not 403 from a stricter gate. Re-tiering this route is a hub-local
+  change with no cloud counterpart.
+
 `hasAccountScope` itself needs no cloud change because cloud imports it from
 this package.
 

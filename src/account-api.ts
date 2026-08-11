@@ -517,9 +517,25 @@ export async function handleAccountCreateVault(
   // existing name — it converges on cloud's exact 409 `vault_taken` shape.
   // `provisionVault` itself is UNCHANGED (still idempotent for its other
   // caller, the invite-redeem flow, which doesn't route through this
-  // facade) — only this facade's wire answer changes. A scripted consumer
-  // that relied on 200-on-existing must follow up with
-  // `POST /account/vaults/<name>/token` to get a usable token.
+  // facade) — only this facade's wire answer changes.
+  //
+  // What a consumer that relied on 200-on-existing can do here depends on its
+  // tier, and the two answers differ:
+  //
+  //   - admin tier: follow up with `POST /account/vaults/<name>/token` to mint
+  //     a credential for the existing vault.
+  //   - write tier: that route is NOT available. It gates on ADMIN_SCOPES
+  //     (`handleAccountMintVaultToken`), so an `account:self:write` bearer —
+  //     the tier this route now accepts — gets 403 there. The only path
+  //     forward at write tier is to retry create with a name that is free.
+  //
+  // This asymmetry is deliberate, not an oversight. Minting a fresh credential
+  // for an ALREADY-EXISTING vault is the "mint access tokens that outlive this
+  // app's access" authority the write-tier consent label explicitly disclaims;
+  // it is also unbounded renewal, which would defeat the 15-minute
+  // WRITE_TIER_VAULT_HANDOFF_TTL_SECONDS bound the create path below is careful
+  // to impose. A write-tier app gets one bounded handoff at the moment IT
+  // creates a vault, and no way to re-arm. Renewal is an admin decision.
   if (!provisioned.created) {
     return json(409, {
       error: "vault_taken",

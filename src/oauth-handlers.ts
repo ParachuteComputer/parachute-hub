@@ -1344,8 +1344,18 @@ export function handleAuthorizeGet(db: Database, req: Request, deps: OAuthDeps):
   // The same-hub auto-trust gate (#312) and the trust-by-client_name carry-over
   // (#409, in `pendingClientResponse` and the early block above) are hub-only
   // self-host / single-operator shortcuts: they exist because the operator who
-  // installed the app IS the account. Cloud is multi-tenant and has neither
-  // SHORTCUT, so every cloud authorize reaches an explicit consent render.
+  // installed the app IS the account. Cloud has neither TRUSTED-CLIENT
+  // shortcut.
+  //
+  // That is narrower than "cloud always shows a consent screen", and the
+  // difference matters. Cloud keeps the ordinary prior-grant skip-consent gate
+  // (`oauth-authorize.ts:293` — `isCoveredByGrant` covers the request, so it
+  // mints through `issueAuthCodeRedirect`), exactly as the hub does a few lines
+  // above this comment. What cloud lacks is any way to skip consent for a
+  // client the user has NEVER granted to. The hub-only shortcuts are dangerous
+  // precisely because they are first-contact trust; the prior-grant skip is
+  // shared, and rests on a consent screen the user already saw for those
+  // scopes.
   //
   // Be precise about which half is missing, because it decides who inherits
   // this bug:
