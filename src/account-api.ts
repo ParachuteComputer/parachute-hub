@@ -129,9 +129,21 @@ const WRITE_SCOPES: readonly string[] = [
 ];
 /** Scopes that satisfy a `/account/*` READ. `admin ⊇ write ⊇ read`, spelled explicitly
  * because the hub's `requireScope` does an exact-string membership check (no
- * inheritance expansion at validate time). Narrowest-first, per ADMIN_SCOPES. */
+ * inheritance expansion at validate time). Narrowest-first, per ADMIN_SCOPES.
+ *
+ * `ACCOUNT_SELF_WRITE_SCOPE` is listed because the ladder is a LATTICE, not
+ * three disjoint sets: door-contract's `hasAccountScope(["account:self:write"],
+ * "self", "read")` is `true`, and `docs/contracts/oauth-scopes.md` publishes
+ * that inheritance. Omitting it here contradicted both — and because
+ * `requireAnyScope` tests exact membership rather than expanding inheritance,
+ * the contradiction was live: a write-tier app 403'd on `GET /account`, the
+ * bootstrap call that is the FIRST request in the account-door flow. The
+ * door-contract parity test did not catch it because it exercises the shared
+ * checker (`hasAccountScope`) and never these constants. Any future rung must
+ * be added to every set it is a superset of. */
 const READ_SCOPES: readonly string[] = [
   ACCOUNT_SELF_READ_SCOPE,
+  ACCOUNT_SELF_WRITE_SCOPE,
   ACCOUNT_SELF_ADMIN_SCOPE,
   HOST_ADMIN_SCOPE,
 ];
@@ -233,8 +245,6 @@ export async function requireAnyScope(
 
 /** Scope set for admin-only `/account/*` mutations (delete / mint). */
 export const ACCOUNT_MUTATION_SCOPES = ADMIN_SCOPES;
-/** Scope set for write-tier `/account/*` mutations (create / set-caps). */
-export const ACCOUNT_WRITE_SCOPES = WRITE_SCOPES;
 /** Scope set for a `/account/*` read (list / get-caps / bootstrap). */
 export const ACCOUNT_READ_SCOPES = READ_SCOPES;
 
@@ -553,29 +563,66 @@ export async function handleAccountCreateVault(
     // account bearers may omit it; retain the existing account-surface id only
     // for that fallback while preserving the caller's id whenever present.
     const clientId = auth.clientId ?? ACCOUNT_API_CLIENT_ID;
-    const minted = await signAccessToken(deps.db, {
-      sub: auth.sub,
-      scopes,
-      audience: inferAudience(scopes),
-      clientId,
-      issuer: deps.issuer,
-      ttlSeconds: WRITE_TIER_VAULT_HANDOFF_TTL_SECONDS,
-      vaultScope: [entry.name],
-      ...(deps.now !== undefined ? { now: deps.now } : {}),
-    });
-    const subjectIsUser = getUserById(deps.db, auth.sub) !== null;
-    recordTokenMint(deps.db, {
-      jti: minted.jti,
-      createdVia: "cli_mint",
-      subject: auth.sub,
-      ...(subjectIsUser ? { userId: auth.sub } : {}),
-      clientId,
-      scopes,
-      expiresAt: minted.expiresAt,
-      ...(deps.now !== undefined ? { now: deps.now } : {}),
-    });
-    vaultToken = minted.token;
+    // NOT ATOMIC WITH THE PROVISION ABOVE, deliberately surfaced rather than
+    // hidden. `provisionVault` has already committed — the vault exists on disk
+    // and in the services manifest — and there is no rollback seam to undo it
+    // (deleting a just-created vault on a mint failure would be a second
+    // destructive action taken on a guess). So a throw here MUST NOT surface as
+    // a generic 500: the caller would read it as "create failed", retry, and
+    // get a 409 `vault_taken` for a vault it does own but has no credential
+    // for — and at write tier `POST /account/vaults/<name>/token` is
+    // admin-gated, so there is no way to recover a credential. That is a dead
+    // end. The distinguishable error below tells caller and operator exactly
+    // what state the box is in: the vault EXISTS, only the handoff failed.
+    try {
+      const minted = await signAccessToken(deps.db, {
+        sub: auth.sub,
+        scopes,
+        audience: inferAudience(scopes),
+        clientId,
+        issuer: deps.issuer,
+        ttlSeconds: WRITE_TIER_VAULT_HANDOFF_TTL_SECONDS,
+        vaultScope: [entry.name],
+        ...(deps.now !== undefined ? { now: deps.now } : {}),
+      });
+      const subjectIsUser = getUserById(deps.db, auth.sub) !== null;
+      recordTokenMint(deps.db, {
+        jti: minted.jti,
+        createdVia: "cli_mint",
+        subject: auth.sub,
+        ...(subjectIsUser ? { userId: auth.sub } : {}),
+        clientId,
+        scopes,
+        expiresAt: minted.expiresAt,
+        ...(deps.now !== undefined ? { now: deps.now } : {}),
+      });
+      vaultToken = minted.token;
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      console.error(
+        `[account-api] vault "${entry.name}" was created but the write-tier token handoff failed: ${detail}`,
+      );
+      return json(500, {
+        error: "vault_created_token_mint_failed",
+        vault: entry.name,
+        message: `The vault "${entry.name}" WAS created, but minting its access token failed. The vault exists — do not retry create (it will report the name as taken). An operator must mint a token for it with \`POST /account/vaults/${entry.name}/token\` (requires ${ACCOUNT_SELF_ADMIN_SCOPE}) or delete the vault.`,
+      });
+    }
   }
+  // `token_guidance` is the CLI's prose for the bootstrap token it returns, and
+  // it points at the admin-gated per-vault mint route. Forwarding it verbatim to
+  // a write-tier caller hands out advice that 403s for that caller (see the
+  // 409 branch above for why that route stays admin-only). Forward it only to
+  // the tier it is true for; write tier gets guidance matching what it actually
+  // holds. This matters most on the empty-token path (no reachable hub origin
+  // for the CLI to mint against), where the response would otherwise be a 201
+  // shaped exactly like a working handoff — empty credential, plus instructions
+  // the caller cannot follow.
+  const tokenGuidance = authorizedWithAdminScope
+    ? provisioned.createJson?.token_guidance
+    : vaultToken.length > 0
+      ? `This token grants read+write access to this vault only, and expires in ${Math.round(WRITE_TIER_VAULT_HANDOFF_TTL_SECONDS / 60)} minutes. It is the one credential this vault hands you at creation — it cannot be renewed at this tier.`
+      : "No access token could be issued for this vault. The vault WAS created, but your grant does not permit minting a credential for it after the fact. Ask an operator to mint one for you.";
   const body: {
     name: string;
     url: string;
@@ -586,9 +633,7 @@ export async function handleAccountCreateVault(
     name: entry.name,
     url: entry.url,
     vault_token: vaultToken,
-    ...(provisioned.createJson?.token_guidance
-      ? { token_guidance: provisioned.createJson.token_guidance }
-      : {}),
+    ...(tokenGuidance ? { token_guidance: tokenGuidance } : {}),
     services: servicesBlock(meta),
   };
   return json(201, body);
@@ -803,8 +848,9 @@ export async function handleAccountSetVaultCaps(
   deps: AccountApiDeps,
 ): Promise<Response> {
   if (req.method !== "PUT") return methodNotAllowed("PUT");
+  let auth: AdminAuthContext;
   try {
-    await requireAnyScope(deps.db, req, WRITE_SCOPES, deps.knownIssuers ?? [deps.issuer]);
+    auth = await requireAnyScope(deps.db, req, WRITE_SCOPES, deps.knownIssuers ?? [deps.issuer]);
   } catch (err) {
     return adminAuthErrorResponse(err);
   }
@@ -823,6 +869,17 @@ export async function handleAccountSetVaultCaps(
   if (!parsed.ok) return json(parsed.status, { error: parsed.error, message: parsed.message });
 
   const cap = setVaultCap(deps.db, vaultName, parsed.cap_bytes);
+  // Audit line, matching the operator route's (`api-vault-caps.ts`) but naming
+  // the CALLER too. This route is reachable at write tier by a third-party
+  // OAuth client, and nothing scopes it to vaults that client created — so a
+  // client granted `account:self:write` for its own vault can retune the quota
+  // of ANY vault on the box. Whether that should be restricted to app-created
+  // vaults is an open design question (Phase 2); until it is answered, the
+  // change must at minimum leave a trace naming who made it.
+  console.log(
+    `vault cap set: vault=${vaultName} cap_bytes=${cap.capBytes} ` +
+      `via=account-api subject=${auth.sub} client_id=${auth.clientId ?? "none"}`,
+  );
   return json(200, {
     name: vaultName,
     caps: { cap_bytes: cap.capBytes, created_at: cap.createdAt, updated_at: cap.updatedAt },

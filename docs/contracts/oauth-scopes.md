@@ -73,6 +73,16 @@ admin ⊇ write ⊇ read       (account:<id>, at the /account/* validator)
   currently imply `scribe:transcribe` — each non-inheritance-tree scope
   stands alone. This is deliberate: we add inheritance per-service
   when the verb set clearly lines up as read/write/admin.
+- **The `/account/*` validator does not expand inheritance at check time.**
+  `requireAnyScope` tests exact membership against a per-tier list, so the
+  `admin ⊇ write ⊇ read` ladder above is realised by *spelling every superset
+  scope into every list it satisfies* (`READ_SCOPES` / `WRITE_SCOPES` /
+  `ADMIN_SCOPES` in `src/account-api.ts`), not by calling `hasAccountScope`.
+  Adding a rung means editing every list it is a superset of — miss one and
+  the published lattice and the enforced one diverge silently, which is
+  exactly how `account:self:write` came to 403 on `GET /account`. Note that
+  the door-contract parity test cannot catch this class of bug: it exercises
+  the shared `hasAccountScope` checker, never these lists.
 
 Canonical implementations:
 - vault — [`parachute-vault/src/scopes.ts`](https://github.com/ParachuteComputer/parachute-vault/blob/main/src/scopes.ts)
