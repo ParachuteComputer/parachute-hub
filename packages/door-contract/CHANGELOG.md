@@ -1,5 +1,35 @@
 # @openparachute/door-contract
 
+## 0.7.0
+
+The account-door scope ladder gains an additive middle rung for
+create/configure authority: `admin ⊇ write ⊇ read`. Existing `read` and `admin`
+scope strings retain their meanings, and an existing admin token still satisfies
+the narrower write and read requirements.
+
+- In `scopes.ts`, adds `AccountVerb = "read" | "write" | "admin"`, the
+  corresponding `ACCOUNT_VERB_RANK` entries, and the re-exported
+  `ACCOUNT_SELF_WRITE_SCOPE` (`account:self:write`).
+- `hasAccountScope` now implements the three-rung inheritance: `admin` satisfies
+  `write` and `read`, while `write` satisfies `read`.
+- In `account-contract.ts`, changes `POST /account/vaults` and
+  `PUT /account/vaults/<name>/caps` from minimum scope `admin` to `write`.
+
+The grammar addition is backward-compatible for callers using scope semantics:
+old `read` and `admin` grants continue to work, and `write` is newly accepted
+for the two create/configure routes. It is a deliberate wire-metadata behavior
+change for consumers that inspect `ACCOUNT_ROUTES` literally — a check for
+`scope === "admin"` on either route now sees `"write"` and must be updated.
+
+**Door drift this bump opens.** The self-host hub implements the new rung
+(`WRITE_SCOPES` in `src/account-api.ts`). The cloud door does NOT yet: its
+`handleAccountVaultCreate` / caps handlers still call
+`requireAccount(..., "admin")` (`workers/identity/src/account-api.ts`), so on
+cloud an `account:<id>:write` bearer is refused on both routes even though
+`ACCOUNT_ROUTES` now advertises `write`. Cloud is the side that must catch up;
+`hasAccountScope` itself needs no cloud change because cloud imports it from
+this package.
+
 ## 0.6.1
 
 Fail-closed hardening of the composed account-scope grammar (unified `/mcp` —
