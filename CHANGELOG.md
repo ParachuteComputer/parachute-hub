@@ -6,6 +6,115 @@ All notable changes to `@openparachute/hub` are documented here. The format foll
 >
 > This backfill covers the 0.6.x line only. Two pre-existing gaps remain undocumented and are **not** addressed here: the `0.5.13` stable itself (the file's newest entry is `0.5.13-rc.48`, never the stable) and the entire `0.5.14-rc` chain (rc.1–rc.21 on npm), which never promoted to a `0.5.14` stable — its work folded forward into 0.6.0.
 
+## [0.7.14] - 2026-08-12
+
+**The account verb ladder grows a middle rung, and strict MCP clients can
+discover a vault.** Three PRs over 0.7.13.
+
+- **`account:self:write` exists (#826).** The account ladder was two rungs,
+  read and admin, so authorizing an agent to CREATE a vault also handed it
+  delete and token-mint authority over every vault on the box -- on self-host
+  the account IS the box. Creating a vault and setting its caps now sit on a
+  `write` rung of their own; delete-vault and token-minting stay admin-only.
+  The scope is consent-gated, carries its own risk tier on the consent screen,
+  and the vault-create handoff is de-escalated rather than passing the
+  caller's authority through. Old `read` / `admin` grants keep working
+  (`admin ⊇ write ⊇ read`), so this is additive for anyone already issued a
+  token -- but a consumer that literally checks `scope === "admin"` on
+  `POST /account/vaults` or `PUT /account/vaults/<name>/caps` now sees
+  `"write"`.
+
+- **The path-inserted PRM spelling is served (#825, closes hub#776).** The
+  vault daemon has answered the RFC 9728 path-insertion discovery shape
+  (`/.well-known/oauth-protected-resource/vault/<name>[/mcp]`) since its
+  routing restore, but the hub had no route for it, so a strictly conformant
+  MCP client -- Claude Code's SDK among them -- 404'd on discovery even when
+  the named vault existed and was reachable. #774 forwarded the vault-agnostic
+  root form and explicitly left this per-vault one out of scope. Now forwarded
+  pathname-for-pathname, byte-identical to the pre-existing suffix spelling for
+  the same vault, under the same loopback cloak and CORS shape as its siblings.
+
+- **PRs gate on typecheck + unit tests (#824, hub#735, hub#773).** Merge was
+  gated only on the container smoke build; `bun run typecheck` and
+  `bun test ./src` ran in `release.yml`'s `test` job, which fires on push to
+  main -- i.e. AFTER merge. A type or unit-test regression could sit on main
+  undetected until the next release run. `pr-verify.yml` now mirrors that job's
+  steps on `pull_request`.
+
+**Dependency.** Requires `@openparachute/door-contract` ^0.7.0 (published
+2026-08-12), which carries the account `write` rung through the shared wire
+contract. No schema migration.
+
+## [0.7.13] - 2026-08-10
+
+**Consent-screen cleanup, and the root `/mcp` door binds a resource.** Six PRs
+over 0.7.12. *(Backfilled 2026-08-12 -- the 0.7.13 release PR bumped the
+version without writing this entry, the third time this file has been left
+behind by a ship. Its own preamble documents the previous two.)*
+
+- **The consent screen stopped double-listing vault permissions (#821).** Four
+  independent causes, one visible symptom: an access-level selector that was
+  functionally retired but whose radios were never deleted from the UI,
+  duplicate scope strings surviving to render as duplicate rows, the admin verb
+  excluded from vault-display substitution so one grant showed in two
+  spellings, and the extras checklist comparing candidates in only one naming
+  shape -- offering as "additional access" what had already been requested. One
+  shared `canonicalConsentScope` now keys both the requested-row dedup and the
+  extras comparison. Display-side only: hidden form fields still carry the raw
+  wire scopes and grant behavior is untouched.
+
+- **The token endpoint honors RFC 8707 `resource` (#822).** It dropped the
+  parameter on the floor for both grant types, so a client of the root `/mcp`
+  door could not bind a minted token to the vault it named. `resource` now
+  validates against the named vault scopes the grant actually carries, with
+  mismatches rejected as `invalid_target` before any state changes on the
+  refresh path, and disambiguates audience when a grant carries more than one
+  named vault. Root PRM advertises only the scopes the root authorize branch
+  accepts, and a root request narrowed to empty returns `invalid_scope` rather
+  than a blank consent screen. No-resource requests are byte-for-byte
+  unchanged.
+
+- **Root `/mcp` got a resource branch of its own (#819).** `resolveResourceVault`
+  recognised only `/vault/<name>/…`, so the root door fell through to null and
+  the whole resource-binding path no-op'd -- leaving root the last place a
+  friend connecting an MCP client still saw the entire hub scope catalog
+  (`scribe:*`, `hub:admin`) on the consent screen. Root is a separate branch
+  rather than a new entry in the resolvable set, because there is no vault name
+  in `<origin>/mcp` to narrow TO.
+
+- **The `/account/*` 403 names the scope the caller must request (#817).**
+  `account:*` is deliberately absent from `scopes_supported`, and the whole
+  justification for that omission is that discovery happens at the point of
+  refusal through the RFC 6750 §3 `scope` challenge parameter. That parameter
+  was not being sent on any `/account/*` route: of the two throw sites,
+  `requireScope` passed it and `requireAnyScope` did not -- and
+  `requireAnyScope` guards every `/account/*` route, the exact surface account
+  scopes were invented for. The missing scope appeared only inside
+  `error_description`, prose for a human rather than a field a client parses.
+
+- **The backup tile follows whether pushes land, not whether they're
+  configured (#820).** A vault's mirror had rejected 122 consecutive pushes
+  since 2026-07-28 -- the remote was created against a repo with unrelated
+  history, so every push was refused as non-fast-forward. The vault logs each
+  failure `(non-fatal)` and carries on, which is correct; `/account/` rendered
+  "Backed up -- version history + GitHub" with a green check the whole time.
+  Five days, no off-site copy, nothing surfaced. `fetchVaultMirrorStatus` read
+  only `body.config`, while the vault returned `last_push_at`,
+  `last_push_error` and `commits_unpushed` in the same response and no hub file
+  read any of them. `auto_push: true` means a remote is *configured*; it says
+  nothing about whether anything ever landed there.
+
+- **`start <svc>` on a clean box no longer exits 1 in silence (#818).** On a box
+  with no supervised hub unit and no prior-detached install -- every container
+  and every fresh install -- `parachute start vault` exited 1 with zero bytes
+  on stdout AND stderr. The gate in `requireSupervisedOrOffer` keyed on
+  `!r.migrateOffer.enabled`, but `cli.ts` passes `enabled: true` for start, stop
+  and restart, so the branch that prints the actionable `parachute migrate
+  --to-supervised` line was dead in production. It gates on whether the offer
+  actually surfaced guidance now.
+
+No schema migration.
+
 ## [0.7.12] - 2026-07-31
 
 **Stable promotion of the 0.7.12 line.** Promotes rc.1-rc.2 plus #811, #812,
