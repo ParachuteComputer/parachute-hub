@@ -1,4 +1,5 @@
-# Release workflow — triggered by pushing a semver tag.
+# Release workflow — triggered by a merge to `main` (hub#790), or by pushing a
+# semver tag.
 #
 # This workflow publishes FOUR packages on different tag namespaces:
 #
@@ -8,9 +9,11 @@
 #   - @openparachute/door-contract  ← tag prefix `door-contract-v...` (e.g. door-contract-v0.6.0)
 #
 # All packages have npm Trusted Publisher rules pointing at this workflow
-# file. The jobs below gate on the tag prefix so only one package publishes
-# per tag push. Independent release cadences; hub doesn't have to bump when
-# scope-guard / depcheck / door-contract ship and vice versa.
+# file. On a tag push the jobs below gate on the tag prefix so only one package
+# publishes; on a merge each job gates on its own `plan` output, so a merge can
+# publish several packages at once. Independent release cadences either way;
+# hub doesn't have to bump when scope-guard / depcheck / door-contract ship and
+# vice versa.
 #
 # Tag conventions (matches governance rule 2, https://github.com/ParachuteComputer/parachute-workspace/blob/main/docs/process/governance.md):
 #   - rc:     v<X>.<Y>.<Z>-rc.<N>   (e.g. v0.5.13-rc.33)
@@ -22,22 +25,19 @@
 #                                    (depcheck-v0.1.0)
 #                                    (door-contract-v0.6.0)
 #
-# Release flow:
-#   1. When ready to ship: bump version in the relevant package.json on main
-#      (root for hub, packages/scope-guard/ for scope-guard,
+# Release flow (publish-on-merge — the tag path below still works, see `plan`):
+#   1. When ready to ship: open a release PR bumping `version` in the relevant
+#      package.json (root for hub, packages/scope-guard/ for scope-guard,
 #      packages/depcheck/ for depcheck, packages/door-contract/ for
 #      door-contract).
-#   2. Push a matching tag:
-#        # for hub
-#        git tag v$(bun -e "console.log(require('./package.json').version)") && git push --tags
-#        # for scope-guard
-#        git tag scope-guard-v$(bun -e "console.log(require('./packages/scope-guard/package.json').version)") && git push --tags
-#        # for depcheck
-#        git tag depcheck-v$(bun -e "console.log(require('./packages/depcheck/package.json').version)") && git push --tags
-#        # for door-contract
-#        git tag door-contract-v$(bun -e "console.log(require('./packages/door-contract/package.json').version)") && git push --tags
-#   3. CI runs tests once (workspace-wide), then publishes the package matching
-#      the tag prefix. Hub also publishes a container image to ghcr.io.
+#   2. Merge it. That IS the release signal — `plan` compares each
+#      package.json against npm and publishes what's new.
+#   3. CI runs tests once (workspace-wide), then publishes whichever packages
+#      `plan` selected. Hub also publishes a container image to ghcr.io, tagged
+#      from the published VERSION (`:vX.Y.Z` + `:rc`/`:stable` + `:latest`) —
+#      not from the ref, which on a merge run is just `main` (hub#829).
+#   4. `tag-record` pushes `vX.Y.Z` afterwards as a RECORD of what shipped.
+#      Nothing needs to be tagged by hand.
 #
 # Operator setup (one-time) — see RELEASING.md:
 #   - npm Trusted Publisher rules: one per package (hub, scope-guard, depcheck,
@@ -96,6 +96,10 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       hub: ${{ steps.hub.outputs.should_publish }}
+      # The version being shipped, independent of the ref. `publish-image`
+      # derives every image tag from this (hub#829) — on a merge-triggered run
+      # `github.ref_name` is `main`, so a ref-derived tag has no version in it.
+      hub_version: ${{ steps.hub.outputs.version }}
       scope_guard: ${{ steps.scope_guard.outputs.should_publish }}
       depcheck: ${{ steps.depcheck.outputs.should_publish }}
       door_contract: ${{ steps.door_contract.outputs.should_publish }}
@@ -410,6 +414,16 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      - name: guard against an empty version
+        # `plan` always emits `version` (release-plan.ts reads it straight out
+        # of package.json), but an empty one here would silently push `:v` and
+        # a `latest`/`stable` with no versioned peer — exactly the failure mode
+        # hub#829 is about. Fail loudly instead.
+        run: |
+          if [ -z "${{ needs.plan.outputs.hub_version }}" ]; then
+            echo "::error::plan job emitted no hub version — refusing to push untagged images"
+            exit 1
+          fi
       - name: derive tags
         id: meta
         uses: docker/metadata-action@v5
@@ -418,10 +432,27 @@ jobs:
           # ParachuteComputer is mixed-case on github, hence the explicit
           # lowercase here.
           images: ghcr.io/parachutecomputer/parachute-hub
+          # Every tag comes from the VERSION BEING PUBLISHED, never from the
+          # ref — the same lesson as the npm dist-tag fix (hub#792). This used
+          # to be `type=ref,event=tag`, which on a merge-triggered run
+          # (`github.ref_name` == `main`) emitted no version tag at all: the
+          # 0.7.13 merge run pushed `:stable` alone, and its `:v0.7.13` /
+          # `:latest` existed only because someone also pushed a tag by hand.
+          # With the manual tag step gone from release PRs, that left RELEASING.md's
+          # `docker pull …:vX.Y.Z` verify/rollback steps pointing at nothing (hub#829).
+          # Naming the version first also fixes the OCI `image.version` label,
+          # which metadata-action takes from the first tag (it read `stable`).
           tags: |
-            type=ref,event=tag
-            type=raw,value=rc,enable=${{ contains(github.ref_name, '-rc.') }}
-            type=raw,value=stable,enable=${{ !contains(github.ref_name, '-rc.') }}
+            type=raw,value=v${{ needs.plan.outputs.hub_version }}
+            type=raw,value=rc,enable=${{ contains(needs.plan.outputs.hub_version, '-rc.') }}
+            type=raw,value=stable,enable=${{ !contains(needs.plan.outputs.hub_version, '-rc.') }}
+            type=raw,value=latest,enable=${{ !contains(needs.plan.outputs.hub_version, '-rc.') }}
+          # `latest` is declared explicitly above, so turn off metadata-action's
+          # automatic one: `latest=auto` only fires for `type=ref,event=tag` /
+          # `type=semver`, i.e. tag runs only, which is the second half of
+          # hub#829 (`:latest` stuck at 0.7.13 once merges became the trigger).
+          flavor: |
+            latest=false
       - name: build + push
         uses: docker/build-push-action@v5
         with:

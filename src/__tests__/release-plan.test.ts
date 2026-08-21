@@ -7,6 +7,8 @@
  */
 
 import { describe, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import {
   compareVersions,
   decidePublish,
@@ -174,5 +176,51 @@ describe("unpublishedDrift", () => {
 
   test("blank lines from git's trailing newline don't inflate the count", () => {
     expect(unpublishedDrift(["abc one", ""]).count).toBe(1);
+  });
+});
+
+/**
+ * hub#829: the ghcr image tags are part of the release contract too.
+ *
+ * The `publish-image` job used to derive its version tag from the ref
+ * (`type=ref,event=tag`). On a merge-triggered run the ref is `main`, so the
+ * 0.7.13 merge published a bare `:stable` with an `image.version=stable`
+ * label, and `:v0.7.13` / `:latest` existed only because someone pushed a tag
+ * by hand afterwards. Once that manual step went away, RELEASING.md's
+ * `docker pull …:vX.Y.Z` verify + rollback instructions pointed at nothing.
+ *
+ * Same class of bug as the dist-tag one above, and the same rule fixes it:
+ * derive from the VERSION BEING PUBLISHED, never from the ref. Asserted here
+ * rather than left to review because a YAML `run:`/`with:` block is otherwise
+ * only exercised by shipping a release.
+ */
+describe("release.yml image tags (hub#829)", () => {
+  const workflow = readFileSync(
+    join(import.meta.dir, "../../.github/workflows/release.yml"),
+    "utf8",
+  );
+
+  test("the plan job exposes the hub version, not just the publish decision", () => {
+    expect(workflow).toContain("hub_version: ${{ steps.hub.outputs.version }}");
+  });
+
+  test("every publish pushes a versioned image tag", () => {
+    expect(workflow).toContain("type=raw,value=v${{ needs.plan.outputs.hub_version }}");
+  });
+
+  test("no image tag is derived from the ref — on a merge run the ref is `main`", () => {
+    expect(workflow).not.toContain("type=ref,event=tag");
+    // The rc/stable/latest gates have to read the version too, or a
+    // merge-published rc lands on `:stable`.
+    expect(workflow).not.toMatch(/type=raw,value=(rc|stable|latest),enable=.*github\.ref_name/);
+  });
+
+  test("`latest` moves on a stable publish, and only on a stable publish", () => {
+    expect(workflow).toContain(
+      "type=raw,value=latest,enable=${{ !contains(needs.plan.outputs.hub_version, '-rc.') }}",
+    );
+    // metadata-action's own `latest=auto` only fires on tag runs, which is the
+    // half of #829 that left `:latest` stuck at 0.7.13.
+    expect(workflow).toMatch(/flavor:\s*\|\s*\n\s*latest=false/);
   });
 });
