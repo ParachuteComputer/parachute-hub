@@ -11,16 +11,8 @@
   "bin": {
     "parachute": "src/cli.ts"
   },
-  "workspaces": [
-    "packages/*"
-  ],
-  "files": [
-    "src",
-    "web/ui/dist",
-    "scripts/git-credential-parachute",
-    "README.md",
-    "LICENSE"
-  ],
+  "workspaces": ["packages/*"],
+  "files": ["src", "web/ui/dist", "scripts/git-credential-parachute", "README.md", "LICENSE"],
   "repository": {
     "type": "git",
     "url": "https://github.com/ParachuteComputer/parachute-hub.git"
