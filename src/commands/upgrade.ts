@@ -85,7 +85,12 @@ import {
   knownServices,
   shortNameForManifest,
 } from "../service-spec.ts";
-import { type ServiceEntry, readManifest } from "../services-manifest.ts";
+import {
+  type ServiceEntry,
+  findService,
+  readManifest,
+  upsertService,
+} from "../services-manifest.ts";
 import { type LifecycleOpts, restart as lifecycleRestart } from "./lifecycle.ts";
 
 export interface UpgradeRunner {
@@ -635,6 +640,52 @@ async function restartTarget(target: ResolvedTarget, r: Resolved): Promise<numbe
   });
 }
 
+/**
+ * Bring the services.json row's `version` back in line with what's installed,
+ * after an upgrade+restart (hub#831).
+ *
+ * `entry.version` is a CACHE of the running version: services own the write
+ * side of services.json and stamp it on their own boot (see CLAUDE.md). That
+ * works for modules with a server of their own — and not at all for the ones
+ * hub serves through the `bundle-serve.ts` static shim (`app`, `notes`), which
+ * have no boot of their own to do the stamping. Their row keeps whatever it
+ * last had, so `parachute status` reported `parachute-app 1944 0.22.10 …
+ * npm (0.22.11)` — VERSION from the stale cache, SOURCE re-read live off disk
+ * on every invocation. Cosmetic, except that "status shows expected versions"
+ * is the deploy verification step.
+ *
+ * Deliberately AFTER a successful restart, never before: until the restart
+ * lands, the old code is still the code that's running, and writing the new
+ * version early would turn a stale row into a lying one. For the same reason
+ * the skip-restart paths ("already at X", "already up to date") don't call
+ * this — nothing restarted, so nothing about the running version changed.
+ *
+ * Re-reads the row instead of reusing `target.entry`: a self-registering
+ * module rewrites its whole row during the restart we just awaited, and
+ * spreading the pre-restart copy would clobber what it just wrote. The
+ * version-differs guard then makes this a no-op for exactly those modules —
+ * they already stamped the right version themselves — so in practice only the
+ * shim-served rows get written here.
+ */
+function refreshManifestVersion(target: ResolvedTarget, sourceDir: string, r: Resolved): void {
+  const installed = readPackageVersion(join(sourceDir, "package.json"));
+  if (!installed) return;
+  const fresh = findService(target.entry.name, r.manifestPath);
+  if (!fresh || fresh.version === installed) return;
+  try {
+    upsertService({ ...fresh, version: installed }, r.manifestPath);
+    r.log(`${target.short}: services.json version ${fresh.version} → ${installed}.`);
+  } catch (err) {
+    // Never fail an otherwise-successful upgrade over the bookkeeping write —
+    // the package is installed and the service is running either way. Say so
+    // rather than leaving the operator to wonder why status disagrees.
+    r.log(
+      `⚠ ${target.short}: upgraded + restarted, but couldn't refresh the services.json version ` +
+        `(${err instanceof Error ? err.message : String(err)}). \`status\` may show the old version.`,
+    );
+  }
+}
+
 async function upgradeLinked(
   target: ResolvedTarget,
   sourceDir: string,
@@ -693,7 +744,9 @@ async function upgradeLinked(
   }
 
   r.log(`${target.short}: ${before.sha.slice(0, 7)} → ${after.sha.slice(0, 7)}; restarting…`);
-  return await restartTarget(target, r);
+  const restarted = await restartTarget(target, r);
+  if (restarted === 0) refreshManifestVersion(target, sourceDir, r);
+  return restarted;
 }
 
 /**
@@ -858,7 +911,9 @@ async function upgradeNpm(target: ResolvedTarget, sourceDir: string, r: Resolved
   }
 
   r.log(`${target.short}: ${beforeVersion ?? "?"} → ${afterVersion ?? "?"}; restarting…`);
-  return await restartTarget(target, r);
+  const restarted = await restartTarget(target, r);
+  if (restarted === 0) refreshManifestVersion(target, sourceDir, r);
+  return restarted;
 }
 
 async function upgradeOne(target: ResolvedTarget, r: Resolved): Promise<number> {

@@ -9,7 +9,7 @@ import { compareVersions, defaultRunner, detectChannel, upgrade } from "../comma
 import type { HubUnitDeps, HubUnitManagerOpResult } from "../hub-unit.ts";
 import { defaultHubUnitDeps } from "../hub-unit.ts";
 import type { MigrateOfferResult } from "../migrate-offer.ts";
-import { upsertService } from "../services-manifest.ts";
+import { findService, upsertService } from "../services-manifest.ts";
 
 interface RunCall {
   cmd: string[];
@@ -1835,6 +1835,212 @@ describe("Phase 5b: upgrade module-restart on a no-unit box", () => {
       expect(offerCalls).toBe(1);
       expect(driveModuleOpCalled).toBe(false);
       expect(logs.join("\n")).not.toMatch(/ECONNREFUSED|connection refused/i);
+    } finally {
+      h.cleanup();
+    }
+  });
+});
+
+describe("hub#831: services.json version refresh after upgrade", () => {
+  /** Not-a-git-checkout runner whose `bun add -g` rewrites package.json. */
+  function npmRunner(installDir: string, afterVersion: string | null): UpgradeRunner {
+    return {
+      async run(cmd) {
+        if (cmd[0] === "bun" && cmd[1] === "add" && cmd[2] === "-g" && afterVersion) {
+          writePackageJson(installDir, { name: "@openparachute/vault", version: afterVersion });
+        }
+        return 0;
+      },
+      async capture(cmd) {
+        if (cmd[1] === "rev-parse" && cmd[2] === "--is-inside-work-tree") {
+          return { code: 128, stdout: "fatal: not a git repository\n" };
+        }
+        return { code: 0, stdout: "" };
+      },
+    };
+  }
+
+  test("npm upgrade + restart refreshes the stale registry row", async () => {
+    const h = makeHarness();
+    try {
+      const installDir = join(h.installRoot, "vault");
+      writePackageJson(installDir, { name: "@openparachute/vault", version: "0.4.0" });
+      seedVault(h.manifestPath, installDir, "0.4.0");
+
+      const logs: string[] = [];
+      const code = await upgrade("vault", {
+        manifestPath: h.manifestPath,
+        configDir: h.configDir,
+        runner: npmRunner(installDir, "0.5.0"),
+        findGlobalInstall: () => join(installDir, "package.json"),
+        restartFn: async () => 0,
+        log: (l) => logs.push(l),
+      });
+
+      expect(code).toBe(0);
+      // The bug: SOURCE re-read 0.5.0 off disk while VERSION kept showing 0.4.0.
+      expect(findService("parachute-vault", h.manifestPath)?.version).toBe("0.5.0");
+      expect(logs.join("\n")).toMatch(/services\.json version 0\.4\.0 → 0\.5\.0/);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("preserves the rest of the row (port, paths, installDir)", async () => {
+    const h = makeHarness();
+    try {
+      const installDir = join(h.installRoot, "vault");
+      writePackageJson(installDir, { name: "@openparachute/vault", version: "0.4.0" });
+      seedVault(h.manifestPath, installDir, "0.4.0");
+
+      const code = await upgrade("vault", {
+        manifestPath: h.manifestPath,
+        configDir: h.configDir,
+        runner: npmRunner(installDir, "0.5.0"),
+        findGlobalInstall: () => join(installDir, "package.json"),
+        restartFn: async () => 0,
+        log: () => {},
+      });
+
+      expect(code).toBe(0);
+      const row = findService("parachute-vault", h.manifestPath);
+      expect(row?.port).toBe(1940);
+      expect(row?.paths).toEqual(["/vault/default"]);
+      expect(row?.installDir).toBe(installDir);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("re-reads the row post-restart so a self-registering module isn't clobbered", async () => {
+    const h = makeHarness();
+    try {
+      const installDir = join(h.installRoot, "vault");
+      writePackageJson(installDir, { name: "@openparachute/vault", version: "0.4.0" });
+      seedVault(h.manifestPath, installDir, "0.4.0");
+
+      const code = await upgrade("vault", {
+        manifestPath: h.manifestPath,
+        configDir: h.configDir,
+        runner: npmRunner(installDir, "0.5.0"),
+        findGlobalInstall: () => join(installDir, "package.json"),
+        // Stand in for a module that rewrites its own row on boot, adding a
+        // field the pre-restart copy never had.
+        restartFn: async () => {
+          upsertService(
+            {
+              name: "parachute-vault",
+              port: 1940,
+              paths: ["/vault/default"],
+              health: "/vault/default/health",
+              version: "0.5.0",
+              installDir,
+              displayName: "Vault",
+            },
+            h.manifestPath,
+          );
+          return 0;
+        },
+        log: () => {},
+      });
+
+      expect(code).toBe(0);
+      const row = findService("parachute-vault", h.manifestPath);
+      expect(row?.version).toBe("0.5.0");
+      expect(row?.displayName).toBe("Vault");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("a failed restart leaves the row alone — the old code is still running", async () => {
+    const h = makeHarness();
+    try {
+      const installDir = join(h.installRoot, "vault");
+      writePackageJson(installDir, { name: "@openparachute/vault", version: "0.4.0" });
+      seedVault(h.manifestPath, installDir, "0.4.0");
+
+      const code = await upgrade("vault", {
+        manifestPath: h.manifestPath,
+        configDir: h.configDir,
+        runner: npmRunner(installDir, "0.5.0"),
+        findGlobalInstall: () => join(installDir, "package.json"),
+        restartFn: async () => 1,
+        log: () => {},
+      });
+
+      expect(code).toBe(1);
+      expect(findService("parachute-vault", h.manifestPath)?.version).toBe("0.4.0");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("the skip-restart no-op doesn't touch the row", async () => {
+    const h = makeHarness();
+    try {
+      const installDir = join(h.installRoot, "vault");
+      writePackageJson(installDir, { name: "@openparachute/vault", version: "0.4.0" });
+      seedVault(h.manifestPath, installDir, "0.3.0");
+
+      const logs: string[] = [];
+      const code = await upgrade("vault", {
+        manifestPath: h.manifestPath,
+        configDir: h.configDir,
+        runner: npmRunner(installDir, null),
+        findGlobalInstall: () => join(installDir, "package.json"),
+        restartFn: async () => 0,
+        log: (l) => logs.push(l),
+      });
+
+      expect(code).toBe(0);
+      expect(logs.join("\n")).toMatch(/already at 0\.4\.0/);
+      expect(findService("parachute-vault", h.manifestPath)?.version).toBe("0.3.0");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("bun-linked upgrade + restart refreshes from the checkout's package.json", async () => {
+    const h = makeHarness();
+    try {
+      const installDir = join(h.installRoot, "vault");
+      writePackageJson(installDir, { name: "@openparachute/vault", version: "0.4.0" });
+      seedVault(h.manifestPath, installDir, "0.4.0");
+
+      let headCalls = 0;
+      const runner: UpgradeRunner = {
+        async run(cmd) {
+          // The pull brings a version bump into the checkout.
+          if (cmd[0] === "git" && cmd[1] === "pull") {
+            writePackageJson(installDir, { name: "@openparachute/vault", version: "0.6.0" });
+          }
+          return 0;
+        },
+        async capture(cmd) {
+          if (cmd[1] === "rev-parse" && cmd[2] === "--is-inside-work-tree") {
+            return { code: 0, stdout: "true" };
+          }
+          if (cmd[1] === "status") return { code: 0, stdout: "" };
+          if (cmd[1] === "rev-parse" && cmd[2] === "HEAD") {
+            headCalls++;
+            return { code: 0, stdout: headCalls === 1 ? "aaaaaaa" : "bbbbbbb" };
+          }
+          return { code: 0, stdout: "" };
+        },
+      };
+
+      const code = await upgrade("vault", {
+        manifestPath: h.manifestPath,
+        configDir: h.configDir,
+        runner,
+        findGlobalInstall: () => join(installDir, "package.json"),
+        restartFn: async () => 0,
+        log: () => {},
+      });
+
+      expect(code).toBe(0);
+      expect(findService("parachute-vault", h.manifestPath)?.version).toBe("0.6.0");
     } finally {
       h.cleanup();
     }
