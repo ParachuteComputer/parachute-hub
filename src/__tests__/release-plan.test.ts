@@ -7,12 +7,14 @@
  */
 
 import { describe, expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   compareVersions,
   decidePublish,
   distTagFor,
+  emitOutputs,
   readRegistry,
   unpublishedDrift,
 } from "../../scripts/release-plan.ts";
@@ -209,7 +211,9 @@ describe("release.yml image tags (hub#829)", () => {
   });
 
   test("no image tag is derived from the ref — on a merge run the ref is `main`", () => {
-    expect(workflow).not.toContain("type=ref,event=tag");
+    // Anchored so the prose in the surrounding comment (which names the old
+    // `type=ref,event=tag` it replaced) doesn't trip it.
+    expect(workflow).not.toMatch(/^\s*type=ref/m);
     // The rc/stable/latest gates have to read the version too, or a
     // merge-published rc lands on `:stable`.
     expect(workflow).not.toMatch(/type=raw,value=(rc|stable|latest),enable=.*github\.ref_name/);
@@ -222,5 +226,59 @@ describe("release.yml image tags (hub#829)", () => {
     // metadata-action's own `latest=auto` only fires on tag runs, which is the
     // half of #829 that left `:latest` stuck at 0.7.13.
     expect(workflow).toMatch(/flavor:\s*\|\s*\n\s*latest=false/);
+  });
+});
+
+/**
+ * The step outputs are the wire between `plan` and every publish job. Losing
+ * one is silent — the consuming expression just interpolates to an empty
+ * string.
+ */
+describe("emitOutputs", () => {
+  test("APPENDS every output — `Bun.write` truncated, keeping only the last", () => {
+    const dir = mkdtempSync(join(tmpdir(), "phub-release-plan-"));
+    try {
+      const out = join(dir, "github_output");
+      writeFileSync(out, "");
+      emitOutputs(
+        out,
+        [
+          ["version", "0.7.15"],
+          ["dist_tag", "latest"],
+          ["should_publish", "true"],
+        ],
+        () => {},
+      );
+      expect(readFileSync(out, "utf8")).toBe(
+        "version=0.7.15\ndist_tag=latest\nshould_publish=true\n",
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("keeps whatever an earlier step already wrote to the file", () => {
+    const dir = mkdtempSync(join(tmpdir(), "phub-release-plan-"));
+    try {
+      const out = join(dir, "github_output");
+      writeFileSync(out, "earlier=kept\n");
+      emitOutputs(out, [["version", "0.7.15"]], () => {});
+      expect(readFileSync(out, "utf8")).toBe("earlier=kept\nversion=0.7.15\n");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("logs every output even with no output file (local runs)", () => {
+    const lines: string[] = [];
+    emitOutputs(
+      undefined,
+      [
+        ["version", "0.7.15"],
+        ["dist_tag", "latest"],
+      ],
+      (l) => lines.push(l),
+    );
+    expect(lines).toEqual(["version=0.7.15", "dist_tag=latest"]);
   });
 });
