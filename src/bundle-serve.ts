@@ -13,7 +13,12 @@
  * alongside the other services.
  *
  * Invoked as:
- *   bun <this-file> --port <n> [--dist <path>] [--mount <prefix>] [--package <npmName>]
+ *   bun <this-file> --port <n> [--host <addr>] [--dist <path>] [--mount <prefix>]
+ *                   [--package <npmName>]
+ *
+ * `--host` is the bind address, same contract as hub-server.ts: flag beats
+ * `PARACHUTE_BIND_HOST`, env beats the `127.0.0.1` default. See
+ * `resolveBindHost` for why the default is loopback.
  *
  * `--mount` (default `/notes`) is the path prefix the reverse proxy hands
  * us. We strip it before resolving against `dist/` so a request for
@@ -54,21 +59,55 @@ import { dirname, join, resolve } from "node:path";
  */
 const DEFAULT_PACKAGE = "@openparachute/app";
 
+/**
+ * Bind address when neither `--host` nor `PARACHUTE_BIND_HOST` says otherwise.
+ *
+ * Matches `hub-server.ts`'s `parseArgs` default. The shim used to pass no
+ * `hostname` at all, so `Bun.serve` bound every interface — on a box whose hub
+ * and vault both sat on `127.0.0.1`, the SPA alone answered unauthenticated on
+ * the tailnet/LAN (hub#832). Nothing legitimate needs the wildcard: this shim
+ * is reached through `parachute expose`'s reverse proxy, which connects over
+ * loopback. The container images that DO need every interface set
+ * `PARACHUTE_BIND_HOST=0.0.0.0` (Dockerfile / render.yaml / fly.toml), which
+ * the supervisor passes down to the child through the inherited env.
+ */
+const DEFAULT_BIND_HOST = "127.0.0.1";
+
 interface Args {
   port: number;
+  host?: string;
   dist?: string;
   mount: string;
   pkg: string;
 }
 
+/**
+ * Flag beats env, env beats default — the same precedence hub-server.ts uses
+ * for its own listener, so one `PARACHUTE_BIND_HOST` governs every process the
+ * hub supervises rather than just the hub itself.
+ */
+export function resolveBindHost(
+  host: string | undefined,
+  env: NodeJS.ProcessEnv = process.env,
+): string {
+  // `||` not `??`, matching hub-server.ts: an empty `PARACHUTE_BIND_HOST=` is
+  // "unset" here, not "bind to the empty string".
+  return host || env.PARACHUTE_BIND_HOST || DEFAULT_BIND_HOST;
+}
+
 function parseArgs(argv: string[]): Args {
   let port = 5173;
+  let host: string | undefined;
   let dist: string | undefined;
   let mount = "/notes";
   let pkg = DEFAULT_PACKAGE;
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
-    if (a === "--port") {
+    if (a === "--host") {
+      const v = argv[++i];
+      if (!v) throw new Error("--host requires a value");
+      host = v;
+    } else if (a === "--port") {
       const v = argv[++i];
       if (!v) throw new Error("--port requires a value");
       const n = Number.parseInt(v, 10);
@@ -92,7 +131,7 @@ function parseArgs(argv: string[]): Args {
       throw new Error(`unknown argument: ${a}`);
     }
   }
-  return { port, dist, mount, pkg };
+  return { port, host, dist, mount, pkg };
 }
 
 export function normalizeMount(raw: string): string {
@@ -375,21 +414,33 @@ export function notesFetch(dist: string, mount: string): (req: Request) => Respo
  * exceeds Render's community-observed ~120s edge pool TTL. Closes the hub#399
  * residual on the second serve entrypoint (the Notes PWA path). Exported so a
  * test can assert the option is set without booting a server.
+ *
+ * `hostname` is REQUIRED rather than optional: omitting it is what let this
+ * shim bind every interface (hub#832), and an optional parameter would let the
+ * same omission come back silently. Callers resolve it via `resolveBindHost`.
  */
 export function notesServeOptions(
   port: number,
   dist: string,
   mount: string,
-): { port: number; idleTimeout: number; fetch: (req: Request) => Response } {
+  hostname: string,
+): {
+  port: number;
+  hostname: string;
+  idleTimeout: number;
+  fetch: (req: Request) => Response;
+} {
   return {
     port,
+    hostname,
     idleTimeout: 255,
     fetch: notesFetch(dist, mount),
   };
 }
 
 if (import.meta.main) {
-  const { port, dist: distArg, mount, pkg } = parseArgs(process.argv.slice(2));
+  const { port, host, dist: distArg, mount, pkg } = parseArgs(process.argv.slice(2));
+  const hostname = resolveBindHost(host);
 
   let dist: string;
   try {
@@ -401,9 +452,9 @@ if (import.meta.main) {
     process.exit(1);
   }
 
-  Bun.serve(notesServeOptions(port, dist, mount));
+  Bun.serve(notesServeOptions(port, dist, mount, hostname));
 
   console.log(
-    `static-serve listening on :${port} (pkg=${pkg}, dist=${dist}, mount=${mount || "/"})`,
+    `static-serve listening on ${hostname}:${port} (pkg=${pkg}, dist=${dist}, mount=${mount || "/"})`,
   );
 }

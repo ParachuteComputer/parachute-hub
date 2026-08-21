@@ -7,6 +7,7 @@ import {
   notesDistCandidates,
   notesFetch,
   notesServeOptions,
+  resolveBindHost,
   resolveBundleDistFrom,
 } from "../bundle-serve.ts";
 
@@ -29,10 +30,34 @@ function req(path: string): Request {
 
 describe("notesServeOptions (hub#399 residual)", () => {
   test("sets idleTimeout: 255 to outlast edge keep-alive pools, matching hub-server.ts", () => {
-    const opts = notesServeOptions(5173, "/tmp/dist", "/notes");
+    const opts = notesServeOptions(5173, "/tmp/dist", "/notes", "127.0.0.1");
     expect(opts.idleTimeout).toBe(255);
     expect(opts.port).toBe(5173);
     expect(typeof opts.fetch).toBe("function");
+  });
+
+  test("passes hostname through to Bun.serve (hub#832 — no hostname = every interface)", () => {
+    expect(notesServeOptions(5173, "/tmp/dist", "/notes", "127.0.0.1").hostname).toBe("127.0.0.1");
+    expect(notesServeOptions(5173, "/tmp/dist", "/notes", "0.0.0.0").hostname).toBe("0.0.0.0");
+  });
+});
+
+describe("resolveBindHost (hub#832)", () => {
+  test("defaults to loopback, matching hub-server.ts", () => {
+    expect(resolveBindHost(undefined, {})).toBe("127.0.0.1");
+  });
+
+  test("honors PARACHUTE_BIND_HOST — one env governs every listener the hub supervises", () => {
+    expect(resolveBindHost(undefined, { PARACHUTE_BIND_HOST: "0.0.0.0" })).toBe("0.0.0.0");
+    expect(resolveBindHost(undefined, { PARACHUTE_BIND_HOST: "127.0.0.1" })).toBe("127.0.0.1");
+  });
+
+  test("--host beats the env", () => {
+    expect(resolveBindHost("127.0.0.1", { PARACHUTE_BIND_HOST: "0.0.0.0" })).toBe("127.0.0.1");
+  });
+
+  test("an empty PARACHUTE_BIND_HOST is unset, not the empty hostname", () => {
+    expect(resolveBindHost(undefined, { PARACHUTE_BIND_HOST: "" })).toBe("127.0.0.1");
   });
 });
 
