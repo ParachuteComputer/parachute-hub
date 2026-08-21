@@ -8,6 +8,7 @@ import {
   looksLikeServer,
   resolveAdminUrl,
   resolveInitChannel,
+  type InitOpts,
 } from "../commands/init.ts";
 import type { ExposeState } from "../expose-state.ts";
 import { writeHubPort } from "../hub-control.ts";
@@ -39,6 +40,25 @@ function makeHarness(): Harness {
  * etc.) can override this with their own stub.
  */
 const noopVaultInstall = async (_configDir: string, _manifestPath: string): Promise<number> => 0;
+const noopAppInstall = async (_configDir: string, _manifestPath: string): Promise<number> => 0;
+
+/**
+ * Call `init` with both module-install steps stubbed.
+ *
+ * Production defaults `bun add -g` vault and app. Tests that forget to
+ * override those seams share that wait, and on a slow runner the cluster
+ * all time out at the 5000ms ceiling together (hub#786 — 11 init /
+ * init-exposure tests, byte-identical to a version-bump tag). Stubbing
+ * here is the default; a test that needs a seed-write still passes its
+ * own `installVaultModuleImpl` and it wins the spread.
+ */
+async function initForTest(opts: InitOpts = {}): Promise<number> {
+  return init({
+    installVaultModuleImpl: noopVaultInstall,
+    installAppModuleImpl: noopAppInstall,
+    ...opts,
+  });
+}
 
 function seedVault(manifestPath: string): void {
   writeFileSync(
@@ -90,7 +110,7 @@ describe("init", () => {
     try {
       const calls: string[] = [];
       const logs: string[] = [];
-      const code = await init({
+      const code = await initForTest({
         configDir: h.configDir,
         // #590: keep the version-check a no-op in init tests — NEVER let the
         // production default fire a real /health fetch + restart the live unit.
@@ -138,7 +158,7 @@ describe("init", () => {
       writeHubPort(1939, h.configDir);
       const calls: string[] = [];
       const logs: string[] = [];
-      const code = await init({
+      const code = await initForTest({
         configDir: h.configDir,
         // #590: keep the version-check a no-op in init tests — NEVER let the
         // production default fire a real /health fetch + restart the live unit.
@@ -186,7 +206,7 @@ describe("init", () => {
 
       const calls: string[] = [];
       const logs: string[] = [];
-      const code = await init({
+      const code = await initForTest({
         configDir: h.configDir,
         // #590: keep the version-check a no-op in init tests — NEVER let the
         // production default fire a real /health fetch + restart the live unit.
@@ -238,7 +258,7 @@ describe("init", () => {
       };
 
       const logs: string[] = [];
-      const code = await init({
+      const code = await initForTest({
         configDir: h.configDir,
         // #590: keep the version-check a no-op in init tests — NEVER let the
         // production default fire a real /health fetch + restart the live unit.
@@ -269,7 +289,7 @@ describe("init", () => {
     try {
       writeHubPort(1939, h.configDir);
       const opened: string[] = [];
-      const code = await init({
+      const code = await initForTest({
         configDir: h.configDir,
         // #590: keep the version-check a no-op in init tests — NEVER let the
         // production default fire a real /health fetch + restart the live unit.
@@ -309,7 +329,7 @@ describe("init", () => {
     try {
       writeHubPort(1939, h.configDir);
       const opened: string[] = [];
-      const code = await init({
+      const code = await initForTest({
         configDir: h.configDir,
         // #590: keep the version-check a no-op in init tests — NEVER let the
         // production default fire a real /health fetch + restart the live unit.
@@ -352,7 +372,7 @@ describe("init", () => {
       writeHubPort(1939, h.configDir);
       const opened: string[] = [];
       let prompted = false;
-      const code = await init({
+      const code = await initForTest({
         configDir: h.configDir,
         // #590: keep the version-check a no-op in init tests — NEVER let the
         // production default fire a real /health fetch + restart the live unit.
@@ -392,7 +412,7 @@ describe("init", () => {
     try {
       writeHubPort(1939, h.configDir);
       let prompted = false;
-      const code = await init({
+      const code = await initForTest({
         configDir: h.configDir,
         // #590: keep the version-check a no-op in init tests — NEVER let the
         // production default fire a real /health fetch + restart the live unit.
@@ -426,7 +446,7 @@ describe("init", () => {
     try {
       writeHubPort(1939, h.configDir);
       const opened: string[] = [];
-      const code = await init({
+      const code = await initForTest({
         configDir: h.configDir,
         // #590: keep the version-check a no-op in init tests — NEVER let the
         // production default fire a real /health fetch + restart the live unit.
@@ -467,7 +487,7 @@ describe("init", () => {
       writeHubPort(1939, h.configDir);
       const opened: string[] = [];
       const logs: string[] = [];
-      const code = await init({
+      const code = await initForTest({
         configDir: h.configDir,
         // #590: keep the version-check a no-op in init tests — NEVER let the
         // production default fire a real /health fetch + restart the live unit.
@@ -508,7 +528,7 @@ describe("init", () => {
     try {
       writeHubPort(1939, h.configDir);
       const opened: string[] = [];
-      const code = await init({
+      const code = await initForTest({
         configDir: h.configDir,
         // #590: keep the version-check a no-op in init tests — NEVER let the
         // production default fire a real /health fetch + restart the live unit.
@@ -545,7 +565,7 @@ describe("init", () => {
     const h = makeHarness();
     try {
       const logs: string[] = [];
-      const code = await init({
+      const code = await initForTest({
         configDir: h.configDir,
         // #590: keep the version-check a no-op in init tests — NEVER let the
         // production default fire a real /health fetch + restart the live unit.
@@ -581,7 +601,7 @@ describe("init — version-check-and-restart at the hub adoption point (#590)", 
     try {
       const logs: string[] = [];
       let seenPort: number | undefined;
-      const code = await init({
+      const code = await initForTest({
         configDir: h.configDir,
         manifestPath: h.manifestPath,
         log: (l) => logs.push(l),
@@ -623,7 +643,7 @@ describe("init — version-check-and-restart at the hub adoption point (#590)", 
     try {
       const logs: string[] = [];
       let exposeRan = false;
-      const code = await init({
+      const code = await initForTest({
         configDir: h.configDir,
         manifestPath: h.manifestPath,
         log: (l) => logs.push(l),
@@ -667,7 +687,7 @@ describe("init — version-check-and-restart at the hub adoption point (#590)", 
     try {
       const logs: string[] = [];
       let exposeRan = false;
-      const code = await init({
+      const code = await initForTest({
         configDir: h.configDir,
         manifestPath: h.manifestPath,
         log: (l) => logs.push(l),
@@ -712,7 +732,7 @@ describe("init — version-check-and-restart at the hub adoption point (#590)", 
     const h = makeHarness();
     try {
       const logs: string[] = [];
-      const code = await init({
+      const code = await initForTest({
         configDir: h.configDir,
         manifestPath: h.manifestPath,
         log: (l) => logs.push(l),
@@ -765,7 +785,7 @@ describe("init bootstrap-token first-claim (hub#576)", () => {
       writeHubPort(1939, h.configDir);
       const probed: string[] = [];
       const logs: string[] = [];
-      const code = await init({
+      const code = await initForTest({
         configDir: h.configDir,
         // #590: keep the version-check a no-op in init tests — NEVER let the
         // production default fire a real /health fetch + restart the live unit.
@@ -806,7 +826,7 @@ describe("init bootstrap-token first-claim (hub#576)", () => {
       writeHubPort(1939, h.configDir);
       let probedCount = 0;
       const logs: string[] = [];
-      const code = await init({
+      const code = await initForTest({
         configDir: h.configDir,
         // #590: keep the version-check a no-op in init tests — NEVER let the
         // production default fire a real /health fetch + restart the live unit.
@@ -841,7 +861,7 @@ describe("init bootstrap-token first-claim (hub#576)", () => {
     try {
       writeHubPort(1939, h.configDir);
       const logs: string[] = [];
-      const code = await init({
+      const code = await initForTest({
         configDir: h.configDir,
         // #590: keep the version-check a no-op in init tests — NEVER let the
         // production default fire a real /health fetch + restart the live unit.
@@ -875,7 +895,7 @@ describe("init bootstrap-token first-claim (hub#576)", () => {
     try {
       writeHubPort(1939, h.configDir);
       const wizardUrls: string[] = [];
-      const code = await init({
+      const code = await initForTest({
         configDir: h.configDir,
         // #590: keep the version-check a no-op in init tests — NEVER let the
         // production default fire a real /health fetch + restart the live unit.
@@ -971,7 +991,7 @@ describe("init --hub-origin (Caddy-direct zero-SSH boot, onboarding-streamline 2
     const h = makeHarness();
     try {
       const order: string[] = [];
-      const code = await init({
+      const code = await initForTest({
         configDir: h.configDir,
         ensureHubVersion: async () => ({
           outcome: "match" as const,
@@ -1008,7 +1028,7 @@ describe("init --hub-origin (Caddy-direct zero-SSH boot, onboarding-streamline 2
   test("default impl writes hub_settings.hub_origin to the real DB", async () => {
     const h = makeHarness();
     try {
-      const code = await init({
+      const code = await initForTest({
         configDir: h.configDir,
         ensureHubVersion: async () => ({
           outcome: "match" as const,
@@ -1048,7 +1068,7 @@ describe("init --hub-origin (Caddy-direct zero-SSH boot, onboarding-streamline 2
     const h = makeHarness();
     try {
       let setCalls = 0;
-      const code = await init({
+      const code = await initForTest({
         configDir: h.configDir,
         ensureHubVersion: async () => ({
           outcome: "match" as const,
@@ -1081,7 +1101,7 @@ describe("init --hub-origin (Caddy-direct zero-SSH boot, onboarding-streamline 2
     const h = makeHarness();
     try {
       const logs: string[] = [];
-      const code = await init({
+      const code = await initForTest({
         configDir: h.configDir,
         ensureHubVersion: async () => ({
           outcome: "match" as const,
@@ -1120,7 +1140,7 @@ describe("init exposure chain", () => {
     try {
       writeHubPort(1939, h.configDir);
       const promptCalls: string[] = [];
-      const code = await init({
+      const code = await initForTest({
         configDir: h.configDir,
         // #590: keep the version-check a no-op in init tests — NEVER let the
         // production default fire a real /health fetch + restart the live unit.
@@ -1160,7 +1180,7 @@ describe("init exposure chain", () => {
       writeHubPort(1939, h.configDir);
       let exposureChained = false;
       const promptCalls: string[] = [];
-      const code = await init({
+      const code = await initForTest({
         configDir: h.configDir,
         // #590: keep the version-check a no-op in init tests — NEVER let the
         // production default fire a real /health fetch + restart the live unit.
@@ -1213,7 +1233,7 @@ describe("init exposure chain", () => {
       let tailnetCalls = 0;
       let cloudflareCalls = 0;
       const promptCalls: string[] = [];
-      const code = await init({
+      const code = await initForTest({
         configDir: h.configDir,
         // #590: keep the version-check a no-op in init tests — NEVER let the
         // production default fire a real /health fetch + restart the live unit.
@@ -1263,7 +1283,7 @@ describe("init exposure chain", () => {
       writeHubPort(1939, h.configDir);
       let tailnetCalls = 0;
       let cloudflareCalls = 0;
-      const code = await init({
+      const code = await initForTest({
         configDir: h.configDir,
         // #590: keep the version-check a no-op in init tests — NEVER let the
         // production default fire a real /health fetch + restart the live unit.
@@ -1304,7 +1324,7 @@ describe("init exposure chain", () => {
       writeHubPort(1939, h.configDir);
       let tailnetCalls = 0;
       let cloudflareCalls = 0;
-      const code = await init({
+      const code = await initForTest({
         configDir: h.configDir,
         // #590: keep the version-check a no-op in init tests — NEVER let the
         // production default fire a real /health fetch + restart the live unit.
@@ -1353,7 +1373,7 @@ describe("init exposure chain", () => {
       const setChained = (v: ExposeChoice) => {
         chained[0] = v;
       };
-      await init({
+      await initForTest({
         configDir: h.configDir,
         // #590: keep the version-check a no-op in init tests — NEVER let the
         // production default fire a real /health fetch + restart the live unit.
@@ -1394,7 +1414,7 @@ describe("init exposure chain", () => {
       // Server: Linux + SSH → default is "3" (cloudflare).
       promptLog = [];
       setChained("none");
-      await init({
+      await initForTest({
         configDir: h.configDir,
         // #590: keep the version-check a no-op in init tests — NEVER let the
         // production default fire a real /health fetch + restart the live unit.
@@ -1450,7 +1470,7 @@ describe("init exposure chain", () => {
       const promptCalls: string[] = [];
       let chained = false;
       const logs: string[] = [];
-      const code = await init({
+      const code = await initForTest({
         configDir: h.configDir,
         // #590: keep the version-check a no-op in init tests — NEVER let the
         // production default fire a real /health fetch + restart the live unit.
@@ -1500,7 +1520,7 @@ describe("init exposure chain", () => {
     try {
       writeHubPort(1939, h.configDir);
       let chained = false;
-      const code = await init({
+      const code = await initForTest({
         configDir: h.configDir,
         // #590: keep the version-check a no-op in init tests — NEVER let the
         // production default fire a real /health fetch + restart the live unit.
@@ -1538,7 +1558,7 @@ describe("init exposure chain", () => {
     try {
       writeHubPort(1939, h.configDir);
       const logs: string[] = [];
-      const code = await init({
+      const code = await initForTest({
         configDir: h.configDir,
         // #590: keep the version-check a no-op in init tests — NEVER let the
         // production default fire a real /health fetch + restart the live unit.
@@ -1581,7 +1601,7 @@ describe("init exposure chain", () => {
     try {
       writeHubPort(1939, h.configDir);
       const logs: string[] = [];
-      const code = await init({
+      const code = await initForTest({
         configDir: h.configDir,
         // #590: keep the version-check a no-op in init tests — NEVER let the
         // production default fire a real /health fetch + restart the live unit.
@@ -1622,7 +1642,7 @@ describe("init exposure chain", () => {
     const h = makeHarness();
     try {
       const order: string[] = [];
-      const code = await init({
+      const code = await initForTest({
         configDir: h.configDir,
         // #590: keep the version-check a no-op in init tests — NEVER let the
         // production default fire a real /health fetch + restart the live unit.
@@ -1674,7 +1694,7 @@ describe("init exposure chain", () => {
       // No operator.token yet.
       expect(await readOperatorTokenFile(h.configDir)).toBeNull();
 
-      const code = await init({
+      const code = await initForTest({
         configDir: h.configDir,
         // #590: keep the version-check a no-op in init tests — NEVER let the
         // production default fire a real /health fetch + restart the live unit.
@@ -1718,7 +1738,7 @@ describe("init exposure chain", () => {
       // Plant a sentinel token on disk.
       await writeOperatorTokenFile("SENTINEL.PRE-EXISTING.TOKEN", h.configDir);
 
-      const code = await init({
+      const code = await initForTest({
         configDir: h.configDir,
         // #590: keep the version-check a no-op in init tests — NEVER let the
         // production default fire a real /health fetch + restart the live unit.
@@ -1753,7 +1773,7 @@ describe("init exposure chain", () => {
       const { readOperatorTokenFile } = await import("../operator-token.ts");
       // No user seeded — the common fresh-box case where init runs before the
       // wizard creates first-admin.
-      const code = await init({
+      const code = await initForTest({
         configDir: h.configDir,
         // #590: keep the version-check a no-op in init tests — NEVER let the
         // production default fire a real /health fetch + restart the live unit.
@@ -1786,7 +1806,7 @@ describe("init exposure chain", () => {
     const h = makeHarness();
     try {
       const logs: string[] = [];
-      const code = await init({
+      const code = await initForTest({
         configDir: h.configDir,
         // #590: keep the version-check a no-op in init tests — NEVER let the
         // production default fire a real /health fetch + restart the live unit.
@@ -1835,7 +1855,7 @@ describe("init exposure chain", () => {
         hubOrigin: "https://box.tailnet.ts.net",
       };
       const logs: string[] = [];
-      const code = await init({
+      const code = await initForTest({
         configDir: h.configDir,
         // #590: keep the version-check a no-op in init tests — NEVER let the
         // production default fire a real /health fetch + restart the live unit.
@@ -1891,7 +1911,7 @@ describe("init hub#694 — vault seeded before the supervisor boot scan (bug 1)"
     const h = makeHarness();
     try {
       const order: string[] = [];
-      const code = await init({
+      const code = await initForTest({
         configDir: h.configDir,
         ensureHubVersion: async () => ({
           outcome: "match" as const,
@@ -1928,7 +1948,7 @@ describe("init hub#694 — vault seeded before the supervisor boot scan (bug 1)"
     const h = makeHarness();
     try {
       const order: string[] = [];
-      const code = await init({
+      const code = await initForTest({
         configDir: h.configDir,
         ensureHubVersion: async () => ({
           outcome: "match" as const,
@@ -1968,13 +1988,16 @@ describe("init hub#694 — vault seeded before the supervisor boot scan (bug 1)"
   });
 
   test("real seed: vault row is in services.json by the time ensureHub runs", async () => {
-    // End-to-end-ish: drive the REAL defaultInstallVaultModule (bun-linked vault
-    // short-circuits the bun-add) and assert the services.json row exists when
-    // ensureHub is invoked — i.e. the boot scan would find it.
+    // The thing under test is ORDERING: the vault row must exist when
+    // ensureHub runs, so the supervisor's one-time boot scan finds it.
+    // The previous version drove production `defaultInstallVaultModule`
+    // (`bun add -g`), which is what clustered 11 tests at 5000ms on a
+    // slow runner (hub#786). A stub that performs the seed-write still
+    // pins the ordering; the bun-add is not the contract.
     const h = makeHarness();
     try {
       let vaultRowAtEnsure: boolean | undefined;
-      const code = await init({
+      const code = await initForTest({
         configDir: h.configDir,
         ensureHubVersion: async () => ({
           outcome: "match" as const,
@@ -1984,6 +2007,10 @@ describe("init hub#694 — vault seeded before the supervisor boot scan (bug 1)"
         manifestPath: h.manifestPath,
         log: () => {},
         alive: () => false,
+        installVaultModuleImpl: async (_configDir, manifestPath) => {
+          seedVault(manifestPath);
+          return 0;
+        },
         ensureHub: async () => {
           // At hub-unit-boot time the services.json must already carry vault.
           const { findService } = await import("../services-manifest.ts");
@@ -1994,8 +2021,6 @@ describe("init hub#694 — vault seeded before the supervisor boot scan (bug 1)"
         readExposeStateFn: () => undefined,
         isTty: false,
         platform: "linux",
-        // NOTE: no installVaultModuleImpl override — exercise the real install
-        // so we prove the seed write lands before ensureHub, not just the stub.
       });
       expect(code).toBe(0);
       expect(vaultRowAtEnsure).toBe(true);
@@ -2009,7 +2034,7 @@ describe("init hub#694 — vault seeded before the supervisor boot scan (bug 1)"
     try {
       seedVault(h.manifestPath);
       const order: string[] = [];
-      const code = await init({
+      const code = await initForTest({
         configDir: h.configDir,
         ensureHubVersion: async () => ({
           outcome: "match" as const,
@@ -2046,7 +2071,7 @@ describe("init hub#694 — install channel (bug 2)", () => {
     const h = makeHarness();
     try {
       const channels: (string | undefined)[] = [];
-      const code = await init({
+      const code = await initForTest({
         configDir: h.configDir,
         ensureHubVersion: async () => ({
           outcome: "match" as const,
@@ -2080,7 +2105,7 @@ describe("init hub#694 — install channel (bug 2)", () => {
     const h = makeHarness();
     try {
       const channels: (string | undefined)[] = [];
-      const code = await init({
+      const code = await initForTest({
         configDir: h.configDir,
         ensureHubVersion: async () => ({
           outcome: "match" as const,
@@ -2116,7 +2141,7 @@ describe("init hub#694 — install channel (bug 2)", () => {
     const h = makeHarness();
     try {
       const channels: (string | undefined)[] = [];
-      const code = await init({
+      const code = await initForTest({
         configDir: h.configDir,
         ensureHubVersion: async () => ({
           outcome: "match" as const,
@@ -2150,7 +2175,7 @@ describe("init hub#694 — install channel (bug 2)", () => {
     const h = makeHarness();
     try {
       const channels: (string | undefined)[] = [];
-      const code = await init({
+      const code = await initForTest({
         configDir: h.configDir,
         ensureHubVersion: async () => ({
           outcome: "match" as const,
@@ -2246,6 +2271,7 @@ describe("init --vault-name (#478 Part 2)", () => {
       isTty: false,
       platform: "linux" as const,
       installVaultModuleImpl: noopVaultInstall,
+      installAppModuleImpl: noopAppInstall,
       noBrowser: true,
       noExposePrompt: true,
       noWizardPrompt: true,
