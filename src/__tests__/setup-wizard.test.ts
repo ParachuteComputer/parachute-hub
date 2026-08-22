@@ -2644,7 +2644,7 @@ describe("done screen MCP command — OAuth-default, no auto-mint", () => {
       const html = await res.text();
       // The bare OAuth command is the rendered command.
       expect(html).toContain(
-        "claude mcp add --transport http parachute-default https://hub.example/vault/default/mcp",
+        "claude mcp add --transport http parachute-default https://hub.example/mcp",
       );
       // Load-bearing regression (Austen's report): the rendered COMMAND
       // (the MCP tile's <pre> block) must NOT carry a `--header
@@ -3472,7 +3472,7 @@ describe("typed vault name (hub#267)", () => {
       );
       const html = await res.text();
       expect(html).toContain("parachute-my-personal-vault");
-      expect(html).toContain("/vault/my-personal-vault/mcp");
+      expect(html).toContain("https://hub.example/mcp");
     } finally {
       db.close();
     }
