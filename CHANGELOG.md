@@ -8,11 +8,15 @@ All notable changes to `@openparachute/hub` are documented here. The format foll
 
 ## [0.7.16] - 2026-08-21
 
-**Train CI + token de-escalation: `next`-targeted PRs finally get typecheck and
-test coverage, a tag push's release override actually works, and vault-admin
-create stops handing out an unrevocable bootstrap credential.** Three PRs
-over 0.7.15, all independently reviewed pre-merge (the account-token PR
-double-reviewed, including a cross-model pass); zero must-fix escapes.
+**Train CI + token de-escalation on both create doors: `next`-targeted PRs
+finally get typecheck and test coverage, a tag push's release override
+actually works, vault-admin AND host-admin create both stop handing out an
+unrevocable bootstrap credential, `status` stops trusting a stale VERSION
+column for npm installs, and the hub claims a defensive loopback bind against
+the exact hijack that took production down for nine hours.** Nine PRs over
+0.7.15 — the original three independently reviewed pre-merge (the
+account-token PR double-reviewed, including a cross-model pass); the six
+added here each carry their own watch-fail evidence and full local gates.
 
 - **`pr-verify` gates PRs targeting `next`, not just `main` (#843, closes
   hub#838).** The merge train (2026-08-14) routes every feature PR to
@@ -48,6 +52,65 @@ double-reviewed, including a cross-model pass); zero must-fix escapes.
   stored the create-time token must renew via
   `POST /account/vaults/<name>/token` — the app already re-mints, this only
   affects direct API callers holding the old long-lived token.
+
+- **Stale `parachute.computer` links across the setup wizard and account-home
+  UI are repointed at their live, content-verified replacements (#850, closes
+  hub#743).** `docs/deploy`, `onboarding/vault-setup`, and
+  `onboarding/surface-build` all 404'd; each is now retargeted to `/start/`,
+  `/vault/`, and `/surfaces/` respectively — verified by fetching and reading
+  the actual replacement page bodies, not just checking for a 200.
+
+- **The admin-ui-lock design doc's mint-endpoint table is corrected: the real
+  chokepoint is `GET /admin/module-token/agent`, not a fourth standalone
+  route (#851, closes hub#736).** `/admin/channel-token` was retired into the
+  generic module-token mint back in #646, before the channel module was
+  renamed "agent" in #667 — the doc's own proposed replacement
+  (`/admin/agent-token`) was traced and found equally wrong. The table drops
+  from four chokepoints to three; every other route reference in the doc was
+  swept against source and confirmed current.
+
+- **Operator-facing copy leads with the canonical root `/mcp`, not the
+  per-vault form (#852, closes hub#777).** The wizard's done-screen MCP tile
+  and the README's "connect any other client" guide now point
+  `claude mcp add` at `<hubOrigin>/mcp`. Per-vault forms stay where they're
+  load-bearing — the admin SPA's Connect card, `parachute status`'s per-row
+  URL, and the OAuth resource-indicator doc example — each traced
+  individually rather than blanket-replaced.
+
+- **Host-admin vault create gets the same token de-escalation #846 gave
+  account-admin create (#854, closes hub#848).** `POST /vaults` used to hand
+  back the CLI's raw `vault:<name>:admin` bootstrap token verbatim —
+  unbounded TTL, no registry row, unrevocable. Both create doors now mint a
+  hub-signed, registry-recorded, 15-minute handoff instead, tagged with a new
+  `createdVia: vault_create_handoff` so registry forensics stop
+  misattributing it as a CLI mint; a mint failure is now a distinguishable
+  `vault_created_token_mint_failed` 500 rather than falling back to the CLI
+  token. Six watch-fail cases, all red against unmodified `next`, all green
+  after.
+
+- **`status` flags npm-installed services as STALE on version drift, not just
+  bun-linked checkouts (#855, closes hub#839).** `isStale()` bailed out on
+  the first line for anything that wasn't bun-linked, on the premise that
+  npm installs have no live/cached split — false: VERSION is the cache a
+  service stamps on its own boot, SOURCE re-reads the installed
+  `package.json` on every call, and nothing keeps those in sync across an
+  out-of-band `bun add -g` or a failed post-upgrade write-back without a
+  restart. The check is now source-agnostic, with guards for `unknown`
+  sources and the `SEED_VERSION` fresh-install sentinel so a just-installed
+  module can't false-flag.
+
+- **The hub claims an explicit loopback guard bind to defend against the
+  exact hijack that took production down for nine hours (#856, closes
+  hub#741).** On 2026-07-02 a rogue specific bind on `127.0.0.1:1939`
+  silently out-routed the wildcard-bound hub for every module's loopback
+  call; #737 shipped detection, this ships prevention — the hub now also
+  claims `127.0.0.1:<port>` right after its primary bind, serving the same
+  real handler, so a later rogue specific bind fails outright instead of
+  winning loopback routing. Darwin-only for the blocking guarantee itself
+  (Linux `SO_REUSEADDR` semantics are unverified); the co-bind attempt is
+  non-fatal everywhere. Reproduced against real sockets with
+  `connection: close` — a keep-alived `fetch` masked the bug entirely on the
+  first repro attempt by reusing the already-pooled socket to the real hub.
 
 ## [0.7.15] - 2026-08-21
 
