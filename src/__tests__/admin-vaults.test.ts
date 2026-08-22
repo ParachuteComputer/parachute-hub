@@ -10,7 +10,7 @@ import {
   provisionVault,
 } from "../admin-vaults.ts";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
-import { signAccessToken } from "../jwt-sign.ts";
+import { ACCESS_TOKEN_TTL_SECONDS, signAccessToken, validateAccessToken } from "../jwt-sign.ts";
 import { upsertService, writeManifest } from "../services-manifest.ts";
 import { rotateSigningKey } from "../signing-keys.ts";
 
@@ -395,7 +395,9 @@ describe("POST /vaults — orchestration", () => {
         // `parachute install vault`, which seeds the default vault. The
         // `name` requested by the caller is honored on follow-up calls
         // through the create-with-json branch (above); first-vault-on-host
-        // doesn't currently surface a token (install has no --json yet).
+        // emits no JSON (install has no --json yet), so there are no
+        // `paths` — but hub#848's handoff is hub-signed and needs nothing
+        // from the CLI, so a token IS returned here now.
         writeManifest({ services: [] }, h.manifestPath);
         const calls: Array<readonly string[]> = [];
         const runCommand = async (cmd: readonly string[]): Promise<RunResult> => {
@@ -420,11 +422,16 @@ describe("POST /vaults — orchestration", () => {
         });
         expect(res.status).toBe(201);
         expect(calls).toEqual([["parachute", "install", "vault"]]);
-        // Bootstrap path: response carries name/url/version, no token/paths
-        // (install doesn't emit JSON yet — known gap, follow-up issue).
+        // hub#848: no `paths` (install doesn't emit JSON yet — known gap),
+        // but a hub-signed handoff all the same. A credential-less 201 on
+        // the fresh-box path would strand the operator who just bootstrapped
+        // the host, and hub signing doesn't depend on the CLI.
         const body = (await res.json()) as Record<string, unknown>;
-        expect(body.token).toBeUndefined();
         expect(body.paths).toBeUndefined();
+        expect(typeof body.token).toBe("string");
+        expect((body.token as string).length).toBeGreaterThan(0);
+        const validated = await validateAccessToken(db, body.token as string, ISSUER);
+        expect(validated.payload.scope).toBe("vault:default:admin");
       } finally {
         db.close();
       }
@@ -433,7 +440,12 @@ describe("POST /vaults — orchestration", () => {
     }
   });
 
-  test("201 response includes token + paths from `parachute-vault create --json` stdout", async () => {
+  // hub#848 (finishing hub#827/hub#846 on the host-admin door): the 201 used
+  // to hand back `createJson.token` — the CLI's unbounded, unregistered,
+  // unrevocable bootstrap credential — verbatim. It must now be a hub-signed,
+  // registry-recorded, TTL-bounded `vault:<name>:admin` handoff, and the CLI
+  // bootstrap must appear nowhere in the response.
+  test("201 mints a bounded registered vault:admin handoff, never the CLI bootstrap", async () => {
     const h = makeHarness();
     try {
       const db = openHubDb(hubDbPath(h.dir));
@@ -475,10 +487,32 @@ describe("POST /vaults — orchestration", () => {
         expect(res.status).toBe(201);
         const body = (await res.json()) as {
           name: string;
-          token?: string;
+          token: string;
+          token_guidance?: string;
           paths?: { vault_dir: string; vault_db: string; vault_config: string };
         };
-        expect(body.token).toBe("hubjwt.work.access");
+        // The CLI bootstrap is nowhere in the response — not in `token`, not
+        // smuggled into guidance or any other field.
+        expect(body.token).not.toBe("hubjwt.work.access");
+        expect(JSON.stringify(body)).not.toContain("hubjwt.work.access");
+        // What came back is a hub-signed, vault-audience-bound admin token.
+        const validated = await validateAccessToken(db, body.token, ISSUER);
+        expect(validated.payload.scope).toBe("vault:work:admin");
+        expect(validated.payload.aud).toBe("vault.work");
+        expect(validated.payload.vault_scope).toEqual(["work"]);
+        // Bounded: one access-token lifetime, not the bootstrap's forever.
+        const lifetime = (validated.payload.exp ?? 0) - (validated.payload.iat ?? 0);
+        expect(lifetime).toBe(ACCESS_TOKEN_TTL_SECONDS);
+        // Registry-recorded → revocable, and attributed to the CALLER.
+        const row = findTokenRowByJti(db, validated.payload.jti ?? "");
+        expect(row).not.toBeNull();
+        expect(row?.createdVia).toBe("vault_create_handoff");
+        expect(row?.clientId).toBe("test-client");
+        expect(row?.subject).toBe("user-admin");
+        expect(row?.scopes).toEqual(["vault:work:admin"]);
+        // Guidance describes the credential the hub actually handed back.
+        expect(body.token_guidance ?? "").toContain("admin access");
+        expect(body.token_guidance ?? "").toContain("15 minutes");
         expect(body.paths).toEqual({
           vault_dir: "/home/test/.parachute/vault/work",
           vault_db: "/home/test/.parachute/vault/work/vault.db",
@@ -492,11 +526,12 @@ describe("POST /vaults — orchestration", () => {
     }
   });
 
-  test("201 forwards an empty token + token_guidance when the vault couldn't mint (post-DROP)", async () => {
+  test("201 still mints a hub-signed handoff when the CLI bootstrap is empty", async () => {
     // The vault emits `token: ""` + a `token_guidance` reason when no hub
-    // origin was reachable to mint against (e.g. loopback create). The hub
-    // must forward both verbatim so the SPA can render the
-    // created-but-no-token state instead of confusing it with a re-POST.
+    // origin was reachable for IT to mint against (e.g. loopback create).
+    // hub#848: that is the vault's problem, not the hub's — hub signing needs
+    // no origin round-trip, so the door mints anyway. The CLI's guidance is
+    // NOT forwarded: it would claim no token was issued when one was.
     const h = makeHarness();
     try {
       const db = openHubDb(hubDbPath(h.dir));
@@ -537,9 +572,80 @@ describe("POST /vaults — orchestration", () => {
         });
         // Still a fresh create — HTTP 201, NOT 200.
         expect(res.status).toBe(201);
-        const body = (await res.json()) as { token?: string; token_guidance?: string };
-        expect(body.token).toBe("");
-        expect(body.token_guidance).toBe("no hub origin reachable to mint against");
+        const body = (await res.json()) as { token: string; token_guidance?: string };
+        expect(body.token.length).toBeGreaterThan(0);
+        const validated = await validateAccessToken(db, body.token, ISSUER);
+        expect(validated.payload.scope).toBe("vault:work:admin");
+        // The CLI's prose never rides along.
+        expect(body.token_guidance ?? "").not.toContain("no hub origin reachable");
+        expect(JSON.stringify(body)).not.toContain("no hub origin reachable");
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("500 vault_created_token_mint_failed when the registry write fails — and no CLI token leaks", async () => {
+    // The provision already committed; a mint failure must be a NAMED 500, not
+    // a generic one (a caller reading "create failed" would retry into the
+    // idempotent 200 and never get a credential). And the failure path must
+    // not fall back to handing out the CLI bootstrap as a consolation — that
+    // would undo the whole fix on exactly the path nobody exercises.
+    const h = makeHarness();
+    try {
+      const db = openHubDb(hubDbPath(h.dir));
+      try {
+        rotateSigningKey(db);
+        upsertService(
+          {
+            name: "parachute-vault",
+            port: 1940,
+            paths: ["/vault/default"],
+            health: "/health",
+            version: "0.3.5",
+          },
+          h.manifestPath,
+        );
+        const runCommand = async (_cmd: readonly string[]): Promise<RunResult> => {
+          upsertService(
+            {
+              name: "parachute-vault",
+              port: 1940,
+              paths: ["/vault/default", "/vault/work"],
+              health: "/health",
+              version: "0.3.5",
+            },
+            h.manifestPath,
+          );
+          return {
+            exitCode: 0,
+            stdout: vaultCreateJson("work", "hubjwt.work.access"),
+            stderr: "",
+          };
+        };
+        // Make the registry INSERT abort — the mint's non-atomic second step.
+        db.run(
+          `CREATE TRIGGER fail_token_insert BEFORE INSERT ON tokens
+           BEGIN SELECT RAISE(ABORT, 'simulated registry failure'); END`,
+        );
+        const res = await call({
+          db,
+          manifestPath: h.manifestPath,
+          body: { name: "work" },
+          runCommand,
+        });
+        expect(res.status).toBe(500);
+        const body = (await res.json()) as {
+          error: string;
+          vault: string;
+          error_description: string;
+        };
+        expect(body.error).toBe("vault_created_token_mint_failed");
+        expect(body.vault).toBe("work");
+        expect(body.error_description).toContain("WAS created");
+        expect(JSON.stringify(body)).not.toContain("hubjwt.work.access");
       } finally {
         db.close();
       }

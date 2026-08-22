@@ -187,7 +187,18 @@ export type TokenCreatedVia =
   // (in-framework, approval-gated, per-turn-injected) and `cli_mint` (generic),
   // so `parachute surface token list` can show exactly these. Registered here so
   // `surface token revoke` (and the revocation list) can drop it.
-  | "surface_token";
+  | "surface_token"
+  // Create-time vault handoff (hub#846 + hub#848) — the bounded
+  // `vault:<name>:{admin|read,write}` credential a create door hands its
+  // caller in the 201, on BOTH doors: host-admin `POST /vaults`
+  // (`admin-vaults.ts`) and account `POST /account/vaults`
+  // (`account-api.ts`). Distinct from `cli_mint` on purpose: these rows are
+  // hub-SIGNED at the moment of provisioning, not minted through the CLI /
+  // `POST /api/auth/mint-token` path, and hub#846's review flagged that
+  // labelling them `cli_mint` misattributes them in registry forensics —
+  // exactly backwards, since the whole point of both fixes is that the CLI
+  // bootstrap token never leaves the hub.
+  | "vault_create_handoff";
 
 export interface SignedRefreshToken {
   /** Opaque token to return to the client. NOT recoverable from the DB. */

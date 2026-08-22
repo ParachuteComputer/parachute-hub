@@ -374,9 +374,12 @@ What it does:
   as STATE=failing and exit 1.
 
   A "STALE: services.json cached … live package.json …" continuation line
-  appears under a row when a bun-linked service has been rebuilt but the
-  manifest's cached version hasn't caught up — re-install (\`parachute
-  install <pkg>\`) refreshes the row.
+  appears under a row when the version the manifest has cached (what the
+  running process last stamped) has fallen behind the version installed on
+  disk. Two ways to get there: a bun-linked service rebuilt without the
+  manifest catching up, or an npm module whose package was upgraded out of
+  band without a restart. Either way \`parachute restart <svc>\` (or a
+  re-install, \`parachute install <pkg>\`) refreshes the row.
 
 Exit codes:
   0   all probed services healthy (or none running)

@@ -1001,7 +1001,7 @@ export function renderExposeStep(props: RenderExposeStepProps): string {
             <span class="expose-option-title">Public URL (custom domain)</span>
             <span class="expose-option-desc">Run the hub behind a reverse
               proxy on a domain you own. See the
-              <a href="https://parachute.computer/docs/deploy" target="_blank" rel="noopener">deploy guide</a>
+              <a href="https://parachute.computer/start/" target="_blank" rel="noopener">deploy guide</a>
               for nginx / Caddy / Cloudflare Tunnel examples + the env
               vars (<code>PARACHUTE_HUB_ORIGIN</code>) the hub reads for
               its own canonical URL.</span>
@@ -1146,10 +1146,18 @@ export function renderDoneStep(props: RenderDoneStepProps): string {
  * default, and baking an admin-scope bearer into a copy-pasted command
  * was a privilege over-grant + a shoulder-surf hazard. The bare OAuth
  * command was always the correct UX; it's now the only one.
+ *
+ * URL shape (hub#777): points at the canonical root `<hubOrigin>/mcp`
+ * rather than the per-vault `/vault/<name>/mcp` form — root `/mcp` is
+ * vault-agnostic (the OAuth consent picks the audience), so it stays
+ * correct even if the operator renames this vault or adds more later.
+ * At this point in the wizard there's exactly one vault, so the OAuth
+ * consent screen has nothing to pick between. The server name stays
+ * `parachute-<vault>` so the connection is still labeled by vault.
  */
 function renderMcpTile(vaultName: string, hubOrigin: string): string {
   const safeVault = escapeHtml(vaultName);
-  const bareCmd = `claude mcp add --transport http parachute-${vaultName} ${hubOrigin}/vault/${vaultName}/mcp`;
+  const bareCmd = `claude mcp add --transport http parachute-${vaultName} ${hubOrigin}/mcp`;
   return `<div class="done-tile">
     <h2>Connect Claude Code (MCP)</h2>
     <p>Wire <code>vault:${safeVault}</code> into Claude Code as an MCP server:</p>
@@ -1212,10 +1220,10 @@ function renderStartUsingTile(vaultName: string, hubOrigin: string): string {
  *
  *   1. "Help me set up my vault" — AI interviews the operator about
  *      where their data lives + proposes a tag/path structure
- *      (parachute.computer/onboarding/vault-setup/).
+ *      (parachute.computer/vault/).
  *   2. "Build a custom UI" — AI builds a static SPA against the vault's
  *      HTTP API, hosted on the operator's own GitHub Pages
- *      (parachute.computer/onboarding/surface-build/).
+ *      (parachute.computer/surfaces/).
  *
  * Aaron 2026-05-27 directive: ship these as the "first AI assist"
  * surface so freshly-onboarded operators have a clear next thing to
@@ -1228,12 +1236,12 @@ function renderStarterPromptsSection(): string {
     <h2>Get help from your AI</h2>
     <p class="starter-prompts-subtitle">Two interview-style prompts to paste into Claude Code or Codex once your vault's MCP is wired up.</p>
     <div class="starter-prompts-grid">
-      <a class="starter-prompt-tile" href="https://parachute.computer/onboarding/vault-setup/" target="_blank" rel="noopener">
+      <a class="starter-prompt-tile" href="https://parachute.computer/vault/" target="_blank" rel="noopener">
         <h3>Set up your vault</h3>
         <p>Interview-style. AI asks where your notes live now + proposes a tag &amp; path structure that fits how you actually think.</p>
         <p class="starter-prompt-cta">Open prompt ↗</p>
       </a>
-      <a class="starter-prompt-tile" href="https://parachute.computer/onboarding/surface-build/" target="_blank" rel="noopener">
+      <a class="starter-prompt-tile" href="https://parachute.computer/surfaces/" target="_blank" rel="noopener">
         <h3>Build a custom UI</h3>
         <p>AI generates a static SPA hosted on your own GitHub Pages — talks to your vault over HTTP. Notes UI works as a reference.</p>
         <p class="starter-prompt-cta">Open prompt ↗</p>
@@ -1406,7 +1414,7 @@ function renderReachableTile(mode: SetupExposeMode, hubOrigin: string): string {
       <p class="fine">Wire a reverse proxy on your domain to
         <code>${safeOrigin}</code>, then set <code>PARACHUTE_HUB_ORIGIN</code>
         to your public URL and restart the hub. See the
-        <a href="https://parachute.computer/docs/deploy">deploy guide</a>
+        <a href="https://parachute.computer/start/">deploy guide</a>
         for nginx / Caddy / Cloudflare Tunnel examples.</p>
     </section>`;
 }

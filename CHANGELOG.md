@@ -6,6 +6,112 @@ All notable changes to `@openparachute/hub` are documented here. The format foll
 >
 > This backfill covers the 0.6.x line only. Two pre-existing gaps remain undocumented and are **not** addressed here: the `0.5.13` stable itself (the file's newest entry is `0.5.13-rc.48`, never the stable) and the entire `0.5.14-rc` chain (rc.1–rc.21 on npm), which never promoted to a `0.5.14` stable — its work folded forward into 0.6.0.
 
+## [0.7.16] - 2026-08-21
+
+**Train CI + token de-escalation on both create doors: `next`-targeted PRs
+finally get typecheck and test coverage, a tag push's release override
+actually works, vault-admin AND host-admin create both stop handing out an
+unrevocable bootstrap credential, `status` stops trusting a stale VERSION
+column for npm installs, and the hub claims a defensive loopback bind against
+the exact hijack that took production down for nine hours.** Nine PRs over
+0.7.15 — the original three independently reviewed pre-merge (the
+account-token PR double-reviewed, including a cross-model pass); the six
+added here each carry their own watch-fail evidence and full local gates.
+
+- **`pr-verify` gates PRs targeting `next`, not just `main` (#843, closes
+  hub#838).** The merge train (2026-08-14) routes every feature PR to
+  `next`, but the workflow's trigger was still `pull_request: branches:
+  [main]` — typecheck and unit tests silently never ran for #834–#837.
+  Adding `next` to the trigger branches was the only gap; no other step
+  makes a main-specific assumption. Audit turned up the same gap in
+  `parachute-vault` (flagged for a follow-up there, out of scope here) and
+  confirmed `parachute-cloud` has no branch filter at all, so it was
+  already unaffected.
+
+- **The `--tag-push` release override is wired for real (#844, closes
+  hub#841).** `decidePublish`'s tag short-circuit was unreachable in CI —
+  the `plan` job's four `release-plan.ts` invocations never passed
+  `--tag-push`, so a tag push of an unpublished-older version silently
+  skipped every publish, contradicting both the job's own comment and
+  RELEASING.md. The flag is now passed on all four invocations, the stale
+  comment is fixed, RELEASING.md is flipped back to describing the real
+  override, and a workflow-text test pins the wiring itself (the flag's
+  parsing and `decidePublish`'s `isTagPush` branch were already unit-tested
+  — the gap was specifically that the workflow never invoked it).
+
+- **Admin-tier vault create stops returning the raw CLI bootstrap token
+  (#846, closes hub#827).** `POST /account/vaults` used to hand admin-tier
+  callers the CLI's `vault:<name>:admin` bootstrap credential verbatim —
+  unbounded TTL, never in the token registry, unrevocable. That was fine
+  while account-admin was cookie-minted only, but `account:self:admin` is
+  now OAuth-requestable, so a third-party admin-tier app walked away with
+  the exact credential class the write-tier branch already de-escalates.
+  Both tiers now receive a hub-signed, registry-recorded handoff bounded at
+  `ACCESS_TOKEN_TTL_SECONDS` (15 min); the CLI bootstrap is never in the
+  201 body or the mint-failure 500. **Operator-visible:** API callers that
+  stored the create-time token must renew via
+  `POST /account/vaults/<name>/token` — the app already re-mints, this only
+  affects direct API callers holding the old long-lived token.
+
+- **Stale `parachute.computer` links across the setup wizard and account-home
+  UI are repointed at their live, content-verified replacements (#850, closes
+  hub#743).** `docs/deploy`, `onboarding/vault-setup`, and
+  `onboarding/surface-build` all 404'd; each is now retargeted to `/start/`,
+  `/vault/`, and `/surfaces/` respectively — verified by fetching and reading
+  the actual replacement page bodies, not just checking for a 200.
+
+- **The admin-ui-lock design doc's mint-endpoint table is corrected: the real
+  chokepoint is `GET /admin/module-token/agent`, not a fourth standalone
+  route (#851, closes hub#736).** `/admin/channel-token` was retired into the
+  generic module-token mint back in #646, before the channel module was
+  renamed "agent" in #667 — the doc's own proposed replacement
+  (`/admin/agent-token`) was traced and found equally wrong. The table drops
+  from four chokepoints to three; every other route reference in the doc was
+  swept against source and confirmed current.
+
+- **Operator-facing copy leads with the canonical root `/mcp`, not the
+  per-vault form (#852, closes hub#777).** The wizard's done-screen MCP tile
+  and the README's "connect any other client" guide now point
+  `claude mcp add` at `<hubOrigin>/mcp`. Per-vault forms stay where they're
+  load-bearing — the admin SPA's Connect card, `parachute status`'s per-row
+  URL, and the OAuth resource-indicator doc example — each traced
+  individually rather than blanket-replaced.
+
+- **Host-admin vault create gets the same token de-escalation #846 gave
+  account-admin create (#854, closes hub#848).** `POST /vaults` used to hand
+  back the CLI's raw `vault:<name>:admin` bootstrap token verbatim —
+  unbounded TTL, no registry row, unrevocable. Both create doors now mint a
+  hub-signed, registry-recorded, 15-minute handoff instead, tagged with a new
+  `createdVia: vault_create_handoff` so registry forensics stop
+  misattributing it as a CLI mint; a mint failure is now a distinguishable
+  `vault_created_token_mint_failed` 500 rather than falling back to the CLI
+  token. Six watch-fail cases, all red against unmodified `next`, all green
+  after.
+
+- **`status` flags npm-installed services as STALE on version drift, not just
+  bun-linked checkouts (#855, closes hub#839).** `isStale()` bailed out on
+  the first line for anything that wasn't bun-linked, on the premise that
+  npm installs have no live/cached split — false: VERSION is the cache a
+  service stamps on its own boot, SOURCE re-reads the installed
+  `package.json` on every call, and nothing keeps those in sync across an
+  out-of-band `bun add -g` or a failed post-upgrade write-back without a
+  restart. The check is now source-agnostic, with guards for `unknown`
+  sources and the `SEED_VERSION` fresh-install sentinel so a just-installed
+  module can't false-flag.
+
+- **The hub claims an explicit loopback guard bind to defend against the
+  exact hijack that took production down for nine hours (#856, closes
+  hub#741).** On 2026-07-02 a rogue specific bind on `127.0.0.1:1939`
+  silently out-routed the wildcard-bound hub for every module's loopback
+  call; #737 shipped detection, this ships prevention — the hub now also
+  claims `127.0.0.1:<port>` right after its primary bind, serving the same
+  real handler, so a later rogue specific bind fails outright instead of
+  winning loopback routing. Darwin-only for the blocking guarantee itself
+  (Linux `SO_REUSEADDR` semantics are unverified); the co-bind attempt is
+  non-fatal everywhere. Reproduced against real sockets with
+  `connection: close` — a keep-alived `fetch` masked the bug entirely on the
+  first repro attempt by reusing the already-pooled socket to the real hub.
+
 ## [0.7.15] - 2026-08-21
 
 **Deploy safety: published images get real version tags, `status` stops

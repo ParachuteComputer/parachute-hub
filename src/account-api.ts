@@ -80,9 +80,9 @@ import { isVaultEntry, vaultInstanceNameFor } from "./well-known.ts";
 const ACCOUNT_API_CLIENT_ID = "parachute-account";
 
 /**
- * Lifetime of the create-time vault credential handed to a WRITE-tier caller
- * (`POST /account/vaults`, the D2 handoff). One access-token lifetime — NOT the
- * 90-day `ACCOUNT_VAULT_TOKEN_TTL_SECONDS` the admin-gated
+ * Lifetime of the create-time vault credential handed on `POST /account/vaults`
+ * (the D2 handoff) for BOTH tiers. One access-token lifetime — NOT the 90-day
+ * `ACCOUNT_VAULT_TOKEN_TTL_SECONDS` the admin-gated
  * `POST /account/vaults/<name>/token` route uses.
  *
  * The write tier's consent label promises the app "cannot ... mint access
@@ -92,7 +92,9 @@ const ACCOUNT_API_CLIENT_ID = "parachute-account";
  * months. Bounding the handoff to one access-token lifetime keeps the
  * credential inside the window the user consented to, and matches cloud, whose
  * `ACCOUNT_VAULT_TOKEN_TTL_SECONDS` IS `ACCESS_TOKEN_TTL_SECONDS`
- * (`workers/identity/src/account-api.ts`).
+ * (`workers/identity/src/account-api.ts`). Admin-tier uses the same bound
+ * because `account:self:admin` is now OAuth-requestable (hub#827); renewal
+ * to the 90-day TTL stays on the admin-gated mint route, which is registered.
  *
  * Bounded residual: the handoff is minted fresh at create time, so it can
  * outlive the caller's *current* bearer by up to one full access-token
@@ -459,23 +461,27 @@ async function parseNameBody(req: Request): Promise<NameBody | BodyErr> {
  * Create a vault and return a ready-to-use vault token (the hinge, D2): the app
  * lands the user IN the vault with zero extra round-trips. Wraps the auth-free
  * `provisionVault` core (this facade already ran the scope gate). The hub's
- * create CLI mints a `vault:<name>:admin` bootstrap token; admin-tier account
- * callers receive that raw token unchanged. A write-tier-only caller instead
- * receives a fresh hub-signed `vault:<name>:{read,write}` token for the new
- * vault, registry-recorded against the REQUESTING client and capped at
- * `WRITE_TIER_VAULT_HANDOFF_TTL_SECONDS`.
+ * create CLI still mints a `vault:<name>:admin` bootstrap token, but that
+ * credential stays INTERNAL — it is never returned on this door (hub#827).
+ * Both tiers receive a hub-signed, registry-recorded handoff capped at
+ * `WRITE_TIER_VAULT_HANDOFF_TTL_SECONDS`, scoped to the granted tier:
+ *   - admin: `vault:<name>:admin`
+ *   - write: `vault:<name>:{read,write}`
  *
- * This is the credential-de-escalation the write tier's consent label
- * requires. Without it the write tier hands back the CLI's full-admin
- * bootstrap credential — an unbounded, hub-registry-invisible
- * `vault:<name>:admin` token — for a grant whose label says the app "cannot
- * ... mint access tokens that outlive this app's access". The de-escalated
- * token matches the tier the user actually granted (write, not admin), lives
- * one access-token lifetime, and is revocable because it has a registry row.
+ * The CLI bootstrap is unbounded, hub-registry-invisible, and therefore
+ * unrevocable. That was fine when account-admin was cookie-minted only;
+ * `account:self:admin` is now OAuth-requestable, so a third-party admin-tier
+ * app would walk away with exactly the credential class the write-tier
+ * branch de-escalates. The handoff matches the granted verb, lives one
+ * access-token lifetime, and is revocable because it has a registry row
+ * against the REQUESTING client. Admin-tier renewal is
+ * `POST /account/vaults/<name>/token` (90-day `ACCOUNT_VAULT_TOKEN_TTL_SECONDS`);
+ * write-tier cannot renew (that route stays admin-gated).
  *
  * Post-`pvt_*`-DROP the CLI token can be `""` when no hub origin was
- * reachable; `token_guidance` remains forwarded verbatim, and an empty CLI
- * token stays empty (nothing to de-escalate).
+ * reachable. Admin-tier still mints a hub-signed handoff (signing does not
+ * need the CLI). Write-tier still returns empty — there is nothing to
+ * de-escalate, and that tier cannot re-mint.
  *
  * ---------------------------------------------------------------------------
  * HUB/CLOUD DRIFT #1 — create-vault authority and the returned credential.
@@ -490,14 +496,15 @@ async function parseNameBody(req: Request): Promise<NameBody | BodyErr> {
  *   - Credential: cloud ALWAYS mints `vault:<name>:{read,write}` and never
  *     returns an admin credential, because it has no host filesystem and no
  *     `parachute-vault create --json` CLI to bootstrap from. Hub's admin-tier
- *     branch below deliberately keeps forwarding the CLI bootstrap token
- *     (existing behavior, hub-only); the write-tier branch converges on
- *     cloud's read+write shape.
+ *     branch mints `vault:<name>:admin` the same way (bounded, registered);
+ *     the write-tier branch converges on cloud's read+write shape. Neither
+ *     tier returns the CLI bootstrap token.
  *   - Lifetime: hub's `ACCOUNT_VAULT_TOKEN_TTL_SECONDS` is 90 days (the
  *     friend-mint default) where cloud's is `ACCESS_TOKEN_TTL_SECONDS`. The
- *     write-tier handoff below uses the cloud value; the admin-gated
- *     `POST /account/vaults/<name>/token` route keeps hub's 90 days. That
- *     older TTL drift is pre-existing and deliberately untouched here.
+ *     create-time handoff below uses the cloud value for BOTH tiers; the
+ *     admin-gated `POST /account/vaults/<name>/token` route keeps hub's 90
+ *     days. That older TTL drift is pre-existing and deliberately untouched
+ *     here.
  */
 export async function handleAccountCreateVault(
   req: Request,
@@ -556,9 +563,17 @@ export async function handleAccountCreateVault(
   const entry = provisioned.entry;
   const meta: VaultMeta = { name: entry.name, url: entry.url, version: entry.version };
   const authorizedWithAdminScope = ADMIN_SCOPES.some((scope) => auth.scopes.includes(scope));
-  let vaultToken = provisioned.createJson?.token ?? "";
-  if (!authorizedWithAdminScope && vaultToken.length > 0) {
-    const scopes = [`vault:${entry.name}:read`, `vault:${entry.name}:write`];
+  // CLI bootstrap token stays INTERNAL. Never returned, never copied into the
+  // error body — a mint-failure consolation that leaked it would undo hub#827.
+  const cliToken = provisioned.createJson?.token ?? "";
+  let vaultToken = "";
+  // Admin-tier always mints (hub signing does not need the CLI). Write-tier
+  // only de-escalates when the CLI actually produced a credential.
+  const mintHandoff = authorizedWithAdminScope || cliToken.length > 0;
+  if (mintHandoff) {
+    const scopes = authorizedWithAdminScope
+      ? [`vault:${entry.name}:admin`]
+      : [`vault:${entry.name}:read`, `vault:${entry.name}:write`];
     // OAuth bearers carry their requesting client_id. Legacy self-issued
     // account bearers may omit it; retain the existing account-surface id only
     // for that fallback while preserving the caller's id whenever present.
@@ -570,10 +585,10 @@ export async function handleAccountCreateVault(
     // destructive action taken on a guess). So a throw here MUST NOT surface as
     // a generic 500: the caller would read it as "create failed", retry, and
     // get a 409 `vault_taken` for a vault it does own but has no credential
-    // for — and at write tier `POST /account/vaults/<name>/token` is
-    // admin-gated, so there is no way to recover a credential. That is a dead
-    // end. The distinguishable error below tells caller and operator exactly
-    // what state the box is in: the vault EXISTS, only the handoff failed.
+    // for. Write tier cannot recover (`POST /account/vaults/<name>/token` is
+    // admin-gated). Admin tier can, via that route. The distinguishable error
+    // below tells caller and operator exactly what state the box is in: the
+    // vault EXISTS, only the handoff failed.
     try {
       const minted = await signAccessToken(deps.db, {
         sub: auth.sub,
@@ -588,7 +603,10 @@ export async function handleAccountCreateVault(
       const subjectIsUser = getUserById(deps.db, auth.sub) !== null;
       recordTokenMint(deps.db, {
         jti: minted.jti,
-        createdVia: "cli_mint",
+        // hub#848: distinct from `cli_mint` — this row is a hub-signed
+        // create-time handoff, not a CLI mint. Same label the host-admin
+        // door stamps, so registry forensics can find both.
+        createdVia: "vault_create_handoff",
         subject: auth.sub,
         ...(subjectIsUser ? { userId: auth.sub } : {}),
         clientId,
@@ -600,7 +618,7 @@ export async function handleAccountCreateVault(
     } catch (err) {
       const detail = err instanceof Error ? err.message : String(err);
       console.error(
-        `[account-api] vault "${entry.name}" was created but the write-tier token handoff failed: ${detail}`,
+        `[account-api] vault "${entry.name}" was created but the token handoff failed: ${detail}`,
       );
       return json(500, {
         error: "vault_created_token_mint_failed",
@@ -609,19 +627,15 @@ export async function handleAccountCreateVault(
       });
     }
   }
-  // `token_guidance` is the CLI's prose for the bootstrap token it returns, and
-  // it points at the admin-gated per-vault mint route. Forwarding it verbatim to
-  // a write-tier caller hands out advice that 403s for that caller (see the
-  // 409 branch above for why that route stays admin-only). Forward it only to
-  // the tier it is true for; write tier gets guidance matching what it actually
-  // holds. This matters most on the empty-token path (no reachable hub origin
-  // for the CLI to mint against), where the response would otherwise be a 201
-  // shaped exactly like a working handoff — empty credential, plus instructions
-  // the caller cannot follow.
+  // Never forward the CLI's `token_guidance` — it describes the bootstrap
+  // token this door no longer returns, and for write-tier it points at a
+  // mint route that 403s. Each tier gets guidance matching the credential
+  // it actually holds.
+  const handoffMinutes = Math.round(WRITE_TIER_VAULT_HANDOFF_TTL_SECONDS / 60);
   const tokenGuidance = authorizedWithAdminScope
-    ? provisioned.createJson?.token_guidance
+    ? `This token grants admin access to this vault only, expires in ${handoffMinutes} minutes, and is registered against this app so it can be revoked. Renew with POST /account/vaults/${entry.name}/token.`
     : vaultToken.length > 0
-      ? `This token grants read+write access to this vault only, and expires in ${Math.round(WRITE_TIER_VAULT_HANDOFF_TTL_SECONDS / 60)} minutes. It is the one credential this vault hands you at creation — it cannot be renewed at this tier.`
+      ? `This token grants read+write access to this vault only, and expires in ${handoffMinutes} minutes. It is the one credential this vault hands you at creation — it cannot be renewed at this tier.`
       : "No access token could be issued for this vault. The vault WAS created, but your grant does not permit minting a credential for it after the fact. Ask an operator to mint one for you.";
   const body: {
     name: string;
