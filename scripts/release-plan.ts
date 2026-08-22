@@ -25,6 +25,32 @@
  * via an explicit tag push, which takes the tag branch below.)
  */
 
+import { appendFileSync } from "node:fs";
+
+/**
+ * Append `key=value` lines to a GitHub Actions output file.
+ *
+ * APPEND, not write. This used to be `Bun.write`, which TRUNCATES — so
+ * emitting three outputs in a row left only the last one in `$GITHUB_OUTPUT`.
+ * `version` and `dist_tag` never reached the workflow at all; only
+ * `should_publish` did, which is why nothing noticed (it's the one output
+ * anything consumed). Latent until hub#829 made `publish-image` derive its
+ * image tags from `version`.
+ *
+ * Exported so the append behaviour is testable without spawning the CLI (which
+ * would need the network to read the registry).
+ */
+export function emitOutputs(
+  path: string | undefined,
+  entries: ReadonlyArray<readonly [string, string]>,
+  log: (line: string) => void = console.log,
+): void {
+  for (const [key, value] of entries) {
+    if (path) appendFileSync(path, `${key}=${value}\n`);
+    log(`${key}=${value}`);
+  }
+}
+
 /** Where a version stands relative to what's already published. */
 export type PublishDecision =
   | { publish: true; reason: string }
@@ -185,12 +211,6 @@ if (import.meta.main) {
     isTagPush: rest.includes("--tag-push"),
   });
 
-  const out = process.env.GITHUB_OUTPUT;
-  const emit = async (k: string, v: string) => {
-    if (out) await Bun.write(out, `${k}=${v}\n`, { createPath: false });
-    console.log(`${k}=${v}`);
-  };
-
   if ("refuse" in decision) {
     console.error(`::error::${npmName}@${version}: ${decision.reason}`);
     process.exit(1);
@@ -222,8 +242,10 @@ if (import.meta.main) {
       // clone just means we can't tell, not that something is wrong.
     }
   }
-  await emit("version", version);
-  await emit("dist_tag", distTagFor(version));
-  await emit("should_publish", String(decision.publish));
+  emitOutputs(process.env.GITHUB_OUTPUT, [
+    ["version", version],
+    ["dist_tag", distTagFor(version)],
+    ["should_publish", String(decision.publish)],
+  ]);
   console.log(`${npmName}@${version}: ${decision.reason}`);
 }

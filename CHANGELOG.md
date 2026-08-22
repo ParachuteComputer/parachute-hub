@@ -6,6 +6,51 @@ All notable changes to `@openparachute/hub` are documented here. The format foll
 >
 > This backfill covers the 0.6.x line only. Two pre-existing gaps remain undocumented and are **not** addressed here: the `0.5.13` stable itself (the file's newest entry is `0.5.13-rc.48`, never the stable) and the entire `0.5.14-rc` chain (rc.1–rc.21 on npm), which never promoted to a `0.5.14` stable — its work folded forward into 0.6.0.
 
+## [0.7.15] - 2026-08-21
+
+**Deploy safety: published images get real version tags, `status` stops
+lying after upgrades, and the app door stops answering the whole network.**
+Four PRs over 0.7.14, all independently reviewed with sandboxed full-suite
+runs (CI does not yet gate `next`-targeted PRs — hub#838).
+
+- **Merge-published images get a versioned ghcr tag (#835, closes hub#829).**
+  Merge-triggered publishes derived image tags with `type=ref,event=tag`, so
+  on a merge run only `:stable` was pushed — rollback-by-tag had nothing to
+  roll back to. Every publish now emits `:vX.Y.Z` derived from the release
+  plan's version, `:rc` or `:stable`+`:latest` gated on prerelease-ness, with
+  a guard that fails the job if the version is ever empty. Along the way a
+  latent bug got fixed: `release-plan.ts` emitted its outputs with
+  `Bun.write`, which truncates — of three sequential outputs only the last
+  survived into `$GITHUB_OUTPUT` (hub#830 item 3; the other two #830 items
+  remain open). RELEASING.md now describes the flow as wired, including the
+  fact that a tag push does **not** bypass the release-plan guards (hub#841).
+
+- **`status` VERSION refreshes after an upgrade (#836, closes hub#831).**
+  The VERSION column reads the cached services.json row, which only a
+  module's own boot ever wrote — and shim-served modules (`app`, `notes`)
+  have no boot, so their row stayed stale forever (`0.22.10 active … npm
+  (0.22.11)` on a real deploy). `upgrade` now refreshes the row, only after
+  a successful restart, re-reading it post-restart so a self-registering
+  module is never clobbered. The `isStale()` warning still can't fire for
+  npm installs — hub#839 tracks that separately.
+
+- **Changed: the app/notes static server (`:1944`) binds `127.0.0.1` by
+  default instead of all interfaces (#837, closes hub#832).** It ignored
+  `PARACHUTE_BIND_HOST` entirely and bound `*`. It now honors `--host`, then
+  `PARACHUTE_BIND_HOST`, then loopback — the same precedence as the hub
+  server. Reach the app through the hub front door (`:1939/app`) or
+  `parachute expose` as documented; if you intentionally accessed `:1944`
+  from off-box, set `PARACHUTE_BIND_HOST` (or pass `--host`) to restore the
+  wider bind. Every packaged deployment path (managed unit, Docker, Render,
+  Fly) already sets the bind host explicitly and is unaffected.
+
+- **Init tests stub the real installer (#834, closes hub#786).** Eleven
+  init/init-exposure tests shared a real `bun add -g` (network + disk) and
+  timed out together at 5000ms on slow runners, once blocking a stable
+  publish. `initForTest()` stubs the vault+app install by default; the real
+  install path stays covered by the e2e tag-push workflow and the container
+  smoke.
+
 ## [0.7.14] - 2026-08-12
 
 **The account verb ladder grows a middle rung, and strict MCP clients can
