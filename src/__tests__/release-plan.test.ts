@@ -14,8 +14,10 @@ import {
   compareVersions,
   decidePublish,
   distTagFor,
+  driftLogArgs,
   emitOutputs,
   readRegistry,
+  tagPrefixFor,
   unpublishedDrift,
 } from "../../scripts/release-plan.ts";
 
@@ -178,6 +180,113 @@ describe("unpublishedDrift", () => {
 
   test("blank lines from git's trailing newline don't inflate the count", () => {
     expect(unpublishedDrift(["abc one", ""]).count).toBe(1);
+  });
+});
+
+/**
+ * hub#830: the drift advisory has to be able to RUN.
+ *
+ * Two independent defects made it dead code in CI:
+ *
+ *   1. The `plan` job used a bare `actions/checkout@v6`, which fetches
+ *      `--depth=1 --no-tags`. `git log v0.7.14..HEAD` in that clone exits 128
+ *      ("unknown revision"), the `proc.exitCode === 0` guard skips, and the
+ *      advisory reports nothing — indistinguishable from "everything is
+ *      shipped", which is the exact confusion it was built to end.
+ *   2. The revision range hardcoded a `v` prefix. Sub-package tags are
+ *      namespaced (`door-contract-v0.7.0`), so door-contract@0.7.0 would have
+ *      been compared against HUB's `v0.7.0` tag — a real tag, pointing at
+ *      unrelated history, so the advisory would have listed nine months of hub
+ *      commits as "door-contract's unpublished work". Masked only by defect 1.
+ *
+ * The prefixes here are not invented: they're the ones `tag-record` pushes at
+ * the bottom of release.yml, and the ones the `on: push: tags:` filters match.
+ */
+describe("tagPrefixFor", () => {
+  test("the root package is hub, whose tags are bare `vX.Y.Z`", () => {
+    expect(tagPrefixFor(".")).toBe("v");
+    expect(tagPrefixFor("")).toBe("v");
+    expect(tagPrefixFor("./")).toBe("v");
+  });
+
+  test("sub-packages get their namespaced prefix — same strings tag-record pushes", () => {
+    expect(tagPrefixFor("packages/scope-guard")).toBe("scope-guard-v");
+    expect(tagPrefixFor("packages/depcheck")).toBe("depcheck-v");
+    expect(tagPrefixFor("packages/door-contract")).toBe("door-contract-v");
+    // Trailing slash is the same package.
+    expect(tagPrefixFor("packages/door-contract/")).toBe("door-contract-v");
+  });
+
+  test("the prefixes match what release.yml's tag-record actually pushes", () => {
+    const workflow = readFileSync(
+      join(import.meta.dir, "../../.github/workflows/release.yml"),
+      "utf8",
+    );
+    for (const [dir, prefix] of [
+      [".", "v"],
+      ["packages/scope-guard", "scope-guard-v"],
+      ["packages/depcheck", "depcheck-v"],
+      ["packages/door-contract", "door-contract-v"],
+    ] as const) {
+      expect(tagPrefixFor(dir)).toBe(prefix);
+      expect(workflow).toMatch(
+        new RegExp(`tag_if\\s+"${prefix}"\\s+"${dir === "." ? "\\." : dir}"`),
+      );
+    }
+  });
+});
+
+describe("driftLogArgs", () => {
+  test("hub compares against its own bare-v tag", () => {
+    expect(driftLogArgs(".", "0.7.14")).toEqual([
+      "git",
+      "log",
+      "v0.7.14..HEAD",
+      "--oneline",
+      "--no-merges",
+      "--",
+      ".",
+    ]);
+  });
+
+  test("door-contract compares against door-contract-v, NOT hub's v tag", () => {
+    const args = driftLogArgs("packages/door-contract", "0.7.0");
+    expect(args).toContain("door-contract-v0.7.0..HEAD");
+    // The bug: `v0.7.0` is a real HUB tag, so the wrong range would have
+    // resolved and listed hub's history as door-contract's drift.
+    expect(args).not.toContain("v0.7.0..HEAD");
+  });
+
+  test("the listing is scoped to the package — a hub commit isn't scope-guard drift", () => {
+    expect(driftLogArgs("packages/scope-guard", "0.5.1").slice(-2)).toEqual([
+      "--",
+      "packages/scope-guard",
+    ]);
+  });
+});
+
+describe("release.yml drift advisory can execute (hub#830)", () => {
+  const workflow = readFileSync(
+    join(import.meta.dir, "../../.github/workflows/release.yml"),
+    "utf8",
+  );
+  // Scope every assertion to the `plan` job — the other jobs' shallow
+  // checkouts are fine, only `plan` reads git history.
+  const planJob = workflow.match(/\n {2}plan:\n([\s\S]*?)\n {2}[a-z][\w-]*:\n/)?.[1];
+
+  test("the plan job is findable (guards the slicing above)", () => {
+    expect(planJob).toBeTruthy();
+    expect(planJob).toContain("bun scripts/release-plan.ts . @openparachute/hub");
+  });
+
+  test("the plan job's checkout fetches full history — depth=1 has no merge base", () => {
+    expect(planJob).toMatch(/actions\/checkout@v6\n\s*with:\n(?:\s*.+\n)*?\s*fetch-depth:\s*0/);
+  });
+
+  test("the plan job's checkout fetches tags — the advisory's range is a TAG", () => {
+    // Bare checkout passes `--no-tags`; without this the range never resolves
+    // and the advisory silently reports nothing, forever.
+    expect(planJob).toMatch(/fetch-tags:\s*true/);
   });
 });
 

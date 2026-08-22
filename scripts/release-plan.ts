@@ -195,6 +195,50 @@ export function unpublishedDrift(commitSubjects: readonly string[]): {
   };
 }
 
+/**
+ * The git tag namespace a package's releases are recorded under.
+ *
+ * Not a detail — the drift advisory's revision range is a TAG, and hub's tags
+ * are bare (`v0.7.0`) while every sub-package's are namespaced
+ * (`door-contract-v0.7.0`). The advisory hardcoded `v`, so door-contract@0.7.0
+ * resolved against HUB's `v0.7.0` — a tag that exists, pointing at unrelated
+ * history — and would have reported ~137 hub commits as door-contract's
+ * unpublished work (hub#830). A wrong-but-resolving range is worse than a
+ * missing one.
+ *
+ * The mapping is the one `tag-record` uses at the bottom of release.yml, and
+ * the one `on: push: tags:` filters against: package dir basename + `-v`, or a
+ * bare `v` for the root package.
+ */
+export function tagPrefixFor(dir: string): string {
+  const name = dir.replace(/\/+$/, "").split("/").pop() ?? "";
+  if (name === "" || name === "." || name === "..") return "v";
+  return `${name}-v`;
+}
+
+/**
+ * The `git log` invocation behind the drift advisory.
+ *
+ * Split out from the CLI so the range and the pathspec are testable without a
+ * repo — both were wrong in ways that only showed up in a release run.
+ *
+ * The trailing pathspec scopes the listing to the package: without it,
+ * "commits not in any published version" for scope-guard would list every hub
+ * commit merged since scope-guard last shipped, which is noise dressed as a
+ * warning.
+ */
+export function driftLogArgs(dir: string, version: string): string[] {
+  return [
+    "git",
+    "log",
+    `${tagPrefixFor(dir)}${version}..HEAD`,
+    "--oneline",
+    "--no-merges",
+    "--",
+    dir.replace(/\/+$/, "") || ".",
+  ];
+}
+
 // --- CLI -------------------------------------------------------------------
 // Usage: bun scripts/release-plan.ts <package-dir> <npm-name> [--tag-push]
 // Emits GitHub Actions outputs; exits non-zero on refusal.
@@ -220,8 +264,17 @@ if (import.meta.main) {
   // in a row sat unpublished on main.
   if (!decision.publish && !rest.includes("--no-drift-check")) {
     try {
-      const proc = Bun.spawnSync(["git", "log", `v${version}..HEAD`, "--oneline", "--no-merges"]);
-      if (proc.exitCode === 0) {
+      const proc = Bun.spawnSync(driftLogArgs(dir, version));
+      if (proc.exitCode !== 0) {
+        // Say so. This is the whole of hub#830: the plan job used a bare
+        // `actions/checkout@v6` (`--depth=1 --no-tags`), git exited 128
+        // "unknown revision", and this branch stayed silent — so a CI run that
+        // COULDN'T check drift looked exactly like one that found none.
+        console.log(
+          `::notice::${npmName}: couldn't check for unpublished drift ` +
+            `(${tagPrefixFor(dir)}${version} not resolvable — shallow or tagless clone?)`,
+        );
+      } else {
         const drift = unpublishedDrift(new TextDecoder().decode(proc.stdout).split("\n"));
         if (drift.drifted) {
           console.log(`::warning::${npmName}: ${drift.summary}`);
