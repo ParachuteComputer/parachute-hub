@@ -9,6 +9,7 @@ import {
   isStale,
   servedDivergenceNote,
 } from "../install-source.ts";
+import { SEED_VERSION } from "../service-spec.ts";
 
 /**
  * Stub helpers for the detect path. Production reads the operator's bun
@@ -161,7 +162,7 @@ describe("isStale", () => {
     ).toBe(false);
   });
 
-  test("does not flag npm-installed services (cached version IS the source)", () => {
+  test("does not flag an npm install whose cached version matches the package", () => {
     expect(
       isStale("0.4.2-rc.1", {
         kind: "npm",
@@ -169,6 +170,63 @@ describe("isStale", () => {
         livePackageVersion: "0.4.2-rc.1",
       }),
     ).toBe(false);
+  });
+
+  // hub#839 — isStale used to `return false` for every non-bun-linked source,
+  // so npm VERSION/SOURCE drift never produced a STALE line. Both cases below
+  // are real (they are the two named in the issue), and both used to be silent.
+  describe("hub#839: npm installs drift too", () => {
+    test("out-of-band `bun add -g <pkg>@newer` with no restart → STALE", () => {
+      // The package on disk moved to 0.22.11. The row still carries 0.22.10 —
+      // the version the still-running old process stamped on ITS boot. This is
+      // a deploy that looks applied and isn't; it must not be silent.
+      expect(
+        isStale("0.22.10", {
+          kind: "npm",
+          path: "/home/op/.bun/install/global/node_modules/@openparachute/app",
+          livePackageVersion: "0.22.11",
+        }),
+      ).toBe(true);
+    });
+
+    test("hub#836 refresh-write-failure leaves a lying row → STALE", () => {
+      // `upgrade` installed 0.23.0 and restarted successfully, but the
+      // post-restart services.json write failed (deliberately non-fatal in
+      // #836 — the package IS installed and the service IS running). The row
+      // is now behind the process it describes. This is the one #836 case
+      // #836 itself could not cover.
+      expect(
+        isStale("0.22.11", {
+          kind: "npm",
+          path: "/home/op/.bun/install/global/node_modules/@openparachute/app",
+          livePackageVersion: "0.23.0",
+        }),
+      ).toBe(true);
+    });
+
+    test("does not flag an npm row still at SEED_VERSION (installed, no instance yet)", () => {
+      // The CLI seeds a missing entry at SEED_VERSION post-install; the
+      // service's own boot overwrites it. That row isn't claiming a running
+      // version, so a mismatch isn't drift — otherwise every fresh install
+      // would render a STALE line.
+      expect(
+        isStale(SEED_VERSION, {
+          kind: "npm",
+          path: "/home/op/.bun/install/global/node_modules/@openparachute/app",
+          livePackageVersion: "0.22.11",
+        }),
+      ).toBe(false);
+    });
+
+    test("does not flag an npm row whose package.json could not be read", () => {
+      expect(
+        isStale("0.22.10", {
+          kind: "npm",
+          path: "/home/op/.bun/install/global/node_modules/@openparachute/app",
+          // livePackageVersion absent — nothing to compare against.
+        }),
+      ).toBe(false);
+    });
   });
 
   test("does not flag when live version is unavailable", () => {
