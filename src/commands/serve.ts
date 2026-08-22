@@ -170,11 +170,20 @@ export function armLoopbackGuardBind(args: {
   log: (line: string) => void;
   /** Test seam — the real bind isn't otherwise injectable. */
   serveImpl?: (options: ReturnType<typeof hubServeOptions>) => { stop: () => unknown };
+  /** Test seam — lets unit tests exercise the wiring on any CI platform. */
+  platform?: string;
 }): LoopbackGuardBind | null {
   const { port, hostname, serveOptions, log } = args;
   const serveImpl =
     args.serveImpl ?? ((options) => Bun.serve(options) as unknown as { stop: () => unknown });
 
+  // The specific-next-to-wildcard co-bind is verified on macOS only: Linux
+  // kernels refuse it outright (EADDRINUSE — proven by pr-verify on ubuntu),
+  // so on non-darwin the attempt would fail on EVERY containerized boot and
+  // log a false hijack alarm forever. The OrbStack hijack this guards against
+  // is itself a macOS phenomenon (hub#737/hub#741), so the guard's verified
+  // scope and its useful scope coincide.
+  if ((args.platform ?? process.platform) !== "darwin") return null;
   // An explicit bind host already owns a specific bind; nothing to guard.
   if (!isWildcardBindHost(hostname)) return null;
   // `port: 0` means "kernel, pick one" — there is no stable port for a rogue

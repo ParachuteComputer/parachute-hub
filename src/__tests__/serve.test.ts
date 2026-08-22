@@ -78,6 +78,7 @@ describe("armLoopbackGuardBind (hub#741)", () => {
           serveOptions,
           log: (l) => lines.push(l),
           serveImpl,
+          platform: "darwin",
         }),
     };
   }
@@ -174,7 +175,7 @@ describe("armLoopbackGuardBind — against real sockets (hub#741)", () => {
   // `0.0.0.0:P` and `127.0.0.1:P`, and with the real handler shared, loopback
   // traffic still reaches the real hub. Verified against actual listeners
   // rather than asserting the unit wiring and hoping.
-  test("wildcard + guard co-hold the port, and loopback reaches the REAL handler", async () => {
+  test.skipIf(process.platform !== "darwin")("wildcard + guard co-hold the port, and loopback reaches the REAL handler", async () => {
     const port = await freePort();
     const serveOptions = hubServeOptions({
       port,
@@ -244,7 +245,7 @@ describe("armLoopbackGuardBind — against real sockets (hub#741)", () => {
 
   // Releasing both sockets matters for restart: a guard left bound would make
   // the hub's own next boot lose the race for 127.0.0.1:<port> to its corpse.
-  test("after stop() the specific loopback bind is free again", async () => {
+  test.skipIf(process.platform !== "darwin")("after stop() the specific loopback bind is free again", async () => {
     const port = await freePort();
     const serveOptions = hubServeOptions({
       port,
