@@ -6,6 +6,49 @@ All notable changes to `@openparachute/hub` are documented here. The format foll
 >
 > This backfill covers the 0.6.x line only. Two pre-existing gaps remain undocumented and are **not** addressed here: the `0.5.13` stable itself (the file's newest entry is `0.5.13-rc.48`, never the stable) and the entire `0.5.14-rc` chain (rc.1–rc.21 on npm), which never promoted to a `0.5.14` stable — its work folded forward into 0.6.0.
 
+## [0.7.16] - 2026-08-21
+
+**Train CI + token de-escalation: `next`-targeted PRs finally get typecheck and
+test coverage, a tag push's release override actually works, and vault-admin
+create stops handing out an unrevocable bootstrap credential.** Three PRs
+over 0.7.15, all independently reviewed pre-merge (the account-token PR
+double-reviewed, including a cross-model pass); zero must-fix escapes.
+
+- **`pr-verify` gates PRs targeting `next`, not just `main` (#843, closes
+  hub#838).** The merge train (2026-08-14) routes every feature PR to
+  `next`, but the workflow's trigger was still `pull_request: branches:
+  [main]` — typecheck and unit tests silently never ran for #834–#837.
+  Adding `next` to the trigger branches was the only gap; no other step
+  makes a main-specific assumption. Audit turned up the same gap in
+  `parachute-vault` (flagged for a follow-up there, out of scope here) and
+  confirmed `parachute-cloud` has no branch filter at all, so it was
+  already unaffected.
+
+- **The `--tag-push` release override is wired for real (#844, closes
+  hub#841).** `decidePublish`'s tag short-circuit was unreachable in CI —
+  the `plan` job's four `release-plan.ts` invocations never passed
+  `--tag-push`, so a tag push of an unpublished-older version silently
+  skipped every publish, contradicting both the job's own comment and
+  RELEASING.md. The flag is now passed on all four invocations, the stale
+  comment is fixed, RELEASING.md is flipped back to describing the real
+  override, and a workflow-text test pins the wiring itself (the flag's
+  parsing and `decidePublish`'s `isTagPush` branch were already unit-tested
+  — the gap was specifically that the workflow never invoked it).
+
+- **Admin-tier vault create stops returning the raw CLI bootstrap token
+  (#846, closes hub#827).** `POST /account/vaults` used to hand admin-tier
+  callers the CLI's `vault:<name>:admin` bootstrap credential verbatim —
+  unbounded TTL, never in the token registry, unrevocable. That was fine
+  while account-admin was cookie-minted only, but `account:self:admin` is
+  now OAuth-requestable, so a third-party admin-tier app walked away with
+  the exact credential class the write-tier branch already de-escalates.
+  Both tiers now receive a hub-signed, registry-recorded handoff bounded at
+  `ACCESS_TOKEN_TTL_SECONDS` (15 min); the CLI bootstrap is never in the
+  201 body or the mint-failure 500. **Operator-visible:** API callers that
+  stored the create-time token must renew via
+  `POST /account/vaults/<name>/token` — the app already re-mints, this only
+  affects direct API callers holding the old long-lived token.
+
 ## [0.7.15] - 2026-08-21
 
 **Deploy safety: published images get real version tags, `status` stops
