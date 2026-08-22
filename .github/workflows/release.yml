@@ -107,6 +107,21 @@ jobs:
       door_contract: ${{ steps.door_contract.outputs.should_publish }}
     steps:
       - uses: actions/checkout@v6
+        with:
+          # The drift advisory in release-plan.ts asks git "what's on main that
+          # no published version contains?" — a `<tag>..HEAD` range. A bare
+          # checkout fetches `--depth=1 --no-tags`, where that range exits 128
+          # ("unknown revision") and the advisory reported nothing, forever
+          # (hub#830). Indistinguishable from "everything is shipped", which is
+          # the exact confusion it was added to end.
+          #
+          # Only this job needs history; every other job's checkout stays
+          # shallow.
+          fetch-depth: 0
+          # Redundant alongside fetch-depth: 0 today, deliberate anyway: it
+          # states the dependency, so narrowing the depth later can't silently
+          # take the tags away again.
+          fetch-tags: true
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.3
