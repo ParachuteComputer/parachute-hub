@@ -143,6 +143,7 @@ describe("armLoopbackGuardBind (hub#741)", () => {
       serveImpl: () => {
         throw new Error("EADDRINUSE: address already in use 127.0.0.1:1939");
       },
+      platform: "darwin",
     });
     expect(guard).toBeNull();
     const out = lines.join("\n");
