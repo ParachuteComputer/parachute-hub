@@ -4,11 +4,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { _resetBootstrapTokenForTests, getBootstrapToken } from "../bootstrap-token.ts";
 import {
+  LOOPBACK_GUARD_HOST,
+  armLoopbackGuardBind,
   armServeDbWatchdog,
   formatBootstrapTokenBanner,
   formatListeningBanner,
   hubPortConflictMessage,
   hubServeOptions,
+  isWildcardBindHost,
   resolveStartupIssuer,
   seedInitialAdminIfNeeded,
 } from "../commands/serve.ts";
@@ -39,6 +42,233 @@ describe("hubServeOptions — the production listener wires the WS bridge", () =
     expect(o.hostname).toBe("0.0.0.0");
     expect(o.idleTimeout).toBe(255);
     expect(o.fetch).toBe(fakeFetch);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// hub#741 — the loopback guard bind (prevention half of hub#737).
+// ---------------------------------------------------------------------------
+describe("armLoopbackGuardBind (hub#741)", () => {
+  const fakeFetch = (() => new Response("ok")) as unknown as Parameters<
+    typeof hubServeOptions
+  >[0]["fetch"];
+
+  function harness(hostname: string, port: number) {
+    const serveOptions = hubServeOptions({ port, hostname, fetch: fakeFetch });
+    const seen: Array<ReturnType<typeof hubServeOptions>> = [];
+    const lines: string[] = [];
+    let stopped = 0;
+    const serveImpl = (o: ReturnType<typeof hubServeOptions>) => {
+      seen.push(o);
+      return {
+        stop: () => {
+          stopped++;
+        },
+      };
+    };
+    return {
+      serveOptions,
+      seen,
+      lines,
+      stoppedCount: () => stopped,
+      arm: () =>
+        armLoopbackGuardBind({
+          port,
+          hostname,
+          serveOptions,
+          log: (l) => lines.push(l),
+          serveImpl,
+        }),
+    };
+  }
+
+  test("wildcard bind → claims a second socket on 127.0.0.1 at the SAME port", () => {
+    const h = harness("0.0.0.0", 1939);
+    const guard = h.arm();
+    expect(guard).not.toBeNull();
+    expect(h.seen).toHaveLength(1);
+    expect(h.seen[0]?.hostname).toBe(LOOPBACK_GUARD_HOST);
+    expect(h.seen[0]?.port).toBe(1939);
+    expect(h.lines.join("\n")).toContain("loopback guard bind held");
+  });
+
+  // THE self-inflicted-outage guard. A specific bind WINS loopback routing
+  // over a wildcard bind in the same process, so a guard socket serving a stub
+  // handler would steal every module's hub call and cause the exact hub#737
+  // outage it exists to prevent. The guard must serve the primary's own
+  // handler set.
+  test("the guard serves the REAL fetch + WS handler, not a stub", () => {
+    const h = harness("0.0.0.0", 1939);
+    h.arm();
+    const guardOptions = h.seen[0];
+    expect(guardOptions?.fetch).toBe(h.serveOptions.fetch);
+    expect(guardOptions?.websocket).toBe(h.serveOptions.websocket);
+    expect(guardOptions?.idleTimeout).toBe(h.serveOptions.idleTimeout);
+    // hostname is the ONLY difference from the primary listener.
+    expect({ ...guardOptions, hostname: h.serveOptions.hostname }).toEqual(h.serveOptions);
+  });
+
+  test("explicit bind host → skipped (the operator already owns a specific bind)", () => {
+    for (const host of ["127.0.0.1", "192.168.1.10", "::1"]) {
+      const h = harness(host, 1939);
+      expect(h.arm()).toBeNull();
+      expect(h.seen).toHaveLength(0);
+    }
+  });
+
+  test("`::` counts as wildcard", () => {
+    expect(isWildcardBindHost("::")).toBe(true);
+    expect(isWildcardBindHost("0.0.0.0")).toBe(true);
+    expect(isWildcardBindHost("127.0.0.1")).toBe(false);
+  });
+
+  test("ephemeral port 0 → skipped (a guard would land on a different port)", () => {
+    const h = harness("0.0.0.0", 0);
+    expect(h.arm()).toBeNull();
+    expect(h.seen).toHaveLength(0);
+  });
+
+  // The ordering prevention cannot cover: a rogue already holds the specific
+  // bind at hub startup. The hub must still come up — a degraded hub beats no
+  // hub, and hub#737's self-probe is what reports this case.
+  test("a failed guard bind is NON-fatal and logs the hijack shape loudly", () => {
+    const serveOptions = hubServeOptions({ port: 1939, hostname: "0.0.0.0", fetch: fakeFetch });
+    const lines: string[] = [];
+    const guard = armLoopbackGuardBind({
+      port: 1939,
+      hostname: "0.0.0.0",
+      serveOptions,
+      log: (l) => lines.push(l),
+      serveImpl: () => {
+        throw new Error("EADDRINUSE: address already in use 127.0.0.1:1939");
+      },
+    });
+    expect(guard).toBeNull();
+    const out = lines.join("\n");
+    expect(out).toContain("WARNING");
+    expect(out).toContain("127.0.0.1:1939");
+    expect(out).toContain("hijack");
+    expect(out).toContain("lsof");
+  });
+
+  test("stop() releases the guard socket", async () => {
+    const h = harness("0.0.0.0", 1939);
+    const guard = h.arm();
+    expect(h.stoppedCount()).toBe(0);
+    await guard?.stop();
+    expect(h.stoppedCount()).toBe(1);
+  });
+});
+
+describe("armLoopbackGuardBind — against real sockets (hub#741)", () => {
+  /** An ephemeral port that is free right now. */
+  async function freePort(): Promise<number> {
+    const probe = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: () => new Response("") });
+    const p = probe.port ?? 0;
+    await probe.stop(true);
+    if (p === 0) throw new Error("could not obtain an ephemeral port");
+    return p;
+  }
+
+  // The behavioral claim the whole issue rests on: one process CAN co-hold
+  // `0.0.0.0:P` and `127.0.0.1:P`, and with the real handler shared, loopback
+  // traffic still reaches the real hub. Verified against actual listeners
+  // rather than asserting the unit wiring and hoping.
+  test("wildcard + guard co-hold the port, and loopback reaches the REAL handler", async () => {
+    const port = await freePort();
+    const serveOptions = hubServeOptions({
+      port,
+      hostname: "0.0.0.0",
+      fetch: (() => new Response("real-hub")) as unknown as Parameters<
+        typeof hubServeOptions
+      >[0]["fetch"],
+    });
+    const primary = Bun.serve(serveOptions);
+    const lines: string[] = [];
+    const guard = armLoopbackGuardBind({
+      port,
+      hostname: "0.0.0.0",
+      serveOptions,
+      log: (l) => lines.push(l),
+    });
+    try {
+      expect(guard).not.toBeNull();
+      // The specific bind wins loopback routing — and it is OUR socket running
+      // the real handler, so this is the hub, not a stub.
+      //
+      // `connection: close` on purpose: with keep-alive, `fetch` reuses a
+      // pooled socket and you measure the pool, not the kernel's routing. That
+      // difference is exactly what makes this class of bug look absent when it
+      // isn't — an unguarded repro of the hijack reads as "still fine" over a
+      // pooled connection and flips to 100% rogue on fresh ones.
+      const res = await fetch(`http://127.0.0.1:${port}/`, {
+        headers: { connection: "close" },
+      });
+      expect(await res.text()).toBe("real-hub");
+
+      // ...and the rogue that started the 2026-07-02 incident now fails to
+      // bind instead of silently shadowing us.
+      //
+      // PLATFORM NOTE: this block asserts the hub#741 finding, which was
+      // verified on macOS (where OrbStack — the actual incident trigger —
+      // runs). Linux/container SO_REUSEADDR/SO_REUSEPORT semantics differ and
+      // have not been re-verified, so the block is macOS-gated rather than
+      // asserted everywhere and left to rot red on another runner.
+      if (process.platform === "darwin") {
+        let rogueBound = false;
+        try {
+          const rogue = Bun.serve({
+            port,
+            hostname: "127.0.0.1",
+            fetch: () => new Response("ROGUE"),
+          });
+          rogueBound = true;
+          await rogue.stop(true);
+        } catch {
+          rogueBound = false;
+        }
+        expect(rogueBound).toBe(false);
+        // ...and loopback keeps reaching us on fresh connections.
+        for (let i = 0; i < 3; i++) {
+          const again = await fetch(`http://127.0.0.1:${port}/`, {
+            headers: { connection: "close" },
+          });
+          expect(await again.text()).toBe("real-hub");
+        }
+      }
+    } finally {
+      await guard?.stop();
+      await primary.stop(true);
+    }
+  });
+
+  // Releasing both sockets matters for restart: a guard left bound would make
+  // the hub's own next boot lose the race for 127.0.0.1:<port> to its corpse.
+  test("after stop() the specific loopback bind is free again", async () => {
+    const port = await freePort();
+    const serveOptions = hubServeOptions({
+      port,
+      hostname: "0.0.0.0",
+      fetch: (() => new Response("real-hub")) as unknown as Parameters<
+        typeof hubServeOptions
+      >[0]["fetch"],
+    });
+    const primary = Bun.serve(serveOptions);
+    const guard = armLoopbackGuardBind({ port, hostname: "0.0.0.0", serveOptions, log: () => {} });
+    await guard?.stop();
+    await primary.stop(true);
+    // Both down → the address is claimable again.
+    const after = Bun.serve({
+      port,
+      hostname: "127.0.0.1",
+      fetch: () => new Response("next-boot"),
+    });
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/`);
+      expect(await res.text()).toBe("next-boot");
+    } finally {
+      await after.stop(true);
+    }
   });
 });
 
