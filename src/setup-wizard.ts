@@ -1146,10 +1146,18 @@ export function renderDoneStep(props: RenderDoneStepProps): string {
  * default, and baking an admin-scope bearer into a copy-pasted command
  * was a privilege over-grant + a shoulder-surf hazard. The bare OAuth
  * command was always the correct UX; it's now the only one.
+ *
+ * URL shape (hub#777): points at the canonical root `<hubOrigin>/mcp`
+ * rather than the per-vault `/vault/<name>/mcp` form — root `/mcp` is
+ * vault-agnostic (the OAuth consent picks the audience), so it stays
+ * correct even if the operator renames this vault or adds more later.
+ * At this point in the wizard there's exactly one vault, so the OAuth
+ * consent screen has nothing to pick between. The server name stays
+ * `parachute-<vault>` so the connection is still labeled by vault.
  */
 function renderMcpTile(vaultName: string, hubOrigin: string): string {
   const safeVault = escapeHtml(vaultName);
-  const bareCmd = `claude mcp add --transport http parachute-${vaultName} ${hubOrigin}/vault/${vaultName}/mcp`;
+  const bareCmd = `claude mcp add --transport http parachute-${vaultName} ${hubOrigin}/mcp`;
   return `<div class="done-tile">
     <h2>Connect Claude Code (MCP)</h2>
     <p>Wire <code>vault:${safeVault}</code> into Claude Code as an MCP server:</p>
