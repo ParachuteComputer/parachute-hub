@@ -1005,7 +1005,7 @@ describe("handleSetupGet", () => {
       expect(res.status).toBe(200);
       const html = await res.text();
       expect(html).toContain("PARACHUTE_HUB_ORIGIN");
-      expect(html).toContain("parachute.computer/docs/deploy");
+      expect(html).toContain("parachute.computer/start/");
     } finally {
       db.close();
     }

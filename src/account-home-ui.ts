@@ -410,7 +410,7 @@ function renderOnboardingChecklist(opts: OnboardingChecklistOpts): string {
           <div class="onboarding-step-body">
             <p class="onboarding-step-title">Set up your vault</p>
             <p class="onboarding-step-sub">Open a new Claude chat and paste the
-               <a href="https://parachute.computer/onboarding/vault-setup/" target="_blank"
+               <a href="https://parachute.computer/vault/" target="_blank"
                   rel="noopener" data-testid="onboarding-vault-setup-link">vault-setup prompt</a> —
                your AI interviews you and structures your vault around how you think.</p>
           </div>
@@ -425,8 +425,8 @@ function renderOnboardingChecklist(opts: OnboardingChecklistOpts): string {
 /**
  * The "Get started with your AI" card — the real first stop for a friend
  * landing on `/account/`. Mirrors the operator setup-wizard's
- * `renderStarterPromptsSection` (same two parachute.computer/onboarding/*
- * links + copy) so friends and operators get the same on-ramp. The prompts
+ * `renderStarterPromptsSection` (same two parachute.computer/vault/ and
+ * /surfaces/ links + copy) so friends and operators get the same on-ramp. The prompts
  * live on parachute.computer rather than embedded here so they iterate
  * without a hub release; this card just links.
  *
@@ -442,14 +442,14 @@ function renderGetStartedCard(): string {
         once your vault is connected — they walk you through it, no setup
         knowledge needed.</p>
       <div class="starter-grid">
-        <a class="starter-tile" href="https://parachute.computer/onboarding/vault-setup/"
+        <a class="starter-tile" href="https://parachute.computer/vault/"
            target="_blank" rel="noopener" data-testid="starter-vault-setup">
           <h3>Set up your vault</h3>
           <p>Your AI interviews you about where your notes live now and suggests
             a structure that fits how you think.</p>
           <span class="starter-cta">Open prompt ↗</span>
         </a>
-        <a class="starter-tile" href="https://parachute.computer/onboarding/surface-build/"
+        <a class="starter-tile" href="https://parachute.computer/surfaces/"
            target="_blank" rel="noopener" data-testid="starter-surface-build">
           <h3>Build a custom UI</h3>
           <p>Your AI builds you a little web app for your vault — your own way to
@@ -567,7 +567,7 @@ function renderVaultCard(opts: VaultCardOpts): string {
           </p>
           <p class="vault-build-ui" data-testid="build-your-own-ui">Notes is just one way to see
              your vault — when you're ready, your AI can build you a custom UI for it in a few
-             minutes. <a href="https://parachute.computer/onboarding/surface-build/"
+             minutes. <a href="https://parachute.computer/surfaces/"
              target="_blank" rel="noopener" data-testid="build-your-own-ui-link">Build your own ↗</a></p>
           ${manageBlock}
         </div>`;
