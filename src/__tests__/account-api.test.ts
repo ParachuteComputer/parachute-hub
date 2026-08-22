@@ -684,7 +684,8 @@ describe("handleAccountCreateVault", () => {
       expect(lifetime).toBe(ACCESS_TOKEN_TTL_SECONDS);
       expect(lifetime).toBeLessThan(ACCOUNT_VAULT_TOKEN_TTL_SECONDS);
       const row = findTokenRowByJti(h.db, validated.payload.jti ?? "");
-      expect(row?.createdVia).toBe("cli_mint");
+      // hub#848: distinct from `cli_mint` — hub-signed create-time handoff.
+      expect(row?.createdVia).toBe("vault_create_handoff");
       expect(row?.clientId).toBe("parachute-hub-spa");
       expect(row?.scopes).toEqual(["vault:work:read", "vault:work:write"]);
     } finally {
@@ -825,7 +826,8 @@ describe("handleAccountCreateVault", () => {
       expect(lifetime).toBe(ACCESS_TOKEN_TTL_SECONDS);
       expect(lifetime).toBeLessThan(ACCOUNT_VAULT_TOKEN_TTL_SECONDS);
       const row = findTokenRowByJti(h.db, validated.payload.jti ?? "");
-      expect(row?.createdVia).toBe("cli_mint");
+      // hub#848: distinct from `cli_mint` — hub-signed create-time handoff.
+      expect(row?.createdVia).toBe("vault_create_handoff");
       expect(row?.clientId).toBe("parachute-hub-spa");
       expect(row?.scopes).toEqual(["vault:work:admin"]);
     } finally {
