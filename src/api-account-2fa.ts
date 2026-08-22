@@ -12,6 +12,11 @@
  *   POST /api/account/2fa/disable  → verify current password, clear 2FA
  *   POST /api/account/password     → verify current, set new (+ revoke the
  *                                     user's still-active tokens)
+ *   GET  /api/account/pubkeys      → the caller's linked Nostr pubkeys
+ *   POST /api/account/pubkeys/{challenge,verify,unlink}
+ *                                   → the hub#833 phase-1a linkage ceremony
+ *                                     (implementation in
+ *                                     `api-account-pubkeys.ts`)
  *
  * Auth posture: every endpoint is **self-service** — it acts on the
  * SIGNED-IN user's OWN account (`session.userId`), never a client-supplied
@@ -39,6 +44,7 @@
 import type { Database } from "bun:sqlite";
 import { hash as argonHash } from "@node-rs/argon2";
 import QRCode from "qrcode";
+import { handleAccountPubkeys } from "./api-account-pubkeys.ts";
 import { verifyCsrfToken } from "./csrf.ts";
 import { changePasswordRateLimiter, totpEnrollConfirmRateLimiter } from "./rate-limit.ts";
 import { findActiveSession } from "./sessions.ts";
@@ -60,6 +66,12 @@ import {
 
 export interface ApiAccount2faDeps {
   db: Database;
+  /**
+   * Origins this hub answers on (`buildHubBoundOrigins`). Only the
+   * `/pubkeys/*` sub-surface reads it — the linkage ceremony binds the signed
+   * event's `u` tag to one of them. See `AccountPubkeysDeps.hubBoundOrigins`.
+   */
+  hubBoundOrigins?: readonly string[];
   /** Test seam — defaults to the real clock. */
   now?: () => Date;
 }
@@ -137,17 +149,42 @@ function passwordRateLimit(userId: string, now: () => Date): Response | null {
 
 /**
  * Router for `/api/account/*`. `subpath` is the path AFTER `/api/account`
- * (e.g. "/2fa/start", "/password"). The hub-server dispatcher slices it.
+ * (e.g. "/2fa/start", "/password", "/pubkeys/verify"). The hub-server
+ * dispatcher slices it.
  *
- * Every route here is a POST (state-changing); the read-side 2FA status the
- * SPA renders comes from `/api/me`'s `two_factor_enabled` field, so there's
- * no GET on this surface.
+ * The 2FA + password routes are POST-only (all state-changing); the read-side
+ * 2FA status the SPA renders comes from `/api/me`'s `two_factor_enabled`
+ * field. The `/pubkeys` sub-surface (hub#833) is the one exception — it has a
+ * read route — so it is dispatched BEFORE the POST-only gate and owns its own
+ * method handling. The gate is left in place verbatim for the pre-existing
+ * routes so their "405 before the session check" behavior is unchanged.
  */
 export async function handleApiAccount(
   req: Request,
   subpath: string,
   deps: ApiAccount2faDeps,
 ): Promise<Response> {
+  // Nostr pubkey linkage (hub#833 phase 1a). Session + CSRF are enforced here
+  // — identically to every other route on this surface — and only then is the
+  // request handed to the sub-router. The CSRF check is skipped for GET (a
+  // read carries no CSRF risk and the double-submit token rides a JSON body
+  // this surface's reads don't have).
+  if (subpath === "/pubkeys" || subpath.startsWith("/pubkeys/")) {
+    const pubkeyGate = requireUser(deps.db, req);
+    if (!pubkeyGate.ok) return pubkeyGate.res;
+    const pubkeyBody = req.method === "GET" ? {} : await readJsonBody(req);
+    if (req.method !== "GET" && !checkCsrf(req, pubkeyBody)) {
+      return jsonError(403, "csrf_failed", "missing or invalid CSRF token");
+    }
+    return handleAccountPubkeys(
+      req,
+      subpath.slice("/pubkeys".length),
+      pubkeyGate.user.id,
+      pubkeyBody,
+      deps,
+    );
+  }
+
   if (req.method !== "POST") return jsonError(405, "method_not_allowed", "use POST");
 
   const gate = requireUser(deps.db, req);
