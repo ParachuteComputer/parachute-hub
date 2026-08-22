@@ -35,7 +35,7 @@
 import { useState } from "react";
 import { HttpError, type MintedToken, mintToken } from "../lib/api.ts";
 
-const CONNECT_DOCS_URL = "https://parachute.computer/install#connect-mcp-clients";
+const CONNECT_DOCS_URL = "https://parachute.computer/start/#connect-mcp-clients";
 
 /**
  * Build `<hub-origin>/vault/<name>/mcp` from the vault's published URL.

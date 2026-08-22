@@ -126,7 +126,7 @@ describe("renderAccountHome", () => {
     });
     expect(html).toContain('data-testid="build-your-own-ui"');
     expect(html).toContain('data-testid="build-your-own-ui-link"');
-    expect(html).toContain("https://parachute.computer/onboarding/surface-build/");
+    expect(html).toContain("https://parachute.computer/surfaces/");
     expect(html).toContain("build you a custom UI");
   });
 
@@ -238,8 +238,8 @@ describe("renderAccountHome", () => {
     // operator setup-wizard's starter-prompts section).
     expect(html).toContain('data-testid="get-started-card"');
     expect(html).toContain("Get started with your AI");
-    expect(html).toContain("https://parachute.computer/onboarding/vault-setup/");
-    expect(html).toContain("https://parachute.computer/onboarding/surface-build/");
+    expect(html).toContain("https://parachute.computer/vault/");
+    expect(html).toContain("https://parachute.computer/surfaces/");
     expect(html).toContain('data-testid="starter-vault-setup"');
     expect(html).toContain('data-testid="starter-surface-build"');
     // External links open safely.
@@ -714,7 +714,7 @@ describe("renderAccountHome", () => {
     expect(html).toContain("claude mcp add");
     // Step ③ links the vault-setup starter prompt.
     expect(html).toContain('data-testid="onboarding-vault-setup-link"');
-    expect(html).toContain("https://parachute.computer/onboarding/vault-setup/");
+    expect(html).toContain("https://parachute.computer/vault/");
   });
 
   test("onboarding checklist — condenses to 'you're connected' when a grant exists", () => {
