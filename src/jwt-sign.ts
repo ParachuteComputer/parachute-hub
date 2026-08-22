@@ -27,6 +27,7 @@ import {
   importSPKI,
   jwtVerify,
 } from "jose";
+import { attributionPubkey } from "./pubkey-links.ts";
 import { vaultScopeName } from "./scope-explanations.ts";
 import { getActiveSigningKey, getAllPublicKeys } from "./signing-keys.ts";
 
@@ -232,10 +233,15 @@ export function signRefreshToken(db: Database, opts: SignRefreshTokenOpts): Sign
   const now = opts.now?.() ?? new Date();
   const expiresAt = new Date(now.getTime() + REFRESH_TOKEN_TTL_MS).toISOString();
   const familyId = opts.familyId ?? randomUUID();
+  // Phase-1b attribution snapshot (hub#833). Additive: NULL when the user has
+  // no linked key, which is every user until they run the linkage ceremony.
+  // Resolved at INSERT time so the row records what was true when the
+  // credential was minted; a later unlink does not rewrite it.
+  const subjectPubkey = attributionPubkey(db, { userId: opts.userId });
   try {
     db.prepare(
-      `INSERT INTO tokens (jti, user_id, client_id, scopes, refresh_token_hash, family_id, expires_at, created_at, created_via)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'oauth_refresh')`,
+      `INSERT INTO tokens (jti, user_id, client_id, scopes, refresh_token_hash, family_id, expires_at, created_at, created_via, subject_pubkey)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'oauth_refresh', ?)`,
     ).run(
       opts.jti,
       opts.userId,
@@ -245,6 +251,7 @@ export function signRefreshToken(db: Database, opts: SignRefreshTokenOpts): Sign
       familyId,
       expiresAt,
       now.toISOString(),
+      subjectPubkey,
     );
   } catch (err) {
     throw new RefreshTokenInsertError(
@@ -270,6 +277,21 @@ export interface RecordTokenMintOpts {
   expiresAt: string;
   /** Optional JSON-encoded permissions claim (per auth-architecture-shape.md §11.3). */
   permissions?: string;
+  /**
+   * Phase-1b attribution snapshot (hub#833) — the Nostr pubkey to stamp on
+   * the registry row alongside the existing `sub`/`subject`.
+   *
+   * **Omit it.** Left `undefined`, the row is stamped automatically by
+   * resolving the mint's principal (`userId`, else `subject`) through
+   * `user_pubkeys`, so every mint path picks attribution up with no call-site
+   * churn and no chance of one path forgetting. Pass `null` to opt a specific
+   * mint OUT of the snapshot; pass a string only if you have already resolved
+   * it and want to avoid the lookup.
+   *
+   * This never affects the token itself — no claim, no scope, no authority.
+   * It is a column on the audit row.
+   */
+  subjectPubkey?: string | null;
   now?: () => Date;
 }
 
@@ -290,12 +312,18 @@ export interface RecordTokenMintOpts {
  */
 export function recordTokenMint(db: Database, opts: RecordTokenMintOpts): void {
   const now = opts.now?.() ?? new Date();
+  // Phase-1b attribution snapshot (hub#833). `undefined` → resolve from the
+  // mint's principal; `null` → explicit opt-out. See `subjectPubkey`'s doc.
+  const subjectPubkey =
+    opts.subjectPubkey !== undefined
+      ? opts.subjectPubkey
+      : attributionPubkey(db, { userId: opts.userId, subject: opts.subject });
   try {
     db.prepare(
       `INSERT INTO tokens (
         jti, user_id, client_id, scopes, expires_at, created_at,
-        permissions, created_via, subject
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        permissions, created_via, subject, subject_pubkey
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).run(
       opts.jti,
       opts.userId ?? null,
@@ -306,6 +334,7 @@ export function recordTokenMint(db: Database, opts: RecordTokenMintOpts): void {
       opts.permissions ?? null,
       opts.createdVia,
       opts.subject,
+      subjectPubkey,
     );
   } catch (err) {
     throw new RefreshTokenInsertError(
@@ -598,6 +627,16 @@ export interface RefreshTokenRow {
    * family's single live tip is the benign immediate-predecessor.
    */
   rotatedTo: string | null;
+  /**
+   * Phase-1b attribution snapshot (hub#833, migration v17) — the Nostr pubkey
+   * the row's principal had proved possession of AT MINT TIME. NULL on every
+   * pre-v17 row and on every mint by a principal with no linked key.
+   *
+   * A SNAPSHOT, not a live join: unlinking a key removes it from
+   * `user_pubkeys` and from live resolution but leaves this column alone, so
+   * the audit row keeps stating what was true. Carries no authority.
+   */
+  subjectPubkey: string | null;
 }
 
 /**
@@ -623,6 +662,7 @@ interface TokenRowDb {
   created_via: string;
   subject: string | null;
   rotated_to: string | null;
+  subject_pubkey: string | null;
 }
 
 function rowToRefreshToken(row: TokenRowDb): RefreshTokenRow {
@@ -639,6 +679,7 @@ function rowToRefreshToken(row: TokenRowDb): RefreshTokenRow {
     createdVia: (row.created_via as TokenCreatedVia) ?? "oauth_refresh",
     permissions: row.permissions,
     rotatedTo: row.rotated_to ?? null,
+    subjectPubkey: row.subject_pubkey ?? null,
   };
 }
 

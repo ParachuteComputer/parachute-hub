@@ -165,6 +165,21 @@ export const SIGNUP_WINDOW_MS = 15 * 60 * 1000;
  * ~4/min sustained. The 61st attempt within the window is denied.
  */
 export const SIGNUP_MAX_ATTEMPTS = 60;
+/**
+ * `/api/account/pubkeys/{challenge,verify}` window (hub#833 phase 1a). Keyed
+ * by user-id — the session already established identity before either
+ * endpoint is reached, so the bucket is per-account, not per-IP.
+ */
+export const PUBKEY_LINK_WINDOW_MS = 10 * 60 * 1000;
+/**
+ * Attempts per window on the linkage ceremony. Linking a signing device is a
+ * once-in-a-while act (a handful of keys per account, ever — `MAX_PUBKEYS_PER_USER`
+ * caps it at 10), so 20 is generous for a human retrying a fiddly browser-
+ * extension signature while still bounding two things a hijacked session
+ * could otherwise do freely: mint unbounded challenge rows, and grind
+ * BIP-340 verifications (elliptic-curve work on attacker-shaped input).
+ */
+export const PUBKEY_LINK_MAX_ATTEMPTS = 20;
 /** Sentinel for the IP-extraction priority chain when nothing parsed. */
 export const UNKNOWN_IP_SENTINEL = "unknown";
 
@@ -351,6 +366,28 @@ export const vaultTokenMintRateLimiter = new RateLimiter(
 export const signupRateLimiter = new RateLimiter(SIGNUP_MAX_ATTEMPTS, SIGNUP_WINDOW_MS);
 
 /**
+ * `POST /api/account/pubkeys/challenge` rate limiter — per-user, 20 / 10 min
+ * (hub#833 phase 1a). Bounds unbounded `pubkey_challenges` row creation from
+ * a hijacked session.
+ */
+export const pubkeyChallengeRateLimiter = new RateLimiter(
+  PUBKEY_LINK_MAX_ATTEMPTS,
+  PUBKEY_LINK_WINDOW_MS,
+);
+
+/**
+ * `POST /api/account/pubkeys/verify` rate limiter — per-user, 20 / 10 min.
+ * SEPARATE bucket from the challenge limiter on purpose: the legitimate flow
+ * is one challenge per one verify, so sharing a bucket would halve the real
+ * budget and 429 an honest user halfway through their retries. Bounds
+ * BIP-340 verification work on attacker-shaped input.
+ */
+export const pubkeyVerifyRateLimiter = new RateLimiter(
+  PUBKEY_LINK_MAX_ATTEMPTS,
+  PUBKEY_LINK_WINDOW_MS,
+);
+
+/**
  * Backwards-compat shim for hub#188's call sites: the original
  * top-level `checkAndRecord` was the login limiter. New code should
  * reach into `loginRateLimiter.checkAndRecord` directly.
@@ -373,6 +410,8 @@ export function __resetForTests(): void {
   vaultTokenMintRateLimiter.reset();
   signupRateLimiter.reset();
   authIpCeilingRateLimiter.reset();
+  pubkeyChallengeRateLimiter.reset();
+  pubkeyVerifyRateLimiter.reset();
 }
 
 /**
