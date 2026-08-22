@@ -88,8 +88,10 @@ jobs:
   # `scripts/release-plan.ts` (unit-tested — release logic that can
   # double-publish or drop a release shouldn't be untested shell in a `run:`).
   #
-  # Note the tag-push path is unchanged: an explicit tag still publishes, and
-  # still overrides every check, because a tag is a human saying "release this".
+  # Note the tag-push path: an explicit tag still publishes, and passes
+  # `--tag-push` so `decidePublish`'s tag short-circuit overrides every
+  # refuse-guard (an ambiguous registry response, an older-than-published
+  # version) — because a tag is a human saying "release this". hub#841.
   # ---------------------------------------------------------------------------
   plan:
     name: plan
@@ -109,13 +111,13 @@ jobs:
         with:
           bun-version: 1.3
       - id: hub
-        run: bun scripts/release-plan.ts . @openparachute/hub
+        run: bun scripts/release-plan.ts . @openparachute/hub ${{ github.ref_type == 'tag' && '--tag-push' || '' }}
       - id: scope_guard
-        run: bun scripts/release-plan.ts packages/scope-guard @openparachute/scope-guard
+        run: bun scripts/release-plan.ts packages/scope-guard @openparachute/scope-guard ${{ github.ref_type == 'tag' && '--tag-push' || '' }}
       - id: depcheck
-        run: bun scripts/release-plan.ts packages/depcheck @openparachute/depcheck
+        run: bun scripts/release-plan.ts packages/depcheck @openparachute/depcheck ${{ github.ref_type == 'tag' && '--tag-push' || '' }}
       - id: door_contract
-        run: bun scripts/release-plan.ts packages/door-contract @openparachute/door-contract
+        run: bun scripts/release-plan.ts packages/door-contract @openparachute/door-contract ${{ github.ref_type == 'tag' && '--tag-push' || '' }}
 
   test:
     name: test
