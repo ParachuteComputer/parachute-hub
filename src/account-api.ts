@@ -603,7 +603,10 @@ export async function handleAccountCreateVault(
       const subjectIsUser = getUserById(deps.db, auth.sub) !== null;
       recordTokenMint(deps.db, {
         jti: minted.jti,
-        createdVia: "cli_mint",
+        // hub#848: distinct from `cli_mint` — this row is a hub-signed
+        // create-time handoff, not a CLI mint. Same label the host-admin
+        // door stamps, so registry forensics can find both.
+        createdVia: "vault_create_handoff",
         subject: auth.sub,
         ...(subjectIsUser ? { userId: auth.sub } : {}),
         clientId,

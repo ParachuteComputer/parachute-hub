@@ -14,19 +14,27 @@
  *   Content-Type: application/json
  *   { "name": "<vault-name>" }
  *
- *   201 → { name, url, version, token?, token_guidance?, paths? }
- *           // vault freshly created. `token` is a hub-issued ACCESS token
- *           // (a JWT scoped `vault:<name>:admin`) captured from the
- *           // `parachute-vault create --json` branch — NOT a `pvt_*` vault
- *           // token (those were dropped). Post-DROP `token` may be the
- *           // empty string `""` when the bootstrap mint was unavailable
- *           // (e.g. a loopback origin the hub can't mint against); in that
- *           // case `token_guidance` carries the vault's human-readable
- *           // reason, forwarded verbatim so the SPA can explain the gap.
+ *   201 → { name, url, version, token, token_guidance, paths? }
+ *           // vault freshly created. `token` is a HUB-SIGNED, REGISTRY-
+ *           // RECORDED access token (a JWT scoped `vault:<name>:admin`,
+ *           // `aud=vault.<name>`) minted by this handler and bounded to
+ *           // `ACCESS_TOKEN_TTL_SECONDS` (hub#848, mirroring hub#846 on
+ *           // the account door). It is NOT the `parachute-vault create
+ *           // --json` bootstrap credential — that one is unbounded,
+ *           // invisible to the hub token registry, and therefore
+ *           // unrevocable, so it stays INTERNAL to the hub and is never
+ *           // returned on any path of this door, success or error.
+ *           // `token_guidance` is the hub's own prose for the credential
+ *           // it just handed out (never the CLI's, which describes the
+ *           // bootstrap token this door no longer emits).
  *           // `paths` is the new vault's filesystem layout. The
  *           // first-vault-on-host bootstrap (`parachute install vault`)
  *           // doesn't emit JSON yet, so a fresh-box response carries
- *           // name/url/version only.
+ *           // name/url/version + token/token_guidance but no `paths`.
+ *   500 → { error: "vault_created_token_mint_failed", vault, error_description }
+ *           // the vault WAS created but the handoff mint failed. Named
+ *           // distinctly so the caller doesn't read it as "create failed"
+ *           // and retry into a 200 idempotent re-POST with no credential.
  *   200 → { name, url, version }
  *           // idempotent re-POST: existing vault. Never includes `token` —
  *           // the create-time access token isn't retrievable later. The
@@ -58,22 +66,49 @@
  * usually a UI retry, not an error to the caller.
  */
 import type { Database } from "bun:sqlite";
-import { type AdminAuthError, adminAuthErrorResponse, requireScope } from "./admin-auth.ts";
+import {
+  type AdminAuthContext,
+  type AdminAuthError,
+  adminAuthErrorResponse,
+  requireScope,
+} from "./admin-auth.ts";
 import { type ConnectionsDeps, teardownConnection } from "./admin-connections.ts";
 import { SERVICES_MANIFEST_PATH } from "./config.ts";
 import { readConnections } from "./connections-store.ts";
 import { rewriteGrantsRemovingVault } from "./grants.ts";
 import { revokeInvitesForVault } from "./invites.ts";
-import { revokeTokensNamingVault, signAccessToken } from "./jwt-sign.ts";
+import { inferAudience } from "./jwt-audience.ts";
+import {
+  ACCESS_TOKEN_TTL_SECONDS,
+  recordTokenMint,
+  revokeTokensNamingVault,
+  signAccessToken,
+} from "./jwt-sign.ts";
 import { findService, type readManifest, readManifestLenient } from "./services-manifest.ts";
 import { enrichedPath } from "./spawn-path.ts";
-import { removeVaultAssignments } from "./users.ts";
+import { getUserById, removeVaultAssignments } from "./users.ts";
 import { removeVaultCap } from "./vault-caps.ts";
 import { RESERVED_VAULT_NAMES, VAULT_NAME_CHARSET_RE } from "./vault-name.ts";
 import { type WellKnownVaultEntry, isVaultEntry, vaultInstanceNameFor } from "./well-known.ts";
 
 /** Scope required to call POST /vaults. */
 export const HOST_ADMIN_SCOPE = "parachute:host:admin";
+
+/**
+ * Client id stamped on the create-time handoff when the presented bearer
+ * carries no `client_id` claim (operator tokens, legacy self-issued admin
+ * bearers). Whenever the claim IS present the CALLER's id is preserved, so a
+ * registry row attributes the credential to whoever actually asked for it.
+ * Matches `DELETE_VAULT_CLIENT_ID` below — same door, same SPA.
+ */
+const CREATE_VAULT_CLIENT_ID = "parachute-hub-spa";
+
+/**
+ * Lifetime of the create-time vault credential this door hands back. One
+ * access-token lifetime, the same bound `POST /account/vaults` uses for its
+ * handoff (hub#846). The CLI bootstrap it replaces had NO expiry at all.
+ */
+const CREATE_VAULT_HANDOFF_TTL_SECONDS = ACCESS_TOKEN_TTL_SECONDS;
 
 // Lowercase-only (item I) — single source of truth in vault-name.ts. Vault's
 // init enforces `[a-z0-9_-]`; a hub-side `[a-zA-Z0-9_-]` superset let an
@@ -92,17 +127,26 @@ export interface CreateVaultRequest {
 export interface VaultCreateJson {
   name: string;
   /**
-   * Hub-issued access token (a JWT scoped `vault:<name>:admin`) the vault
-   * minted at create time. Post the pvt_* DROP this is the empty string
-   * `""` when no hub origin was reachable to mint against (e.g. a loopback
-   * create) — the field is always present but may be empty.
+   * The CLI's bootstrap credential — a JWT scoped `vault:<name>:admin` the
+   * vault minted at create time. Post the pvt_* DROP this is the empty
+   * string `""` when no hub origin was reachable to mint against (e.g. a
+   * loopback create) — the field is always present but may be empty.
+   *
+   * INTERNAL to the hub (hub#827 / hub#848). Unbounded TTL, no `tokens`
+   * registry row, therefore unrevocable. No door returns it: both create
+   * doors mint their own bounded, registered handoff instead. The only
+   * remaining reader is `account-api.ts`'s write tier, which uses its
+   * emptiness (never its value) as a "did the CLI have a hub origin to mint
+   * against" predicate.
    */
   token: string;
   /**
    * Vault-supplied human-readable reason no token was minted, present only
    * when `token` is empty (e.g. "no hub origin reachable to mint against").
-   * Optional — older vaults that always minted don't emit it. Forwarded
-   * verbatim to the caller so the SPA can explain the empty-token state.
+   * Optional — older vaults that always minted don't emit it. NOT forwarded
+   * to callers: it describes the bootstrap token no door returns any more.
+   * Each door writes its own guidance for the credential it actually hands
+   * back.
    */
   token_guidance?: string;
   paths: {
@@ -450,8 +494,11 @@ export async function handleCreateVault(req: Request, deps: CreateVaultDeps): Pr
 
   // Auth gate: parachute:host:admin scope. Maps an AdminAuthError straight
   // to an RFC 6750 401/403 — the route handler doesn't care which.
+  // The surfaced claims are kept: the create-time handoff is minted against
+  // the CALLER's `sub`/`client_id` so the registry row is attributable.
+  let auth: AdminAuthContext;
   try {
-    await requireScope(deps.db, req, HOST_ADMIN_SCOPE, deps.knownIssuers ?? [deps.issuer]);
+    auth = await requireScope(deps.db, req, HOST_ADMIN_SCOPE, deps.knownIssuers ?? [deps.issuer]);
   } catch (err) {
     return adminAuthErrorResponse(err as AdminAuthError);
   }
@@ -484,27 +531,100 @@ export async function handleCreateVault(req: Request, deps: CreateVaultDeps): Pr
   }
 
   const entry = provisioned.entry;
-  const result = { createJson: provisioned.createJson };
-  // Access token (a `vault:<name>:admin` JWT, possibly empty post-DROP) +
-  // filesystem paths are single-emit at create time. We surface them here so
-  // the caller can immediately bootstrap a connection to the new vault.
-  // `token_guidance` (when the vault couldn't mint) is forwarded verbatim so
-  // the SPA can explain the empty-token state rather than rendering a blank.
-  // Idempotent re-POSTs intentionally never include any of these.
+  // hub#848 (finishing hub#827/hub#846): the `parachute-vault create --json`
+  // bootstrap token stays INTERNAL. It is read nowhere below, never
+  // interpolated into a response body or a log line, and never used as a
+  // fallback on the mint-failure path — a consolation prize that leaked it
+  // would undo the issue. The variable is deliberately not even bound.
+  //
+  // Why it matters even though this door is host-admin only: the CLI
+  // bootstrap has unbounded TTL and no `tokens` registry row, so it is
+  // unrevocable — `revokeTokensNamingVault` (the delete cascade, below) and
+  // the revocation list both miss it, and `parachute auth tokens` can't show
+  // it. `parachute:host:admin` being in NON_REQUESTABLE_SCOPES bounds WHO can
+  // obtain one; it does nothing about what the credential is once handed out.
+  // The replacement is bounded, registered, and attributable, and it dies
+  // with the vault when the delete cascade runs.
+  //
+  // Minted unconditionally on a 201 — including the fresh-box bootstrap
+  // branch where `parachute install vault` emits no JSON at all. Hub signing
+  // needs nothing from the CLI, so an absent or empty CLI token is not a
+  // reason to hand back a credential-less 201 (same call hub#846 made for
+  // its admin tier).
+  const scopes = [`vault:${entry.name}:admin`];
+  // OAuth/SPA bearers carry their requesting client_id; operator tokens and
+  // legacy self-issued admin bearers may omit it. Preserve the caller's id
+  // whenever present so registry forensics name the real requester.
+  const clientId = auth.clientId ?? CREATE_VAULT_CLIENT_ID;
+  let vaultToken: string;
+  // NOT ATOMIC WITH THE PROVISION ABOVE, deliberately surfaced rather than
+  // hidden. `provisionVault` has already committed — the vault exists on disk
+  // and in services.json — and there is no rollback seam (deleting a
+  // just-created vault on a mint failure would be a second destructive action
+  // taken on a guess). So a throw here MUST NOT surface as a generic 500: the
+  // caller would read it as "create failed", retry, and get the idempotent
+  // 200 for a vault it owns but has no credential for. The distinguishable
+  // error below says exactly what state the box is in.
+  try {
+    const minted = await signAccessToken(deps.db, {
+      sub: auth.sub,
+      scopes,
+      audience: inferAudience(scopes), // → `vault.<name>`
+      clientId,
+      issuer: deps.issuer,
+      ttlSeconds: CREATE_VAULT_HANDOFF_TTL_SECONDS,
+      // The token names exactly one vault in `scope`; mirror that in
+      // `vault_scope` so scope-guard sees the same explicit pin rather than
+      // the empty-admin sentinel.
+      vaultScope: [entry.name],
+    });
+    const subjectIsUser = getUserById(deps.db, auth.sub) !== null;
+    recordTokenMint(deps.db, {
+      jti: minted.jti,
+      createdVia: "vault_create_handoff",
+      subject: auth.sub,
+      ...(subjectIsUser ? { userId: auth.sub } : {}),
+      clientId,
+      scopes,
+      expiresAt: minted.expiresAt,
+    });
+    vaultToken = minted.token;
+  } catch (err) {
+    // `detail` is the registry/signing error text (jti + sqlite message). No
+    // credential material passes through here.
+    const detail = err instanceof Error ? err.message : String(err);
+    console.error(
+      `[admin-vaults] vault "${entry.name}" was created but the token handoff failed: ${detail}`,
+    );
+    return new Response(
+      JSON.stringify({
+        error: "vault_created_token_mint_failed",
+        vault: entry.name,
+        error_description: `The vault "${entry.name}" WAS created, but minting its access token failed. The vault exists — do not retry create (it will return 200 for the existing vault). An operator must mint a credential for it (\`GET /admin/vault-admin-token/${entry.name}\` with an admin session) or delete the vault.`,
+      }),
+      { status: 500, headers: { "content-type": "application/json" } },
+    );
+  }
+
+  const handoffMinutes = Math.round(CREATE_VAULT_HANDOFF_TTL_SECONDS / 60);
+  // The hub's own prose for the credential the hub just signed. The CLI's
+  // `token_guidance` is never forwarded: it describes the bootstrap token
+  // this door no longer returns, so forwarding it would explain the wrong
+  // credential (and, on the empty-CLI-token path, claim no token was issued
+  // when in fact one was).
   const body: WellKnownVaultEntry & {
-    token?: string;
-    token_guidance?: string;
+    token: string;
+    token_guidance: string;
     paths?: VaultCreateJson["paths"];
-  } = result.createJson
-    ? {
-        ...entry,
-        token: result.createJson.token,
-        ...(result.createJson.token_guidance
-          ? { token_guidance: result.createJson.token_guidance }
-          : {}),
-        paths: result.createJson.paths,
-      }
-    : entry;
+  } = {
+    ...entry,
+    token: vaultToken,
+    token_guidance: `This token grants admin access to the "${entry.name}" vault only, expires in ${handoffMinutes} minutes, and is registered with the hub so it can be revoked. Mint a fresh one from the hub admin surface when it expires.`,
+    // Filesystem layout is single-emit at create time and is not a
+    // credential. Absent on the fresh-box bootstrap branch, which emits no
+    // JSON. Idempotent re-POSTs (200, above) never include it.
+    ...(provisioned.createJson ? { paths: provisioned.createJson.paths } : {}),
+  };
 
   return new Response(JSON.stringify(body), {
     status: 201,
