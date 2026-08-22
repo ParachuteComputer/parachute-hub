@@ -1908,6 +1908,46 @@ export function resolveIssuerSource(
 }
 
 /**
+ * hub#833 MEDIUM-1 — the origin set the `/api/account/pubkeys` linkage ceremony
+ * may bind a DURABLE proof to.
+ *
+ * The general `buildHubBoundOrigins` set legitimately includes the per-request
+ * issuer, because `resolveIssuer` derives it from the request's Host when
+ * nothing is configured and the OAuth same-origin / known-issuer checks WANT to
+ * accept a browser POST from whatever public Host the operator is actually on
+ * (token provenance is signature-gated regardless — see `buildHubBoundOrigins`
+ * jsdoc). A stored linkage proof is different: it is re-checkable by third
+ * parties forever, so the origin it commits to must be one the hub can vouch
+ * for INDEPENDENTLY of the incoming request. A Host-derived origin is
+ * attacker-influenceable and must not anchor it.
+ *
+ * So when the issuer is request-sourced (`resolveIssuerSource === "request"`:
+ * plain `parachute serve` with no hub_origin / PARACHUTE_ISSUER / expose-state)
+ * we rebuild the set with the issuer DROPPED, keeping only the structurally
+ * trusted sources — loopback aliases (re-added from `loopbackPort`, so a local
+ * ceremony still works), expose-state, and the platform-injected URL. An
+ * unconfigured-but-Host-exposed hub then cannot complete the ceremony until the
+ * operator pins an origin (set hub_origin in the admin SPA, or run `parachute
+ * expose`), which is the correct posture for a durable proof. When the issuer
+ * is settings/env/expose-sourced it is operator- or expose-asserted, not
+ * request-derived, so it is kept — behavior is identical to the general set.
+ */
+export function linkageBoundOrigins(args: {
+  issuerSource: IssuerSource;
+  issuer: string;
+  loopbackPort?: number;
+  exposeHubOrigin?: string;
+  platformOrigin?: string;
+}): readonly string[] {
+  return buildHubBoundOrigins({
+    issuer: args.issuerSource === "request" ? "" : args.issuer,
+    loopbackPort: args.loopbackPort,
+    exposeHubOrigin: args.exposeHubOrigin,
+    platformOrigin: args.platformOrigin,
+  });
+}
+
+/**
  * Minimal structural type for the Bun `Server` handle the fetch callback
  * receives as its 2nd argument. We need `requestIP` (item E / #526) to
  * resolve the peer address for `layerOf`, and `upgrade` (H1) to hand a
@@ -3443,8 +3483,18 @@ export function hubFetch(
           // Only the /pubkeys sub-surface reads this — the hub#833 linkage
           // ceremony binds the signed event's `u` tag to an origin this hub
           // actually answers on, so a NIP-98 signature harvested for another
-          // service (or another hub) can't be replayed here.
-          hubBoundOrigins: oauthDeps(req).hubBoundOrigins(),
+          // service (or another hub) can't be replayed here. MEDIUM-1: unlike
+          // the OAuth same-origin set, the ceremony writes a durable proof, so
+          // we drop the request-sourced (Host-derived) issuer via
+          // `linkageBoundOrigins` — an attacker who controls Host must not be
+          // able to choose the origin a stored proof commits to.
+          hubBoundOrigins: linkageBoundOrigins({
+            issuerSource: resolveIssuerSource(getDb(), configuredIssuer, loadExposeHubOrigin),
+            issuer: resolveIssuer(req, getDb(), configuredIssuer, loadExposeHubOrigin),
+            loopbackPort,
+            exposeHubOrigin: loadExposeHubOrigin(),
+            platformOrigin: process.env.RENDER_EXTERNAL_URL ?? flyDefaultOrigin(process.env),
+          }),
         });
       }
 
