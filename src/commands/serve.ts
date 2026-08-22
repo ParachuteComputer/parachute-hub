@@ -84,6 +84,134 @@ export function hubServeOptions(args: {
   };
 }
 
+/**
+ * The specific loopback address the guard bind claims (hub#741).
+ *
+ * `127.0.0.1` and not `localhost`: the guard's entire job is to OWN a
+ * particular specific bind, and a name that could resolve to `::1` (or to
+ * both) would leave the address the incident actually involved unclaimed.
+ */
+export const LOOPBACK_GUARD_HOST = "127.0.0.1";
+
+/**
+ * True for the wildcard ("all interfaces") bind addresses. Only a wildcard
+ * listener has an unclaimed specific loopback bind sitting next to it — an
+ * operator who set `PARACHUTE_BIND_HOST=127.0.0.1` already owns it, and one
+ * who set a LAN address chose that deliberately and is not asking us to also
+ * grab loopback.
+ */
+export function isWildcardBindHost(hostname: string): boolean {
+  return hostname === "0.0.0.0" || hostname === "::" || hostname === "";
+}
+
+/** A held guard bind. `stop()` releases the second socket. */
+export interface LoopbackGuardBind {
+  stop: () => Promise<void>;
+}
+
+/**
+ * Claim an explicit `127.0.0.1:<port>` socket alongside the hub's wildcard
+ * listener — the PREVENTION half of the loopback-hijack defense (hub#741,
+ * deferred from hub#737).
+ *
+ * ## What it protects
+ *
+ * The hub binds `0.0.0.0:<port>`. Every Parachute module reaches the hub over
+ * `127.0.0.1:<port>` for JWKS and API calls. On 2026-07-02 an OrbStack Linux
+ * VM auto-forwarded its own port 1939 onto the host as a SPECIFIC bind on
+ * `127.0.0.1:1939`, and a specific bind BEATS a wildcard bind for loopback
+ * routing. Every module's hub call silently reached the wrong hub (fresh DB →
+ * empty JWKS), every hub-JWT validation failed, and the resulting 401 loop
+ * exhausted the host's ephemeral ports for nine hours. hub#737 shipped
+ * DETECTION (per-boot instance nonce on `/health`, serve self-probe, doctor
+ * check). This is the other half: if the hub already holds the specific bind,
+ * the rogue's bind FAILS instead of silently shadowing us.
+ *
+ * ## Why it shares the real handler
+ *
+ * When both listeners live in one process, the SPECIFIC bind wins loopback
+ * routing — so a guard socket with a stub handler would steal loopback from
+ * the real hub and self-inflict the exact outage this defends against. The
+ * guard therefore serves the SAME `Bun.serve` options object as the primary
+ * listener: the same `hubFetch` closure (with its per-request connection
+ * handling from hub#738) and the same `createWsBridgeHandlers()` instance,
+ * with only `hostname` overridden. Callers must pass the object they actually
+ * bound, not a rebuilt copy.
+ *
+ * ## Why a failure here is not fatal
+ *
+ * A guard bind that fails means something ELSE already owns
+ * `127.0.0.1:<port>` — i.e. the hijack is already in place, which is exactly
+ * the ordering prevention cannot cover (hub#737's detection does: the
+ * self-probe armed moments later will compare instance nonces and say so
+ * loudly). Refusing to start there would turn a degraded hub into no hub. It
+ * also keeps the guard safe to attempt on platforms where the co-bind
+ * semantics differ: the "wildcard + specific in one process" co-hold and the
+ * "specific bind blocks a later specific bind" behavior were verified on
+ * macOS, where OrbStack runs; Linux/container `SO_REUSEADDR` / `SO_REUSEPORT`
+ * semantics differ and have NOT been re-verified. On a platform that refuses
+ * the co-bind we log and carry on with detection alone.
+ *
+ * ## Interaction with `parachute doctor`
+ *
+ * doctor's hijack check counts DISTINCT PIDs across the port's LISTEN rows
+ * (`defaultCountHubListeners`), not raw sockets — so the guard's second
+ * socket, being in this same process, does not read as a second listener and
+ * cannot false-flag as a shadow.
+ *
+ * Returns `null` when the guard was skipped (non-wildcard bind, ephemeral
+ * port) or could not be claimed; a `stop()` handle when it is held.
+ */
+export function armLoopbackGuardBind(args: {
+  port: number;
+  hostname: string;
+  /** The exact options object passed to the primary `Bun.serve`. */
+  serveOptions: ReturnType<typeof hubServeOptions>;
+  log: (line: string) => void;
+  /** Test seam — the real bind isn't otherwise injectable. */
+  serveImpl?: (options: ReturnType<typeof hubServeOptions>) => { stop: () => unknown };
+  /** Test seam — lets unit tests exercise the wiring on any CI platform. */
+  platform?: string;
+}): LoopbackGuardBind | null {
+  const { port, hostname, serveOptions, log } = args;
+  const serveImpl =
+    args.serveImpl ?? ((options) => Bun.serve(options) as unknown as { stop: () => unknown });
+
+  // The specific-next-to-wildcard co-bind is verified on macOS only: Linux
+  // kernels refuse it outright (EADDRINUSE — proven by pr-verify on ubuntu),
+  // so on non-darwin the attempt would fail on EVERY containerized boot and
+  // log a false hijack alarm forever. The OrbStack hijack this guards against
+  // is itself a macOS phenomenon (hub#737/hub#741), so the guard's verified
+  // scope and its useful scope coincide.
+  if ((args.platform ?? process.platform) !== "darwin") return null;
+  // An explicit bind host already owns a specific bind; nothing to guard.
+  if (!isWildcardBindHost(hostname)) return null;
+  // `port: 0` means "kernel, pick one" — there is no stable port for a rogue
+  // to shadow, and a guard would land on a DIFFERENT ephemeral port, which is
+  // worse than useless. This is the test/embedded path.
+  if (port === 0) return null;
+
+  let guard: { stop: () => unknown };
+  try {
+    guard = serveImpl({ ...serveOptions, hostname: LOOPBACK_GUARD_HOST });
+  } catch (err) {
+    log(
+      `parachute serve: WARNING could not claim the loopback guard bind ${LOOPBACK_GUARD_HOST}:${port} (${
+        err instanceof Error ? err.message : String(err)
+      }). Something else may already own the specific loopback bind for this port — that IS the hub#737 hijack shape. The hub is running on ${hostname}:${port}; the loopback self-probe will report whether 127.0.0.1:${port} reaches this instance. Diagnose: lsof -nP -iTCP:${port} -sTCP:LISTEN`,
+    );
+    return null;
+  }
+  log(
+    `parachute serve: loopback guard bind held on ${LOOPBACK_GUARD_HOST}:${port} (hub#741) — a later specific bind on that address will fail instead of shadowing this hub.`,
+  );
+  return {
+    stop: async () => {
+      await guard.stop();
+    },
+  };
+}
+
 export interface ServeOpts {
   /** Override PORT (test-only). Real callers thread env via process.env. */
   port?: number;
@@ -535,25 +663,28 @@ export async function serve(opts: ServeOpts = {}): Promise<{
   // module ports before it ever hit the hub-port conflict — the
   // dual-supervisor crash loop in hub#536. Binding first makes a duplicate
   // fail fast and cleanly, leaving the live hub's children untouched.
+  //
+  // Built once and reused: the loopback guard bind (hub#741, below) serves
+  // this SAME options object — same `hubFetch` closure, same WS bridge
+  // handler — so the two sockets are the same hub, not two hubs.
+  const serveOptions = hubServeOptions({
+    port,
+    hostname,
+    fetch: hubFetch(WELL_KNOWN_DIR, {
+      getDb: () => dbHolder.get(),
+      onDbError: (err) => dbHolder.healOrExit(err),
+      // #610: /health's db check probes the path so monitoring + the #591
+      // adoption probe see a wipe instead of the ghost-fd lie.
+      probeDbPath: () => dbHolder.probePath(),
+      issuer,
+      loopbackPort: port,
+      instanceNonce,
+      supervisor,
+    }),
+  });
   let server: ReturnType<typeof Bun.serve>;
   try {
-    server = Bun.serve(
-      hubServeOptions({
-        port,
-        hostname,
-        fetch: hubFetch(WELL_KNOWN_DIR, {
-          getDb: () => dbHolder.get(),
-          onDbError: (err) => dbHolder.healOrExit(err),
-          // #610: /health's db check probes the path so monitoring + the #591
-          // adoption probe see a wipe instead of the ghost-fd lie.
-          probeDbPath: () => dbHolder.probePath(),
-          issuer,
-          loopbackPort: port,
-          instanceNonce,
-          supervisor,
-        }),
-      }),
-    );
+    server = Bun.serve(serveOptions);
   } catch (err) {
     const conflict = hubPortConflictMessage(err, port);
     if (conflict) throw new Error(conflict);
@@ -571,6 +702,14 @@ export async function serve(opts: ServeOpts = {}): Promise<{
     startedAt: new Date().toISOString(),
   };
   writeHubInstanceFile(instanceRecord, { configDir: CONFIG_DIR, log });
+
+  // Claim the specific loopback bind too (hub#741) — the prevention half of
+  // the hub#737 defense. AFTER the primary bind on purpose: the primary is the
+  // fail-fast duplicate-supervisor check (hub#536), and a guard attempted
+  // first would surface a duplicate `serve` as the wrong error. Never fatal —
+  // see `armLoopbackGuardBind`; a failure here means the hijack is already in
+  // place, which is precisely what the self-probe armed just below reports.
+  const loopbackGuard = armLoopbackGuardBind({ port, hostname, serveOptions, log });
 
   // Arm the loopback self-probe (hub#737): an immediate check right after the
   // bind catches a hijack that's ALREADY present at boot (the OrbStack VM that
@@ -668,6 +807,9 @@ export async function serve(opts: ServeOpts = {}): Promise<{
       }
       selfProbe?.stop();
       livenessTimer.stop();
+      // Both sockets come down. Leaving the guard bound after a restart would
+      // make the hub's own next boot race itself for 127.0.0.1:<port>.
+      await loopbackGuard?.stop();
       await server.stop();
       // Clear our on-disk identity so a cleanly-stopped hub leaves no stale
       // self-probe verdict for `status` / `doctor` to read (hub#737 review).
