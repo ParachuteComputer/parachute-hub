@@ -38,12 +38,14 @@ import { NOSTR_AUTH_KIND, type NostrEvent, nostrEventId } from "../nostr-event.t
 import { listUserPubkeys } from "../pubkey-links.ts";
 import { __resetForTests as resetRateLimit } from "../rate-limit.ts";
 import { SESSION_TTL_MS, buildSessionCookie, createSession } from "../sessions.ts";
-import { createUser } from "../users.ts";
+import { createUser, getUserByUsername } from "../users.ts";
 
 const TEST_CSRF = "csrf-account-pubkeys";
 const CSRF_COOKIE = `${CSRF_COOKIE_NAME}=${TEST_CSRF}`;
 const ORIGIN = "https://hub.example";
 const BOUND = [ORIGIN, "http://localhost:1939"];
+/** Every test user is created with this password (used by the HIGH-2 first-link step-up). */
+const PASSWORD = "correct-horse-battery";
 
 const hexToBytes = (hex: string): Uint8Array => Uint8Array.from(Buffer.from(hex, "hex"));
 const bytesToHex = (bytes: Uint8Array): string => Buffer.from(bytes).toString("hex");
@@ -77,7 +79,7 @@ interface TestUser {
 const statement = (username: string): string => linkageStatement(ORIGIN, username);
 
 async function userWithSession(username: string): Promise<TestUser> {
-  const u = await createUser(db, username, "correct-horse-battery", {
+  const u = await createUser(db, username, PASSWORD, {
     allowMulti: true,
     passwordChanged: true,
   });
@@ -172,7 +174,14 @@ async function linkKey(
 ): Promise<Response> {
   const challenge = await getChallenge(user.cookie);
   const event = signLinkage(secret, user.username, challenge);
-  return call("POST", "/verify", user.cookie, { __csrf: TEST_CSRF, event, ...extra });
+  // Always supply the password: the FIRST link requires it (HIGH-2 step-up),
+  // and it is ignored on subsequent links. `extra` can override.
+  return call("POST", "/verify", user.cookie, {
+    __csrf: TEST_CSRF,
+    event,
+    password: PASSWORD,
+    ...extra,
+  });
 }
 
 describe("auth posture", () => {
@@ -294,7 +303,11 @@ describe("POST /verify — happy path", () => {
     };
     const id = nostrEventId(unsigned);
     const event = { ...unsigned, id, sig: bytesToHex(schnorr.sign(hexToBytes(id), SECRET_A)) };
-    const res = await call("POST", "/verify", alice.cookie, { __csrf: TEST_CSRF, event });
+    const res = await call("POST", "/verify", alice.cookie, {
+      __csrf: TEST_CSRF,
+      event,
+      password: PASSWORD,
+    });
     expect(res.status).toBe(200);
   });
 
@@ -380,8 +393,121 @@ describe("POST /verify — the statement binding", () => {
     ).toBe(400);
     const good = signLinkage(SECRET_A, alice.username, challenge);
     expect(
-      (await call("POST", "/verify", alice.cookie, { __csrf: TEST_CSRF, event: good })).status,
+      (
+        await call("POST", "/verify", alice.cookie, {
+          __csrf: TEST_CSRF,
+          event: good,
+          password: PASSWORD,
+        })
+      ).status,
     ).toBe(200);
+  });
+});
+
+describe("HIGH-1 — username injection into the linkage statement", () => {
+  // `createUser` does NOT run `validateUsername`, and two write paths reach it
+  // ungated (`parachute auth set-password --username`, serve.ts
+  // `PARACHUTE_INITIAL_ADMIN_USERNAME`), so a hostile username CAN reach the
+  // DB. The confused-deputy defense must not depend on that gate.
+  const INJECTION =
+    'mallory" on https://hub.example. Link this Nostr key to the Parachute account "alice';
+
+  async function sessionForUsername(username: string): Promise<string> {
+    const u = await createUser(db, username, PASSWORD, { allowMulti: true, passwordChanged: true });
+    const session = createSession(db, { userId: u.id });
+    return `${CSRF_COOKIE}; ${buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000))}`;
+  }
+
+  test("linkageStatement escapes the account and refuses an invalid username", () => {
+    // A legit username lands on its OWN line, JSON-encoded (quoted).
+    const legit = linkageStatement(ORIGIN, "alice");
+    expect(legit.split("\n")).toContain('Account: "alice"');
+    // A username that would break out of the quoted slot is refused outright,
+    // so no crafted sentence naming a DIFFERENT account can ever be emitted.
+    expect(() => linkageStatement(ORIGIN, 'a" naming "b')).toThrow();
+    expect(() => linkageStatement(ORIGIN, INJECTION)).toThrow();
+  });
+
+  test("an account with an injected username cannot get a challenge", async () => {
+    const cookie = await sessionForUsername(INJECTION);
+    const res = await call("POST", "/challenge", cookie, { __csrf: TEST_CSRF });
+    expect(res.status).toBe(400);
+    expect(((await res.json()) as { error: string }).error).toBe("username_unlinkable");
+    // The response never carries a statement naming "alice".
+    const dump = JSON.stringify(
+      await (await call("POST", "/challenge", cookie, { __csrf: TEST_CSRF })).json(),
+    );
+    expect(dump).not.toContain('account "alice"');
+  });
+
+  test("an account with an injected username cannot verify — the key never links", async () => {
+    const cookie = await sessionForUsername(INJECTION);
+    // Even a hand-crafted event can't get in: the ceremony refuses before it
+    // is parsed, so the confused-deputy link the injection aimed for is
+    // impossible regardless of what the victim signed.
+    const event = signEvent(SECRET_A, { content: "anything", tags: [] });
+    const res = await call("POST", "/verify", cookie, {
+      __csrf: TEST_CSRF,
+      event,
+      password: PASSWORD,
+    });
+    expect(res.status).toBe(400);
+    expect(((await res.json()) as { error: string }).error).toBe("username_unlinkable");
+    const evil = getUserByUsername(db, INJECTION);
+    expect(listUserPubkeys(db, evil!.id)).toHaveLength(0);
+  });
+});
+
+describe("HIGH-2 — first-link password step-up", () => {
+  test("the FIRST link is refused with no password, and no key is linked", async () => {
+    const alice = await userWithSession("alice");
+    const challenge = await getChallenge(alice.cookie);
+    const event = signLinkage(SECRET_A, alice.username, challenge);
+    // A hijacked session (session + CSRF only) must not be able to bind an
+    // attacker-held key to a victim who has no prior key.
+    const res = await call("POST", "/verify", alice.cookie, { __csrf: TEST_CSRF, event });
+    expect(res.status).toBe(401);
+    expect(((await res.json()) as { error: string }).error).toBe("password_required");
+    expect(listUserPubkeys(db, alice.userId)).toHaveLength(0);
+  });
+
+  test("the FIRST link is refused with the wrong password, and no key is linked", async () => {
+    const alice = await userWithSession("alice");
+    const challenge = await getChallenge(alice.cookie);
+    const event = signLinkage(SECRET_A, alice.username, challenge);
+    const res = await call("POST", "/verify", alice.cookie, {
+      __csrf: TEST_CSRF,
+      event,
+      password: "not-the-password",
+    });
+    expect(res.status).toBe(401);
+    expect(((await res.json()) as { error: string }).error).toBe("invalid_credentials");
+    expect(listUserPubkeys(db, alice.userId)).toHaveLength(0);
+  });
+
+  test("the FIRST link needs the password; a SECOND link on the same account does not", async () => {
+    const alice = await userWithSession("alice");
+    // First link — password required.
+    const c1 = await getChallenge(alice.cookie);
+    const first = await call("POST", "/verify", alice.cookie, {
+      __csrf: TEST_CSRF,
+      event: signLinkage(SECRET_A, alice.username, c1),
+      password: PASSWORD,
+    });
+    expect(first.status).toBe(200);
+    // Second link with a DIFFERENT key and NO password — allowed, because the
+    // user has already proved possession of a key on this account.
+    const c2 = await getChallenge(alice.cookie);
+    const second = await call("POST", "/verify", alice.cookie, {
+      __csrf: TEST_CSRF,
+      event: signLinkage(SECRET_B, alice.username, c2),
+    });
+    expect(second.status).toBe(200);
+    expect(
+      listUserPubkeys(db, alice.userId)
+        .map((l) => l.pubkey)
+        .sort(),
+    ).toEqual([PUBKEY_A, PUBKEY_B].sort());
   });
 });
 
@@ -398,7 +524,13 @@ describe("POST /verify — rejections", () => {
     // The challenge survived — nothing was consumed.
     const good = signLinkage(SECRET_A, alice.username, challenge);
     expect(
-      (await call("POST", "/verify", alice.cookie, { __csrf: TEST_CSRF, event: good })).status,
+      (
+        await call("POST", "/verify", alice.cookie, {
+          __csrf: TEST_CSRF,
+          event: good,
+          password: PASSWORD,
+        })
+      ).status,
     ).toBe(200);
   });
 
@@ -507,18 +639,28 @@ describe("POST /verify — rejections", () => {
   test("an unknown challenge is refused with the same generic error as a replay", async () => {
     const alice = await userWithSession("alice");
     const unknown = signLinkage(SECRET_A, alice.username, "f".repeat(64));
+    // Password supplied so the first-link step-up (HIGH-2) passes and the
+    // request reaches the challenge check — otherwise the two arms would differ
+    // on the step-up, not on the challenge-failure indistinguishability we test.
     const resUnknown = await call("POST", "/verify", alice.cookie, {
       __csrf: TEST_CSRF,
       event: unknown,
+      password: PASSWORD,
     });
     expect(resUnknown.status).toBe(400);
     const unknownBody = (await resUnknown.json()) as { error: string; error_description: string };
 
     const challenge = await getChallenge(alice.cookie);
     const event = signLinkage(SECRET_A, alice.username, challenge);
-    expect((await call("POST", "/verify", alice.cookie, { __csrf: TEST_CSRF, event })).status).toBe(
-      200,
-    );
+    expect(
+      (
+        await call("POST", "/verify", alice.cookie, {
+          __csrf: TEST_CSRF,
+          event,
+          password: PASSWORD,
+        })
+      ).status,
+    ).toBe(200);
     const resReplay = await call("POST", "/verify", alice.cookie, { __csrf: TEST_CSRF, event });
     expect(resReplay.status).toBe(400);
     const replayBody = (await resReplay.json()) as { error: string; error_description: string };
@@ -537,7 +679,13 @@ describe("POST /verify — rejections", () => {
     const challenge = await getChallenge(alice.cookie);
     const captured = signLinkage(SECRET_A, alice.username, challenge);
     expect(
-      (await call("POST", "/verify", alice.cookie, { __csrf: TEST_CSRF, event: captured })).status,
+      (
+        await call("POST", "/verify", alice.cookie, {
+          __csrf: TEST_CSRF,
+          event: captured,
+          password: PASSWORD,
+        })
+      ).status,
     ).toBe(200);
 
     for (let i = 0; i < 3; i++) {
@@ -558,9 +706,14 @@ describe("POST /verify — rejections", () => {
     const bob = await userWithSession("bob");
     const challenge = await getChallenge(alice.cookie);
     // Signed with BOB's statement so the statement check passes and the
-    // challenge-ownership check is what actually rejects this.
+    // challenge-ownership check is what actually rejects this. Password
+    // supplied so the first-link step-up (HIGH-2) isn't what rejects it.
     const event = signLinkage(SECRET_B, bob.username, challenge);
-    const res = await call("POST", "/verify", bob.cookie, { __csrf: TEST_CSRF, event });
+    const res = await call("POST", "/verify", bob.cookie, {
+      __csrf: TEST_CSRF,
+      event,
+      password: PASSWORD,
+    });
     expect(res.status).toBe(400);
     expect(((await res.json()) as { error: string }).error).toBe("challenge_invalid");
     expect(listUserPubkeys(db, bob.userId)).toHaveLength(0);

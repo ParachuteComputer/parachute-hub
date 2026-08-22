@@ -82,7 +82,12 @@ import {
   purgeExpiredChallenges,
   unlinkPubkey,
 } from "./pubkey-links.ts";
-import { pubkeyChallengeRateLimiter, pubkeyVerifyRateLimiter } from "./rate-limit.ts";
+import {
+  changePasswordRateLimiter,
+  pubkeyChallengeRateLimiter,
+  pubkeyVerifyRateLimiter,
+} from "./rate-limit.ts";
+import { PASSWORD_MAX_LEN, getUserById, validateUsername, verifyPassword } from "./users.ts";
 
 /** Path the signed event's `u` tag must name. Also where this surface mounts. */
 export const PUBKEY_VERIFY_PATH = "/api/account/pubkeys/verify";
@@ -131,9 +136,69 @@ export const MAX_PUBKEY_LABEL_LEN = 64;
  * The origin is the one named by the event's own `u` tag, which `checkBinding`
  * has already required to be an origin this hub answers on — so the statement
  * and the endpoint binding can never disagree.
+ *
+ * ## Why the username is escaped and refused (hub#833 HIGH-1)
+ *
+ * The account name is the ONLY untrusted-charset value in the statement, and a
+ * legibility defense whose text an attacker can shape is no defense. Two things
+ * make the sentence un-forgeable regardless of what reached `users.username`:
+ *
+ *   - The account sits ALONE on its own line, and its value is
+ *     `JSON.stringify`'d (quoted + escaped) rather than bare-interpolated into
+ *     a quoted slot. A crafted username can neither break out of the quotes nor
+ *     smuggle a trailing clause that reads as naming a DIFFERENT account, and a
+ *     signer pane that truncates cannot hide the `Account:` prefix and leave a
+ *     forged tail behind.
+ *   - We REFUSE to build the statement at all when `validateUsername` rejects
+ *     the name. `createUser` does not run the validator, and two write paths
+ *     reach it ungated — `parachute auth set-password --username` (auth.ts) and
+ *     `PARACHUTE_INITIAL_ADMIN_USERNAME` (serve.ts) — so a hostile username CAN
+ *     reach the DB. The ceremony must not trust that it didn't: an account
+ *     whose username the validator rejects simply cannot run the ceremony
+ *     (`username_unlinkable`). (The two username validators still diverge —
+ *     `setup-wizard.ts` accepts a looser `[A-Za-z0-9_.-]` superset; reconciling
+ *     them onto `validateUsername` touches a shipped-door setup path and
+ *     `admin`-as-reserved / period / length compat, so it is filed as a
+ *     follow-up rather than folded here. This refusal closes the exploit
+ *     independent of that reconciliation.)
+ *
+ * @throws if `validateUsername(username)` fails — callers on this surface guard
+ * with the same check first and return `username_unlinkable`, so this throw is
+ * the last-line invariant, never a live 500 path.
  */
 export function linkageStatement(origin: string, username: string): string {
-  return `Link this Nostr key to the Parachute account "${username}" on ${origin}.`;
+  const check = validateUsername(username);
+  if (!check.valid) {
+    throw new Error(
+      `refusing to build a linkage statement for a username validateUsername rejects (${check.reason})`,
+    );
+  }
+  // EIP-4361 / SIWE shape: one legible sentence, the bound account isolated on
+  // its own line, its value JSON-encoded. `validateUsername` has already pinned
+  // the charset to [a-z0-9_-], so the encoding can never actually need to
+  // escape anything — it is defense-in-depth for the ungated-write paths above.
+  return [
+    `${origin} asks you to link a Nostr key to a Parachute account.`,
+    "",
+    `Account: ${JSON.stringify(username)}`,
+    "",
+    "Signing binds the Nostr public key in this event to the account named above, on this hub. Do not sign if that account is not yours.",
+  ].join("\n");
+}
+
+/**
+ * Guard reused by `/challenge` and `/verify`: an account whose username the
+ * validator rejects cannot run the ceremony, because `linkageStatement` (its
+ * only legibility anchor) would refuse to build for it. Returns a clean 400
+ * rather than letting `linkageStatement` throw into a 500. See HIGH-1 above.
+ */
+function unlinkableUsername(username: string): Response | null {
+  if (validateUsername(username).valid) return null;
+  return jsonError(
+    400,
+    "username_unlinkable",
+    "this account's username cannot be used in the linkage ceremony — an operator must rename it to a valid username first",
+  );
 }
 
 /** Lowercase hex, 64 chars — the NIP-01 canonical x-only pubkey spelling. */
@@ -256,6 +321,12 @@ function handleChallenge(
   deps: AccountPubkeysDeps,
   now: () => Date,
 ): Response {
+  // HIGH-1: never hand out a template whose statement we could not later
+  // recompute and exact-match — refuse before issuing (and burning) a
+  // challenge that could never be verified.
+  const unlinkable = unlinkableUsername(user.username);
+  if (unlinkable) return unlinkable;
+
   const gate = pubkeyChallengeRateLimiter.checkAndRecord(user.id, now());
   if (!gate.allowed) return tooManyAttempts(gate.retryAfterSeconds ?? 1);
 
@@ -302,6 +373,8 @@ function requestOrigin(req: Request): string {
  *
  * Order is load-bearing and cheap-to-expensive:
  *
+ *   0. username linkability (HIGH-1 — refuse an account whose username the
+ *      validator rejects before touching the request at all)
  *   1. label validation (pure string check — reject before anything else so a
  *      bad label can't burn a challenge)
  *   2. event shape + bounds (`parseNostrEvent`; no hashing yet)
@@ -310,6 +383,8 @@ function requestOrigin(req: Request): string {
  *      from the SESSION's user and the `u` tag's already-validated origin
  *   5. rate limit (before any curve math)
  *   6. NIP-01 id recomputation, then BIP-340 verification
+ *   6b. first-link password step-up (HIGH-2 — only when the account has zero
+ *      linked keys; reuses the `/2fa/disable` password + rate-limit posture)
  *   7. challenge consumption + link write, atomically
  *
  * Nothing before step 7 writes to the database, so every rejection above
@@ -323,6 +398,13 @@ async function handleVerify(
   deps: AccountPubkeysDeps,
   now: () => Date,
 ): Promise<Response> {
+  // 0. HIGH-1: refuse the ceremony for an account whose username the validator
+  //    rejects (see `linkageStatement` / `unlinkableUsername`). Runs first so a
+  //    hostile username that reached the DB through an ungated write path can
+  //    neither be matched against a forged statement nor 500 the handler.
+  const unlinkable = unlinkableUsername(user.username);
+  if (unlinkable) return unlinkable;
+
   // 1. Label.
   let label: string | null = null;
   if (body.label !== undefined && body.label !== null) {
@@ -389,6 +471,46 @@ async function handleVerify(
       "proof_failed",
       "the event's signature does not prove possession of the claimed pubkey",
     );
+  }
+
+  // 6b. First-link step-up (hub#833 HIGH-2). Linking the FIRST key to an
+  //     account is a consequential, durable state change: every later write by
+  //     that user can resolve to this key, and once linked it becomes the
+  //     oldest-wins primary. A session cookie alone must not authorize that —
+  //     a hijacked session could otherwise bind an ATTACKER-held key to a
+  //     victim who has no key yet, poisoning attribution with no prior consent.
+  //     So the FIRST link re-confirms the current password, the same step-up
+  //     `/2fa/disable` and `/password` require, reusing the same argon2id rate-
+  //     limit bucket. Subsequent links do NOT: the user has already proved
+  //     possession of a key on this account, oldest-wins keeps the primary
+  //     stable, and a later link can neither displace it nor forge a new
+  //     primary. Placed AFTER proof-of-possession so a hijacked session with no
+  //     valid signed event never reaches the argon2id verify, and BEFORE the
+  //     commit so a wrong password never consumes the challenge.
+  if (listUserPubkeys(deps.db, user.id).length === 0) {
+    const password = typeof body.password === "string" ? body.password : "";
+    if (!password) {
+      return jsonError(
+        401,
+        "password_required",
+        "Re-enter your current password to link your first key to this account.",
+      );
+    }
+    if (password.length > PASSWORD_MAX_LEN) {
+      return jsonError(
+        413,
+        "password_too_long",
+        `Password must be ≤ ${PASSWORD_MAX_LEN} characters.`,
+      );
+    }
+    // Rate-limit before argon2id — a stolen session must not get an unbounded
+    // grind window (shares the `/password` + `/2fa/disable` bucket).
+    const pwGate = changePasswordRateLimiter.checkAndRecord(user.id, now());
+    if (!pwGate.allowed) return tooManyAttempts(pwGate.retryAfterSeconds ?? 1);
+    const fullUser = getUserById(deps.db, user.id);
+    if (fullUser === null || !(await verifyPassword(fullUser, password))) {
+      return jsonError(401, "invalid_credentials", "That password is incorrect.");
+    }
   }
 
   // 7. Commit.
@@ -483,11 +605,20 @@ function checkBinding(
   if (bound !== undefined && bound.length > 0 && !bound.includes(parsedU.origin)) {
     return generic("event `u` tag names an origin this hub does not answer on");
   }
-  // `req` is unused beyond documenting that the binding is checked against the
-  // hub's OWN origin set rather than the incoming request's Host — a
-  // Host-derived value would let an attacker who controls Host choose the
-  // origin a harvested signature is accepted for. The origin handed back is
-  // the one the SIGNATURE covers, for the same reason.
+  // `req` is unused because the `u`-origin binding is deliberately checked
+  // against a NON-REQUEST-SOURCED origin set, never the incoming request's
+  // Host. This matters more here than for the OAuth same-origin checks: this
+  // ceremony writes a DURABLE proof, and `resolveIssuer` falls back to the
+  // request's own (Host-derived) origin when no hub_origin / PARACHUTE_ISSUER /
+  // expose-state is configured (plain `parachute serve` before `expose`). A
+  // Host-derived origin is attacker-influenceable and must not anchor a stored
+  // proof, so the wiring (`linkageBoundOrigins` in hub-server.ts, keyed off
+  // `resolveIssuerSource`) drops the request-sourced issuer from the set it
+  // passes as `deps.hubBoundOrigins` — leaving only loopback / expose /
+  // platform origins. The origin handed back is thus one the hub can vouch for
+  // independently of this request, and it is the one the SIGNATURE covers.
+  // (MEDIUM-1: this closes the gap the earlier "checked against the hub's own
+  // origin set rather than the incoming Host" claim skipped over.)
   void req;
   return { ok: true, origin: parsedU.origin };
 }
