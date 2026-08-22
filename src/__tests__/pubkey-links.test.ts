@@ -180,6 +180,53 @@ describe("linkPubkey", () => {
     ).toEqual({ ok: false, reason: "challenge_invalid" });
   });
 
+  test("a challenge that validated stays consumed even when the link is then refused", async () => {
+    // The documented trade in `linkPubkey`: once a signed event has been
+    // PRESENTED, its challenge is spent, whatever happens next. Otherwise a
+    // refused attempt would leave a live (challenge, signed event) pair on the
+    // table — exactly the replayable artifact this design exists to prevent.
+    // The cost is that a refused attempt needs a fresh challenge; for an auth
+    // surface that is the right side to err on.
+    const alice = await user("alice");
+    const bob = await user("bob");
+    const now = new Date();
+    const cA = issuePubkeyChallenge(db, alice, now);
+    expect(
+      linkPubkey(db, {
+        userId: alice,
+        pubkey: PK_A,
+        challenge: cA.challenge,
+        proofEvent: proof(PK_A, cA.challenge),
+        now,
+      }).ok,
+    ).toBe(true);
+
+    // Bob's own challenge, spent on a key alice already holds → pubkey_taken.
+    const cB = issuePubkeyChallenge(db, bob, now);
+    expect(
+      linkPubkey(db, {
+        userId: bob,
+        pubkey: PK_A,
+        challenge: cB.challenge,
+        proofEvent: proof(PK_A, cB.challenge),
+        now,
+      }),
+    ).toEqual({ ok: false, reason: "pubkey_taken" });
+
+    // That challenge is now spent — bob cannot reuse it, not even for a key
+    // that WOULD be acceptable.
+    expect(
+      linkPubkey(db, {
+        userId: bob,
+        pubkey: PK_B,
+        challenge: cB.challenge,
+        proofEvent: proof(PK_B, cB.challenge),
+        now,
+      }),
+    ).toEqual({ ok: false, reason: "challenge_invalid" });
+    expect(listUserPubkeys(db, bob)).toHaveLength(0);
+  });
+
   test("an expired challenge is refused", async () => {
     const alice = await user("alice");
     const issued = new Date(1_700_000_000_000);
