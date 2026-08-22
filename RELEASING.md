@@ -11,7 +11,7 @@ This repo publishes FOUR npm packages on independent release cadences via [`.git
 
 **Merging a version bump to `main` is the release signal** (hub#790). CI runs `bun run typecheck` + the four test suites once, then `scripts/release-plan.ts` compares each `package.json` against npm and publishes whatever is new. Nothing is tagged by hand — the `tag-record` job pushes `vX.Y.Z` afterwards as a record of what shipped.
 
-Pushing a tag still works for a deliberate re-release of an **already-published** version: the image republishes (npm rejects republishing an existing version, so the npm job goes red — expected). A tag does **not** bypass `release-plan.ts`'s guards: the workflow never passes `--tag-push`, so an unpublished-older version or an ambiguous registry response fails the plan job and skips every publish (hub#841 tracks whether to wire the override). The merge path is the normal one.
+Pushing a tag is the explicit override: the `plan` job passes `--tag-push`, which makes `release-plan.ts` publish regardless of what the guards would otherwise say — an unpublished-older version, an ambiguous registry response, none of it blocks a tag push, because a tag is a human saying "release this" (hub#841). The one thing a tag can't force is npm itself: republishing an **already-published** version still gets rejected by npm (the npm job goes red — expected), so a deliberate re-release only actually re-pushes the image. The merge path is the normal one; reach for a tag push when you need to bypass the guards on purpose.
 
 ## Version conventions
 
