@@ -22,7 +22,8 @@
  * ## The ceremony
  *
  * `/challenge` returns 32 bytes of CSPRNG entropy plus the exact event the
- * client must sign — a NIP-98-shaped kind-27235 event carrying three tags:
+ * client must sign — a NIP-98-shaped kind-27235 event whose `content` is a
+ * legible statement (see `linkageStatement`) and which carries three tags:
  *
  *   ["u",         "<this hub>/api/account/pubkeys/verify"]
  *   ["method",    "POST"]
@@ -36,16 +37,21 @@
  *   - `created_at` within ±5 minutes of the hub's clock
  *   - the `u` tag naming an origin this hub answers on AND the verify path
  *   - the `method` tag exactly `POST`
+ *   - `content` exactly the linkage statement for THIS session's account and
+ *     that origin
  *   - a recomputed NIP-01 id matching the claimed `id`
  *   - a BIP-340 Schnorr signature over that id verifying against the claimed
  *     x-only pubkey
  *   - a challenge that exists, belongs to THIS user, is unconsumed, and is
  *     unexpired — consumed atomically with the link write
  *
- * Three independent replay defenses stack here: the server-issued single-use
- * challenge (primary), the `created_at` window, and the `u`/`method` binding
- * that stops a NIP-98 signature harvested for another service — or another
- * hub — from being replayed at this one.
+ * Four independent defenses stack here. Against REPLAY: the server-issued
+ * single-use challenge (primary), the `created_at` window, and the `u`/`method`
+ * binding that stops a NIP-98 signature harvested for another service — or
+ * another hub — from being replayed at this one. Against a CONFUSED DEPUTY
+ * (getting a victim to sign the attacker's challenge, so the victim's key
+ * lands on the attacker's account): the statement in `content`, which names
+ * the account being linked in words a signer can show a human.
  *
  * ## Hub-local, no relay
  *
@@ -92,6 +98,43 @@ export const VERIFY_MAX_CREATED_AT_SKEW_SECONDS = 300;
 
 /** Max length of the optional human label on a linked key. */
 export const MAX_PUBKEY_LABEL_LEN = 64;
+
+/**
+ * The human-readable statement the signed event's `content` must carry.
+ *
+ * ## Why an opaque challenge alone is not enough
+ *
+ * A single-use challenge stops REPLAY, but it does not stop a CONFUSED DEPUTY.
+ * Consider Mallory, who holds a hub account but no key: she calls `/challenge`
+ * with her own session, gets an opaque 64-hex string, and puts it in front of a
+ * victim in some unrelated "sign this to continue" prompt. A NIP-07 browser
+ * signer will happily sign an arbitrary event. If the only thing under the
+ * signature were a random hex blob, the victim could not tell what they were
+ * agreeing to — and Mallory would submit the result with her own session and
+ * end up with the victim's key linked to HER account. Attribution would then
+ * resolve every one of Mallory's writes to the victim's npub, which is exactly
+ * the property this feature exists to provide.
+ *
+ * So the ceremony puts a legible sentence under the signature, naming the
+ * account and the hub the key is being bound to. This is the Sign-In-with-X
+ * discipline (EIP-4361's "statement"): the bytes a human is asked to sign have
+ * to say what signing them means. `/verify` recomputes the statement from the
+ * SESSION's user — never from anything in the request — and requires an exact
+ * match, so a signature produced against a statement naming Mallory cannot be
+ * accepted as one naming the victim, and vice versa.
+ *
+ * The honest limit: this is a LEGIBILITY defense, not a cryptographic one. It
+ * works because the victim's signer shows them the content before they approve.
+ * A victim who blind-signs is still phishable, and no hub-side check can fix
+ * that. It converts an invisible attack into a visible one.
+ *
+ * The origin is the one named by the event's own `u` tag, which `checkBinding`
+ * has already required to be an origin this hub answers on — so the statement
+ * and the endpoint binding can never disagree.
+ */
+export function linkageStatement(origin: string, username: string): string {
+  return `Link this Nostr key to the Parachute account "${username}" on ${origin}.`;
+}
 
 /** Lowercase hex, 64 chars — the NIP-01 canonical x-only pubkey spelling. */
 const PUBKEY_RE = /^[0-9a-f]{64}$/;
@@ -157,6 +200,16 @@ function linkWire(link: LinkedPubkey): Record<string, unknown> {
 }
 
 /**
+ * The signed-in principal, as established from the session by the caller.
+ * `username` is needed only to build and re-check the linkage statement.
+ * Nothing on this surface accepts a client-supplied identity.
+ */
+export interface PubkeyCeremonyUser {
+  id: string;
+  username: string;
+}
+
+/**
  * Router. `subpath` is relative to `/api/account/pubkeys` ("" for the
  * collection). The caller (`handleApiAccount`) has already established the
  * session and, for POSTs, the CSRF token.
@@ -164,7 +217,7 @@ function linkWire(link: LinkedPubkey): Record<string, unknown> {
 export async function handleAccountPubkeys(
   req: Request,
   subpath: string,
-  userId: string,
+  user: PubkeyCeremonyUser,
   body: Record<string, unknown>,
   deps: AccountPubkeysDeps,
 ): Promise<Response> {
@@ -172,7 +225,7 @@ export async function handleAccountPubkeys(
 
   if (req.method === "GET") {
     if (subpath !== "") return jsonError(404, "not_found", "no route at that path");
-    return json(200, { pubkeys: listUserPubkeys(deps.db, userId).map(linkWire) });
+    return json(200, { pubkeys: listUserPubkeys(deps.db, user.id).map(linkWire) });
   }
   if (req.method !== "POST") {
     return jsonError(405, "method_not_allowed", "use GET or POST");
@@ -180,11 +233,11 @@ export async function handleAccountPubkeys(
 
   switch (subpath) {
     case "/challenge":
-      return handleChallenge(req, userId, deps, now);
+      return handleChallenge(req, user, deps, now);
     case "/verify":
-      return handleVerify(req, userId, body, deps, now);
+      return handleVerify(req, user, body, deps, now);
     case "/unlink":
-      return handleUnlink(userId, body, deps);
+      return handleUnlink(user.id, body, deps);
     default:
       return jsonError(404, "not_found", `no route at /api/account/pubkeys${subpath}`);
   }
@@ -199,26 +252,29 @@ export async function handleAccountPubkeys(
  */
 function handleChallenge(
   req: Request,
-  userId: string,
+  user: PubkeyCeremonyUser,
   deps: AccountPubkeysDeps,
   now: () => Date,
 ): Response {
-  const gate = pubkeyChallengeRateLimiter.checkAndRecord(userId, now());
+  const gate = pubkeyChallengeRateLimiter.checkAndRecord(user.id, now());
   if (!gate.allowed) return tooManyAttempts(gate.retryAfterSeconds ?? 1);
 
   // Opportunistic housekeeping — expired rows are already unusable; this only
   // stops the table growing. Cheap indexed DELETE on an already-write path.
   purgeExpiredChallenges(deps.db, now());
 
-  const issued = issuePubkeyChallenge(deps.db, userId, now());
+  const issued = issuePubkeyChallenge(deps.db, user.id, now());
+  const origin = requestOrigin(req);
   return json(200, {
     challenge: issued.challenge,
     expires_at: issued.expiresAt,
     event_template: {
       kind: NOSTR_AUTH_KIND,
-      content: "",
+      // The legible statement — see `linkageStatement`. A signer that shows
+      // the user what they are about to sign shows them this sentence.
+      content: linkageStatement(origin, user.username),
       tags: [
-        ["u", `${requestOrigin(req)}${PUBKEY_VERIFY_PATH}`],
+        ["u", `${origin}${PUBKEY_VERIFY_PATH}`],
         ["method", "POST"],
         ["challenge", issued.challenge],
       ],
@@ -250,17 +306,19 @@ function requestOrigin(req: Request): string {
  *      bad label can't burn a challenge)
  *   2. event shape + bounds (`parseNostrEvent`; no hashing yet)
  *   3. kind / created_at / `u` / `method` / challenge-tag presence — all pure
- *   4. rate limit (before any curve math)
- *   5. NIP-01 id recomputation, then BIP-340 verification
- *   6. challenge consumption + link write, atomically
+ *   4. the legible statement in `content` (see `linkageStatement`), recomputed
+ *      from the SESSION's user and the `u` tag's already-validated origin
+ *   5. rate limit (before any curve math)
+ *   6. NIP-01 id recomputation, then BIP-340 verification
+ *   7. challenge consumption + link write, atomically
  *
- * Nothing before step 6 writes to the database, so every rejection above
- * leaves the user's challenge spendable. Step 6's own failures are covered in
+ * Nothing before step 7 writes to the database, so every rejection above
+ * leaves the user's challenge spendable. Step 7's own failures are covered in
  * `linkPubkey`'s docstring (a challenge that validated there stays consumed).
  */
 async function handleVerify(
   req: Request,
-  userId: string,
+  user: PubkeyCeremonyUser,
   body: Record<string, unknown>,
   deps: AccountPubkeysDeps,
   now: () => Date,
@@ -296,18 +354,32 @@ async function handleVerify(
   const event = parsed.event;
 
   // 3. Binding checks — all pure, all before any hashing.
-  const bindingError = checkBinding(event, req, deps, now());
-  if (bindingError) return bindingError;
+  const binding = checkBinding(event, req, deps, now());
+  if (!binding.ok) return binding.res;
   const challenge = tagValue(event, "challenge");
   if (challenge === null || challenge.length === 0) {
     return jsonError(400, "invalid_event", "event must carry a `challenge` tag");
   }
 
-  // 4. Rate limit before the elliptic-curve work.
-  const gate = pubkeyVerifyRateLimiter.checkAndRecord(userId, now());
+  // 4. The legible statement. Recomputed from the SESSION's username and the
+  //    origin the event's own (already origin-validated) `u` tag names — never
+  //    from anything else in the body. A signature produced against a
+  //    statement naming a DIFFERENT account cannot be presented here, which is
+  //    what stops the confused-deputy link described on `linkageStatement`.
+  const expectedStatement = linkageStatement(binding.origin, user.username);
+  if (event.content !== expectedStatement) {
+    return jsonError(
+      400,
+      "invalid_event",
+      "event content must be the linkage statement this hub issued for this account — request a fresh challenge and sign its `content` verbatim",
+    );
+  }
+
+  // 5. Rate limit before the elliptic-curve work.
+  const gate = pubkeyVerifyRateLimiter.checkAndRecord(user.id, now());
   if (!gate.allowed) return tooManyAttempts(gate.retryAfterSeconds ?? 1);
 
-  // 5. Proof of possession. `id_mismatch` and `bad_signature` collapse into
+  // 6. Proof of possession. `id_mismatch` and `bad_signature` collapse into
   //    one response: both mean "this event does not prove you hold that key,"
   //    and telling an attacker which of the two failed is free information.
   const verified = verifyNostrEvent(event);
@@ -319,9 +391,9 @@ async function handleVerify(
     );
   }
 
-  // 6. Commit.
+  // 7. Commit.
   const result = linkPubkey(deps.db, {
-    userId,
+    userId: user.id,
     pubkey: event.pubkey,
     challenge,
     proofEvent: JSON.stringify(event),
@@ -357,17 +429,25 @@ async function handleVerify(
 }
 
 /**
- * Kind / freshness / endpoint-binding checks. Returns an error Response or
- * null. Every failure collapses to the same `invalid_event` body as the shape
- * check above, on purpose.
+ * Kind / freshness / endpoint-binding checks. On success it hands back the
+ * origin the `u` tag named — validated against `hubBoundOrigins` — so the
+ * caller can build the linkage statement against the SAME origin the signature
+ * is bound to, rather than a second, independently-derived one. Every failure
+ * collapses to the same `invalid_event` body as the shape check above, on
+ * purpose.
  */
+type BindingResult = { ok: true; origin: string } | { ok: false; res: Response };
+
 function checkBinding(
   event: NostrEvent,
   req: Request,
   deps: AccountPubkeysDeps,
   now: Date,
-): Response | null {
-  const generic = (why: string) => jsonError(400, "invalid_event", why);
+): BindingResult {
+  const generic = (why: string): BindingResult => ({
+    ok: false,
+    res: jsonError(400, "invalid_event", why),
+  });
 
   if (event.kind !== NOSTR_AUTH_KIND) {
     return generic(`event kind must be ${NOSTR_AUTH_KIND}`);
@@ -406,9 +486,10 @@ function checkBinding(
   // `req` is unused beyond documenting that the binding is checked against the
   // hub's OWN origin set rather than the incoming request's Host — a
   // Host-derived value would let an attacker who controls Host choose the
-  // origin a harvested signature is accepted for.
+  // origin a harvested signature is accepted for. The origin handed back is
+  // the one the SIGNATURE covers, for the same reason.
   void req;
-  return null;
+  return { ok: true, origin: parsedU.origin };
 }
 
 /**

@@ -179,7 +179,7 @@ export async function handleApiAccount(
     return handleAccountPubkeys(
       req,
       subpath.slice("/pubkeys".length),
-      pubkeyGate.user.id,
+      { id: pubkeyGate.user.id, username: pubkeyGate.user.username },
       pubkeyBody,
       deps,
     );
