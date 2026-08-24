@@ -30,6 +30,8 @@ bun run typecheck                # tsc --noEmit
 
 **Test-count trap:** `bun test src` (no `./`) picks up *both* `src/` and `packages/scope-guard/src/` in one inflated, cross-interfering run. Use `bun test ./src`; cite hub-only counts by default, and pair with a separate scope-guard count only when scope-guard is load-bearing in the PR.
 
+- **Test state isolation is unconditional (hub#840).** `bunfig.toml` `[test] preload` replaces any inherited `PARACHUTE_HOME` with a fresh empty temp dir *before* `config.ts` computes `CONFIG_DIR` / `SERVICES_MANIFEST_PATH` (those are import-time constants). Do not weaken this to "only when unset": an inherited value commonly names the live install, and handler tests fall back to `SERVICES_MANIFEST_PATH`. `NODE_ENV=test` also refuses a live `~/.parachute` `CONFIG_DIR` if the cwd-sensitive preload is missed. This does **not** make `bun test ./src` safe on a live operator box: launchd-touching tests still ignore `PARACHUTE_HOME`.
+
 For end-to-end against a real install, `bun link` this repo — the linked `parachute` binary follows the checked-out branch.
 
 ## Naming
