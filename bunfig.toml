@@ -1,0 +1,11 @@
+# Bun config. Test-only so far.
+
+[test]
+# Sandbox PARACHUTE_HOME before anything imports `config.ts`, whose CONFIG_DIR
+# / SERVICES_MANIFEST_PATH are computed at import time and can't be moved
+# afterwards. Without this the suite reads — and writes — the operator's live
+# `~/.parachute` (hub#840). See the preload file for the measurements.
+#
+# Here rather than in package.json's `test` script because CI and everyone's
+# muscle memory run `bun test ./src` directly, not `bun run test`.
+preload = ["./src/__tests__/preload-isolate-home.ts"]
