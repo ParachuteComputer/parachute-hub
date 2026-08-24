@@ -150,17 +150,12 @@ export const MAX_PUBKEY_LABEL_LEN = 64;
  *     signer pane that truncates cannot hide the `Account:` prefix and leave a
  *     forged tail behind.
  *   - We REFUSE to build the statement at all when `validateUsername` rejects
- *     the name. `createUser` does not run the validator, and two write paths
- *     reach it ungated — `parachute auth set-password --username` (auth.ts) and
- *     `PARACHUTE_INITIAL_ADMIN_USERNAME` (serve.ts) — so a hostile username CAN
- *     reach the DB. The ceremony must not trust that it didn't: an account
- *     whose username the validator rejects simply cannot run the ceremony
- *     (`username_unlinkable`). (The two username validators still diverge —
- *     `setup-wizard.ts` accepts a looser `[A-Za-z0-9_.-]` superset; reconciling
- *     them onto `validateUsername` touches a shipped-door setup path and
- *     `admin`-as-reserved / period / length compat, so it is filed as a
- *     follow-up rather than folded here. This refusal closes the exploit
- *     independent of that reconciliation.)
+ *     the name. `createUser` now runs the validator (hub#864), so new writes
+ *     cannot land a hostile username. Existing rows (and a seeded first-user
+ *     `admin`) are grandfathered and still cannot run the ceremony
+ *     (`username_unlinkable`) until renamed. The ceremony must not trust that
+ *     the row was gated: an account whose username the validator rejects
+ *     simply cannot run it.
  *
  * @throws if `validateUsername(username)` fails — callers on this surface guard
  * with the same check first and return `username_unlinkable`, so this throw is
@@ -174,9 +169,9 @@ export function linkageStatement(origin: string, username: string): string {
     );
   }
   // EIP-4361 / SIWE shape: one legible sentence, the bound account isolated on
-  // its own line, its value JSON-encoded. `validateUsername` has already pinned
-  // the charset to [a-z0-9_-], so the encoding can never actually need to
-  // escape anything — it is defense-in-depth for the ungated-write paths above.
+  // its own line, its value JSON-encoded. `validateUsername` (and createUser)
+  // pin the charset to [a-z0-9_-] for new writes; the encoding is still
+  // defense-in-depth for grandfathered rows that reached the DB before #864.
   return [
     `${origin} asks you to link a Nostr key to a Parachute account.`,
     "",

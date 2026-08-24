@@ -6,6 +6,7 @@ import { hubDbPath, openHubDb } from "../hub-db.ts";
 import { recordTokenMint, signAccessToken } from "../jwt-sign.ts";
 import { createSession, findSession } from "../sessions.ts";
 import {
+  InvalidUsernameError,
   PASSWORD_MIN_LEN,
   SingleUserModeError,
   USERNAME_RESERVED,
@@ -18,6 +19,8 @@ import {
   getUserByUsername,
   getUserByUsernameCI,
   isFirstAdmin,
+  isSeedAdminUsername,
+  listUnlinkableUsernames,
   listUsers,
   resetUserPassword,
   setPassword,
@@ -177,6 +180,37 @@ describe("createUser", () => {
       cleanup();
     }
   });
+
+  test("hub#864 chokepoint — rejects format/length/reserved on every write", async () => {
+    const { db, cleanup } = makeDb();
+    try {
+      await expect(createUser(db, "Alice", "pw1")).rejects.toThrow(InvalidUsernameError);
+      await expect(createUser(db, "user.name", "pw1")).rejects.toThrow(InvalidUsernameError);
+      await expect(createUser(db, "a", "pw1")).rejects.toThrow(InvalidUsernameError);
+      await expect(createUser(db, "root", "pw1")).rejects.toThrow(InvalidUsernameError);
+      expect(userCount(db)).toBe(0);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("hub#864 — first-user reserved `admin` is allowed; a later `admin` is not", async () => {
+    const { db, cleanup } = makeDb();
+    try {
+      const first = await createUser(db, "admin", "pw1");
+      expect(first.username).toBe("admin");
+      await expect(createUser(db, "admin", "pw2", { allowMulti: true })).rejects.toThrow(
+        InvalidUsernameError,
+      );
+      // A second reserved word never gets the seed exemption.
+      await expect(createUser(db, "root", "pw2", { allowMulti: true })).rejects.toThrow(
+        InvalidUsernameError,
+      );
+      expect(userCount(db)).toBe(1);
+    } finally {
+      cleanup();
+    }
+  });
 });
 
 describe("verifyPassword", () => {
@@ -228,8 +262,8 @@ describe("listUsers / getUserByUsername", () => {
   test("listUsers returns rows in created_at order", async () => {
     const { db, cleanup } = makeDb();
     try {
-      const a = await createUser(db, "a", "pw", { now: () => new Date(1000) });
-      const b = await createUser(db, "b", "pw", {
+      const a = await createUser(db, "aa", "pw", { now: () => new Date(1000) });
+      const b = await createUser(db, "bb", "pw", {
         allowMulti: true,
         now: () => new Date(2000),
       });
@@ -400,6 +434,50 @@ describe("validateUsername", () => {
     expect(validateUsername("user-2").valid).toBe(true);
     expect(validateUsername("123").valid).toBe(true);
     expect(validateUsername("_-_").valid).toBe(true);
+  });
+});
+
+describe("isSeedAdminUsername", () => {
+  test("only the exact lowercase first-user `admin`", () => {
+    expect(isSeedAdminUsername("admin", 0)).toBe(true);
+    expect(isSeedAdminUsername("admin", 1)).toBe(false);
+    expect(isSeedAdminUsername("Admin", 0)).toBe(false);
+    expect(isSeedAdminUsername("root", 0)).toBe(false);
+    expect(isSeedAdminUsername("ops", 0)).toBe(false);
+  });
+});
+
+describe("listUnlinkableUsernames", () => {
+  test("empty when every row is valid", async () => {
+    const { db, cleanup } = makeDb();
+    try {
+      await createUser(db, "ops", "pw1");
+      expect(listUnlinkableUsernames(db)).toEqual([]);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("reports a seeded `admin` and a grandfathered out-of-charset row", async () => {
+    const { db, cleanup } = makeDb();
+    try {
+      await createUser(db, "admin", "pw1");
+      const stamp = new Date().toISOString();
+      db.prepare(
+        `INSERT INTO users (id, username, password_hash, created_at, updated_at, password_changed, email)
+         VALUES (?, ?, ?, ?, ?, 1, NULL)`,
+      ).run("legacy-1", "Alice", "not-a-real-hash", stamp, stamp);
+      const listed = listUnlinkableUsernames(db);
+      expect(listed).toEqual(
+        expect.arrayContaining([
+          { username: "admin", reason: "reserved" },
+          { username: "Alice", reason: "format" },
+        ]),
+      );
+      expect(listed).toHaveLength(2);
+    } finally {
+      cleanup();
+    }
   });
 });
 

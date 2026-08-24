@@ -76,6 +76,15 @@ export class UsernameTakenError extends Error {
   }
 }
 
+export class InvalidUsernameError extends Error {
+  readonly reason: "format" | "length" | "reserved";
+  constructor(username: string, reason: "format" | "length" | "reserved") {
+    super(`username "${username}" is invalid (${reason})`);
+    this.name = "InvalidUsernameError";
+    this.reason = reason;
+  }
+}
+
 export class UserNotFoundError extends Error {
   constructor(ref: string) {
     super(`user "${ref}" not found`);
@@ -283,6 +292,14 @@ export async function createUser(
   const count = (db.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM users").get() ?? { n: 0 })
     .n;
   if (count > 0 && !opts.allowMulti) throw new SingleUserModeError();
+
+  // Chokepoint (hub#864): every users.username write is gated here so the
+  // wizard / env-seed / `auth set-password` paths cannot land a name the
+  // linkage ceremony will refuse. Existing rows are not rewritten.
+  const check = validateUsername(username);
+  if (!check.valid && !isSeedAdminUsername(username, count)) {
+    throw new InvalidUsernameError(username, check.reason);
+  }
 
   const id = randomUUID();
   const passwordHash = await argonHash(password);
@@ -706,8 +723,8 @@ export function deleteUser(db: Database, userId: string): boolean {
 export const USERNAME_RESERVED = ["admin", "root", "system", "setup", "parachute", "hub"] as const;
 
 const USERNAME_REGEX = /^[a-z0-9_-]+$/;
-const USERNAME_MIN_LEN = 2;
-const USERNAME_MAX_LEN = 32;
+export const USERNAME_MIN_LEN = 2;
+export const USERNAME_MAX_LEN = 32;
 
 export type ValidateUsernameResult =
   | { valid: true; name: string }
@@ -734,6 +751,46 @@ export function validateUsername(name: string): ValidateUsernameResult {
     return { valid: false, reason: "reserved" };
   }
   return { valid: true, name };
+}
+
+/**
+ * First-user seed paths (`PARACHUTE_INITIAL_ADMIN_USERNAME`, the wizard's
+ * first admin, `parachute auth set-password` with no existing user) may
+ * use the reserved word `admin` — it IS the admin. Charset + length still
+ * apply via `validateUsername` (this helper only waives the reserved-word
+ * reason, and only for the exact lowercase spelling). Other reserved
+ * words, and `admin` on any subsequent create, stay rejected.
+ */
+export function isSeedAdminUsername(name: string, existingUserCount: number): boolean {
+  return existingUserCount === 0 && name === "admin";
+}
+
+export function describeUsernameReason(reason: "format" | "length" | "reserved"): string {
+  switch (reason) {
+    case "length":
+      return "username must be 2-32 characters long";
+    case "format":
+      return "username must contain only lowercase letters, digits, hyphens, and underscores ([a-z0-9_-])";
+    case "reserved":
+      return "username is reserved (admin, root, system, setup, parachute, hub)";
+  }
+}
+
+/**
+ * Existing rows whose username `validateUsername` rejects — including a
+ * seeded `admin`. They stay in the DB (grandfathered) but cannot run the
+ * pubkey-linkage ceremony until renamed. Callers (serve boot) surface
+ * this as an operator warning.
+ */
+export function listUnlinkableUsernames(
+  db: Database,
+): Array<{ username: string; reason: "format" | "length" | "reserved" }> {
+  const out: Array<{ username: string; reason: "format" | "length" | "reserved" }> = [];
+  for (const u of listUsers(db)) {
+    const r = validateUsername(u.username);
+    if (!r.valid) out.push({ username: u.username, reason: r.reason });
+  }
+  return out;
 }
 
 /**
