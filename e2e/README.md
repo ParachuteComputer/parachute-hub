@@ -2,7 +2,7 @@
 
 This directory holds the **Tier 1** end-to-end harness for the hub: a
 systemd-in-container test that runs the **real fresh-Linux install flow** an
-operator runs on a VPS — `curl bun.sh/install` → `bun add -g
+operator runs on a VPS — `curl bun.sh/install` pinned to bun-v1.4.0 → `bun add -g
 @openparachute/hub` → `parachute init` → setup wizard → MCP — and replays the
 field-failure scenarios from recent weeks as staged assertions.
 
