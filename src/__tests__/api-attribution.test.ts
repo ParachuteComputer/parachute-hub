@@ -22,9 +22,9 @@ import { handleApiTokens } from "../api-tokens.ts";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
 import { recordTokenMint, signAccessToken } from "../jwt-sign.ts";
 import { type NostrEvent, nostrEventId, verifyNostrEvent } from "../nostr-event.ts";
-import { issuePubkeyChallenge, linkPubkey } from "../pubkey-links.ts";
+import { issuePubkeyChallenge, linkPubkey, unlinkPubkey } from "../pubkey-links.ts";
 import { getActiveSigningKey } from "../signing-keys.ts";
-import { createUser } from "../users.ts";
+import { createUser, deleteUser } from "../users.ts";
 
 const ISSUER = "https://hub.example";
 
@@ -192,6 +192,52 @@ describe("resolution", () => {
     const dump = JSON.stringify(await res.json());
     expect(dump).not.toContain(PUBKEY);
     expect(dump).not.toContain(alice);
+  });
+
+  test("keeps a registry-attributed proof resolvable after unlink", async () => {
+    const userId = await linkedUser("alice");
+    recordTokenMint(db, {
+      jti: "jti-unlinked-proof",
+      createdVia: "cli_mint",
+      subject: userId,
+      userId,
+      clientId: "parachute-hub",
+      scopes: ["vault:work:read"],
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    });
+    expect(unlinkPubkey(db, userId, PUBKEY)).toBe(true);
+
+    const res = await get(
+      `/api/auth/attribution?subject=${userId}`,
+      await bearer(["parachute:host:auth"]),
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { pubkeys: { proof_event: NostrEvent }[] };
+    expect(body.pubkeys).toHaveLength(1);
+    expect(verifyNostrEvent(body.pubkeys[0]!.proof_event)).toEqual({ ok: true });
+  });
+
+  test("keeps a registry-attributed proof resolvable after account deletion", async () => {
+    const userId = await linkedUser("alice");
+    recordTokenMint(db, {
+      jti: "jti-deleted-user-proof",
+      createdVia: "cli_mint",
+      subject: userId,
+      userId,
+      clientId: "parachute-hub",
+      scopes: ["vault:work:read"],
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    });
+    expect(deleteUser(db, userId)).toBe(true);
+
+    const res = await get(
+      `/api/auth/attribution?subject=${userId}`,
+      await bearer(["parachute:host:auth"]),
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { pubkeys: { proof_event: NostrEvent }[] };
+    expect(body.pubkeys).toHaveLength(1);
+    expect(verifyNostrEvent(body.pubkeys[0]!.proof_event)).toEqual({ ok: true });
   });
 });
 

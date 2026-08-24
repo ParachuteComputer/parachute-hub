@@ -658,6 +658,9 @@ export async function resetUserPassword(
  *   - `user_vaults.user_id` has `ON DELETE CASCADE` (migration v10), so
  *     vault assignments are dropped automatically when the parent row
  *     goes. No explicit cleanup needed.
+ *   - `attribution_proofs` deliberately has no user FK (migration v18), so a
+ *     deleted subject's signed key-possession proof remains available for
+ *     historical registry rows whose `subject` and `subject_pubkey` survive.
  *
  * Returns false when no user matches the id (idempotent — the API
  * layer translates that to 404). Returns true on a successful delete.
@@ -692,7 +695,7 @@ export function deleteUser(db: Database, userId: string): boolean {
     db.prepare("DELETE FROM sessions WHERE user_id = ?").run(userId);
     db.prepare("DELETE FROM grants WHERE user_id = ?").run(userId);
     db.prepare("DELETE FROM auth_codes WHERE user_id = ?").run(userId);
-    // 3. Drop the user row itself.
+    // 3. Drop the user row itself. The no-FK attribution proof archive remains.
     db.prepare("DELETE FROM users WHERE id = ?").run(userId);
   })();
   return true;

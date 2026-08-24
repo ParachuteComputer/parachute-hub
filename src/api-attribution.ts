@@ -13,9 +13,10 @@
  * and that no third party can check.
  *
  * Phase 1b does NOT change that column. It adds a resolution step a reader can
- * take at display time: `sub` → linked pubkey(s) → a portable, checkable
- * identity. The stored value stays opaque and stable; the identity becomes
- * verifiable. This endpoint is the hub's half of that step.
+ * take at display time: `sub` → historically proved pubkey(s) → a portable,
+ * checkable identity. The stored value stays opaque and stable; the identity
+ * remains verifiable even if the live account link is later removed. This
+ * endpoint is the hub's half of that step.
  *
  * ## What "verifiable" means here, precisely
  *
@@ -33,8 +34,9 @@
  * ## Auth + disclosure posture
  *
  * Bearer-gated on `parachute:host:auth`, matching the rest of `/api/auth/*`
- * (`mint-token`, `revoke-token`, `tokens`). This is a **directory of who holds
- * which key**, so it is operator-level on purpose.
+ * (`mint-token`, `revoke-token`, `tokens`). This is a **directory of who has
+ * proved possession of which key**, including historical proofs rather than a
+ * claim about who holds the key now, so it is operator-level on purpose.
  *
  * That is also an acknowledged SEAM, not an oversight: the natural consumer of
  * phase-1b resolution is a resource server (the vault, rendering `created_by`),
@@ -43,12 +45,12 @@
  * — squarely an ACL question (design doc seam S1/S1b, Jon's), so phase 1 leaves
  * it at the operator level rather than guessing.
  *
- * An unknown subject and a subject with no linked key return the SAME body
- * shape with an empty list. There is no user-existence oracle here.
+ * An unknown subject and a subject that never proved a key return the SAME
+ * body shape with an empty list. There is no user-existence oracle here.
  */
 import type { Database } from "bun:sqlite";
 import { validateAccessToken } from "./jwt-sign.ts";
-import { listUserPubkeys, proofEventFor } from "./pubkey-links.ts";
+import { attributionProofsForSubject } from "./pubkey-links.ts";
 
 /** Scope required on the bearer. Same gate as `GET /api/auth/tokens`. */
 export const API_ATTRIBUTION_REQUIRED_SCOPE = "parachute:host:auth";
@@ -133,9 +135,12 @@ export async function handleApiAttribution(
     );
   }
 
-  // 5. Resolve. An unknown subject simply has no rows — same body as a known
-  //    subject with no linked key.
-  const pubkeys = listUserPubkeys(deps.db, subject).map((link) => ({
+  // 5. Resolve from the durable proof archive. An unknown subject simply
+  //    has no rows — same body as a subject that never established a proof.
+  //    Deliberately include historical proofs whose live account link was
+  //    removed: downstream attribution snapshots must stay independently
+  //    verifiable after unlink or account deletion.
+  const pubkeys = attributionProofsForSubject(deps.db, subject).map((link) => ({
     pubkey: link.pubkey,
     label: link.label,
     linked_at: link.linkedAt,
@@ -145,7 +150,7 @@ export async function handleApiAttribution(
     // native shape it would sign. Malformed JSON (impossible via the ceremony —
     // we store `JSON.stringify` of a parsed event — but defense in depth)
     // surfaces as null rather than crashing the response.
-    proof_event: parseProof(proofEventFor(deps.db, link.pubkey)),
+    proof_event: parseProof(link.proofEvent),
   }));
 
   return new Response(JSON.stringify({ subject, pubkeys }), {

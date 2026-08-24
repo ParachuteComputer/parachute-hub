@@ -13,6 +13,10 @@
  * A hub user may hold **zero or more** linked keys; a key names **at most one**
  * user hub-wide (`user_pubkeys.pubkey` is the PRIMARY KEY — see migration v17
  * for why that is a security property rather than a convenience).
+ * Successful ceremonies are also copied into `attribution_proofs`, keyed by
+ * `(subject, pubkey)` without a user foreign key. That durable audit row is
+ * intentionally not deleted with the live link or account: registry snapshots
+ * naming the subject and key must remain independently verifiable.
  *
  * No new principal entity is introduced. `users.id` is already what every
  * minted token's `sub` claim carries, so linkage hangs off the row that
@@ -67,10 +71,26 @@ export interface LinkedPubkey {
   lastVerifiedAt: string;
 }
 
+/** A subject→pubkey possession proof retained independently of the live link. */
+export interface AttributionProof extends LinkedPubkey {
+  /** Verbatim signed NIP-01 event; callers can re-verify it independently. */
+  proofEvent: string;
+}
+
 interface LinkRow {
   pubkey: string;
   user_id: string;
   label: string | null;
+  proof_event_id: string;
+  linked_at: string;
+  last_verified_at: string;
+}
+
+interface AttributionProofRow {
+  subject: string;
+  pubkey: string;
+  label: string | null;
+  proof_event: string;
   proof_event_id: string;
   linked_at: string;
   last_verified_at: string;
@@ -85,6 +105,50 @@ function rowToLink(r: LinkRow): LinkedPubkey {
     linkedAt: r.linked_at,
     lastVerifiedAt: r.last_verified_at,
   };
+}
+
+function rowToAttributionProof(r: AttributionProofRow): AttributionProof {
+  return {
+    pubkey: r.pubkey,
+    userId: r.subject,
+    label: r.label,
+    proofEvent: r.proof_event,
+    proofEventId: r.proof_event_id,
+    linkedAt: r.linked_at,
+    lastVerifiedAt: r.last_verified_at,
+  };
+}
+
+function retainAttributionProof(
+  db: Database,
+  proof: {
+    subject: string;
+    pubkey: string;
+    label: string | null;
+    proofEvent: string;
+    proofEventId: string;
+    linkedAt: string;
+    lastVerifiedAt: string;
+  },
+): void {
+  db.prepare(
+    `INSERT INTO attribution_proofs
+       (subject, pubkey, label, proof_event, proof_event_id, linked_at, last_verified_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(subject, pubkey) DO UPDATE SET
+       label = excluded.label,
+       proof_event = excluded.proof_event,
+       proof_event_id = excluded.proof_event_id,
+       last_verified_at = excluded.last_verified_at`,
+  ).run(
+    proof.subject,
+    proof.pubkey,
+    proof.label,
+    proof.proofEvent,
+    proof.proofEventId,
+    proof.linkedAt,
+    proof.lastVerifiedAt,
+  );
 }
 
 /**
@@ -216,6 +280,15 @@ export function linkPubkey(db: Database, opts: LinkPubkeyOpts): LinkPubkeyResult
            (pubkey, user_id, label, proof_event, proof_event_id, linked_at, last_verified_at)
          VALUES (?, ?, ?, ?, ?, ?, ?)`,
       ).run(opts.pubkey, opts.userId, label, opts.proofEvent, proofEventId, stamp, stamp);
+      retainAttributionProof(db, {
+        subject: opts.userId,
+        pubkey: opts.pubkey,
+        label,
+        proofEvent: opts.proofEvent,
+        proofEventId,
+        linkedAt: stamp,
+        lastVerifiedAt: stamp,
+      });
       return {
         ok: true,
         relinked: false,
@@ -235,6 +308,15 @@ export function linkPubkey(db: Database, opts: LinkPubkeyOpts): LinkPubkeyResult
          SET label = ?, proof_event = ?, proof_event_id = ?, last_verified_at = ?
        WHERE pubkey = ? AND user_id = ?`,
     ).run(label, opts.proofEvent, proofEventId, stamp, opts.pubkey, opts.userId);
+    retainAttributionProof(db, {
+      subject: opts.userId,
+      pubkey: opts.pubkey,
+      label,
+      proofEvent: opts.proofEvent,
+      proofEventId,
+      linkedAt: existing.linked_at,
+      lastVerifiedAt: stamp,
+    });
     return {
       ok: true,
       relinked: true,
@@ -283,6 +365,23 @@ export function proofEventFor(db: Database, pubkey: string): string | null {
   return row?.proof_event ?? null;
 }
 
+/**
+ * Every possession proof a subject has established, including proofs whose
+ * live link was later removed. This durable archive is the audit counterpart
+ * to `listUserPubkeys`, which answers only what the account holds now.
+ */
+export function attributionProofsForSubject(db: Database, subject: string): AttributionProof[] {
+  return db
+    .query<AttributionProofRow, [string]>(
+      `SELECT subject, pubkey, label, proof_event, proof_event_id, linked_at, last_verified_at
+       FROM attribution_proofs
+       WHERE subject = ?
+       ORDER BY linked_at ASC, pubkey ASC`,
+    )
+    .all(subject)
+    .map(rowToAttributionProof);
+}
+
 /** Phase-1b resolution: a subject's linked keys, in deterministic order. */
 export function pubkeysForUser(db: Database, userId: string): string[] {
   return listUserPubkeys(db, userId).map((l) => l.pubkey);
@@ -303,7 +402,10 @@ export function primaryPubkeyForUser(db: Database, userId: string): string | nul
   return row?.pubkey ?? null;
 }
 
-/** Remove a link. Self-only: the `user_id` predicate is not optional. */
+/**
+ * Remove a LIVE link. Self-only: the `user_id` predicate is not optional.
+ * The independently stored attribution proof is deliberately retained.
+ */
 export function unlinkPubkey(db: Database, userId: string, pubkey: string): boolean {
   const res = db
     .prepare("DELETE FROM user_pubkeys WHERE pubkey = ? AND user_id = ?")

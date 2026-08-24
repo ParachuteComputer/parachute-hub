@@ -9,7 +9,7 @@
  * multi-use public-signup links + email-as-username + the `vault_caps`
  * per-vault storage-cap table), and Nostr-pubkey ↔ user linkage plus the
  * additive `tokens.subject_pubkey` attribution snapshot (v17, hub#833
- * phase 1).
+ * phase 1), and the durable attribution proof archive (v18, hub#860).
  *
  * Each open() runs `migrate()` to bring the schema up to date. A
  * `schema_version` table records every applied migration so re-opens are
@@ -660,6 +660,37 @@ const MIGRATIONS: readonly Migration[] = [
       ALTER TABLE tokens ADD COLUMN subject_pubkey TEXT;
       CREATE INDEX tokens_subject_pubkey ON tokens (subject_pubkey)
         WHERE subject_pubkey IS NOT NULL;
+    `,
+  },
+  {
+    version: 18,
+    sql: `
+      -- Preserve the signed possession proof independently of the LIVE
+      -- user_pubkeys link (hub#860). Unlinking a key or deleting its user must
+      -- not make an already-written tokens.subject_pubkey snapshot impossible
+      -- to verify later. No FK to users/user_pubkeys on purpose: this is an
+      -- durable audit store, keyed by the stable subject string that JWTs
+      -- and downstream attribution rows already carry plus the pubkey.
+      CREATE TABLE attribution_proofs (
+        subject TEXT NOT NULL,
+        pubkey TEXT NOT NULL,
+        label TEXT,
+        proof_event TEXT NOT NULL,
+        proof_event_id TEXT NOT NULL,
+        linked_at TEXT NOT NULL,
+        last_verified_at TEXT NOT NULL,
+        PRIMARY KEY (subject, pubkey)
+      );
+      CREATE INDEX attribution_proofs_pubkey ON attribution_proofs (pubkey);
+
+      -- Every proof that is still live at migration time is already verified;
+      -- preserve it before any later unlink/account-delete can cascade the
+      -- source row away. Historical proofs deleted before v18 cannot be
+      -- reconstructed and are intentionally not fabricated.
+      INSERT INTO attribution_proofs
+        (subject, pubkey, label, proof_event, proof_event_id, linked_at, last_verified_at)
+      SELECT user_id, pubkey, label, proof_event, proof_event_id, linked_at, last_verified_at
+      FROM user_pubkeys;
     `,
   },
 ];
