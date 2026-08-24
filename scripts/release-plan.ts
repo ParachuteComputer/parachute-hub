@@ -23,6 +23,13 @@
  * installing `@rc` would silently DOWNGRADE. We refuse to move a dist-tag
  * backwards. (Re-publishing an older version deliberately is still possible
  * via an explicit tag push, which takes the tag branch below.)
+ *
+ * **Stable that skipped rc.** 0.7.13 through 0.7.16 shipped `@latest` with
+ * new code and no matching `X.Y.Z-rc.*`. Stable is a suffix-drop from an rc
+ * of the same X.Y.Z, never a skip: `decidePublish` refuses a stable unless
+ * npm already has that rc, and the CLI refuses again unless `git diff` from
+ * the latest matching rc tag only touches version/changelog/lockfile paths.
+ * An explicit tag push still overrides — a human saying "release this".
  */
 
 import { appendFileSync } from "node:fs";
@@ -62,6 +69,13 @@ export interface RegistryView {
   versionExists: boolean;
   /** Current version behind the dist-tag we'd move (`rc` or `latest`). */
   currentDistTagVersion?: string;
+  /**
+   * Every version currently on npm. Used to require an `X.Y.Z-rc.*` of the
+   * same core before a stable. Omitted is treated as empty — a stable then
+   * refuses unless this is a first-ever package (nothing on the dist-tag
+   * either). Forgetting to plumb the list must not silently skip the gate.
+   */
+  publishedVersions?: readonly string[];
 }
 
 /** `rc` for a prerelease, `latest` otherwise. */
@@ -95,6 +109,70 @@ export function compareVersions(a: string, b: string): number {
   }
   if (pa.preNum === pb.preNum) return 0;
   return pa.preNum < pb.preNum ? -1 : 1;
+}
+
+/** `0.7.17-rc.1` → `0.7.17`; a stable is returned unchanged. */
+export function coreVersion(version: string): string {
+  return version.split("-")[0] ?? version;
+}
+
+/**
+ * Published versions that are an `X.Y.Z-rc.N` of `version`'s core.
+ * `0.7.16-rc.1` does not match a `0.7.17` stable.
+ */
+export function matchingRcVersions(version: string, published: readonly string[]): string[] {
+  const core = coreVersion(version);
+  const escaped = core.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const re = new RegExp(`^${escaped}-rc\\.\\d+$`);
+  return published.filter((v) => re.test(v)).sort(compareVersions);
+}
+
+/**
+ * Files a stable promotion may touch vs the latest matching rc tag.
+ * Anything else is "new code" and the publish is refused.
+ */
+export const STABLE_PROMOTION_ALLOWED_PATHS: readonly string[] = [
+  "package.json",
+  "CHANGELOG.md",
+  "RELEASING.md",
+  "bun.lock",
+  "packages/scope-guard/package.json",
+  "packages/scope-guard/CHANGELOG.md",
+  "packages/depcheck/package.json",
+  "packages/door-contract/package.json",
+  "packages/door-contract/CHANGELOG.md",
+];
+
+export function disallowedStablePromotionPaths(
+  changedPaths: readonly string[],
+  allowed: readonly string[] = STABLE_PROMOTION_ALLOWED_PATHS,
+): string[] {
+  const allow = new Set(allowed);
+  return changedPaths.filter((p) => p.length > 0 && !allow.has(p));
+}
+
+/** Highest `prefix+X.Y.Z-rc.N` tag for this version's core, or undefined. */
+export function latestMatchingRcTag(
+  tags: readonly string[],
+  version: string,
+  prefix: string,
+): string | undefined {
+  const core = coreVersion(version);
+  const escapedPrefix = prefix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const escapedCore = core.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const re = new RegExp(`^${escapedPrefix}${escapedCore}-rc\\.\\d+$`);
+  const matches = tags.filter((t) => re.test(t));
+  if (matches.length === 0) return undefined;
+  matches.sort((a, b) => compareVersions(a.slice(prefix.length), b.slice(prefix.length)));
+  return matches[matches.length - 1];
+}
+
+export function rcTagListArgs(dir: string, version: string): string[] {
+  return ["git", "tag", "-l", `${tagPrefixFor(dir)}${coreVersion(version)}-rc.*`];
+}
+
+export function stablePromotionDiffArgs(rcTag: string): string[] {
+  return ["git", "diff", "--name-only", `${rcTag}..HEAD`];
 }
 
 /**
@@ -131,6 +209,20 @@ export function decidePublish(
         "This usually means parallel PRs merged out of version order; bump and re-merge.",
     };
   }
+  if (distTagFor(version) === "latest") {
+    const published = registry.publishedVersions ?? [];
+    const firstEver = published.length === 0 && !current;
+    if (!firstEver) {
+      const rcs = matchingRcVersions(version, published);
+      if (rcs.length === 0) {
+        const core = coreVersion(version);
+        return {
+          refuse: true,
+          reason: `${version} is a stable release but npm has no ${core}-rc.* — stable is a suffix-drop from an rc, never a skip. Cut an rc first, soak, then drop the suffix.`,
+        };
+      }
+    }
+  }
   return { publish: true, reason: `${version} is not on npm` };
 }
 
@@ -145,7 +237,7 @@ export async function readRegistry(
     const res = await fetchImpl(`https://registry.npmjs.org/${encoded}`);
     if (res.status === 404) {
       // Package has never been published at all — first release.
-      return { versionExists: false };
+      return { versionExists: false, publishedVersions: [] };
     }
     if (!res.ok) return { ambiguous: true };
     const body = (await res.json()) as {
@@ -155,6 +247,7 @@ export async function readRegistry(
     return {
       versionExists: Boolean(body.versions?.[version]),
       currentDistTagVersion: body["dist-tags"]?.[distTagFor(version)],
+      publishedVersions: Object.keys(body.versions ?? {}),
     };
   } catch {
     return { ambiguous: true };
@@ -195,6 +288,50 @@ export function unpublishedDrift(commitSubjects: readonly string[]): {
   };
 }
 
+/**
+ * The git tag namespace a package's releases are recorded under.
+ *
+ * Not a detail — the drift advisory's revision range is a TAG, and hub's tags
+ * are bare (`v0.7.0`) while every sub-package's are namespaced
+ * (`door-contract-v0.7.0`). The advisory hardcoded `v`, so door-contract@0.7.0
+ * resolved against HUB's `v0.7.0` — a tag that exists, pointing at unrelated
+ * history — and would have reported ~137 hub commits as door-contract's
+ * unpublished work (hub#830). A wrong-but-resolving range is worse than a
+ * missing one.
+ *
+ * The mapping is the one `tag-record` uses at the bottom of release.yml, and
+ * the one `on: push: tags:` filters against: package dir basename + `-v`, or a
+ * bare `v` for the root package.
+ */
+export function tagPrefixFor(dir: string): string {
+  const name = dir.replace(/\/+$/, "").split("/").pop() ?? "";
+  if (name === "" || name === "." || name === "..") return "v";
+  return `${name}-v`;
+}
+
+/**
+ * The `git log` invocation behind the drift advisory.
+ *
+ * Split out from the CLI so the range and the pathspec are testable without a
+ * repo — both were wrong in ways that only showed up in a release run.
+ *
+ * The trailing pathspec scopes the listing to the package: without it,
+ * "commits not in any published version" for scope-guard would list every hub
+ * commit merged since scope-guard last shipped, which is noise dressed as a
+ * warning.
+ */
+export function driftLogArgs(dir: string, version: string): string[] {
+  return [
+    "git",
+    "log",
+    `${tagPrefixFor(dir)}${version}..HEAD`,
+    "--oneline",
+    "--no-merges",
+    "--",
+    dir.replace(/\/+$/, "") || ".",
+  ];
+}
+
 // --- CLI -------------------------------------------------------------------
 // Usage: bun scripts/release-plan.ts <package-dir> <npm-name> [--tag-push]
 // Emits GitHub Actions outputs; exits non-zero on refusal.
@@ -215,13 +352,67 @@ if (import.meta.main) {
     console.error(`::error::${npmName}@${version}: ${decision.reason}`);
     process.exit(1);
   }
+  // Stable must be a suffix-drop from the latest matching rc tag.
+  // decidePublish already required that npm has an X.Y.Z-rc.*; this is the
+  // "no new code" half. First-ever packages have no rc to diff against and
+  // skip. Tag-push overrides, same as decidePublish.
+  if (
+    decision.publish &&
+    distTagFor(version) === "latest" &&
+    !rest.includes("--tag-push") &&
+    !("ambiguous" in registry) &&
+    matchingRcVersions(version, registry.publishedVersions ?? []).length > 0
+  ) {
+    const tagProc = Bun.spawnSync(rcTagListArgs(dir, version));
+    const tags = new TextDecoder()
+      .decode(tagProc.stdout)
+      .split("\n")
+      .map((t) => t.trim())
+      .filter((t) => t.length > 0);
+    const rcTag = latestMatchingRcTag(tags, version, tagPrefixFor(dir));
+    if (!rcTag) {
+      const core = coreVersion(version);
+      console.error(
+        `::error::${npmName}@${version}: npm has ${core}-rc.* but no matching git tag (${tagPrefixFor(dir)}${core}-rc.*) — cannot verify this stable is a suffix-drop. Fetch tags, or pass --tag-push to override.`,
+      );
+      process.exit(1);
+    }
+    const diffProc = Bun.spawnSync(stablePromotionDiffArgs(rcTag));
+    if (diffProc.exitCode !== 0) {
+      console.error(
+        `::error::${npmName}@${version}: git diff ${rcTag}..HEAD failed — cannot verify suffix-drop.`,
+      );
+      process.exit(1);
+    }
+    const changed = new TextDecoder()
+      .decode(diffProc.stdout)
+      .split("\n")
+      .map((p) => p.trim())
+      .filter((p) => p.length > 0);
+    const extra = disallowedStablePromotionPaths(changed);
+    if (extra.length > 0) {
+      console.error(
+        `::error::${npmName}@${version}: stable is not a suffix-drop from ${rcTag}. Extra paths vs the rc:\n${extra.map((p) => `  - ${p}`).join("\n")}\nPromote by branching from the rc tag and dropping -rc.N only. Do not merge next.`,
+      );
+      process.exit(1);
+    }
+  }
   // On the skip path, say whether anything is stranded. A silent skip is
   // indistinguishable from "everything is shipped", which is how three fixes
   // in a row sat unpublished on main.
   if (!decision.publish && !rest.includes("--no-drift-check")) {
     try {
-      const proc = Bun.spawnSync(["git", "log", `v${version}..HEAD`, "--oneline", "--no-merges"]);
-      if (proc.exitCode === 0) {
+      const proc = Bun.spawnSync(driftLogArgs(dir, version));
+      if (proc.exitCode !== 0) {
+        // Say so. This is the whole of hub#830: the plan job used a bare
+        // `actions/checkout@v6` (`--depth=1 --no-tags`), git exited 128
+        // "unknown revision", and this branch stayed silent — so a CI run that
+        // COULDN'T check drift looked exactly like one that found none.
+        console.log(
+          `::notice::${npmName}: couldn't check for unpublished drift ` +
+            `(${tagPrefixFor(dir)}${version} not resolvable — shallow or tagless clone?)`,
+        );
+      } else {
         const drift = unpublishedDrift(new TextDecoder().decode(proc.stdout).split("\n"));
         if (drift.drifted) {
           console.log(`::warning::${npmName}: ${drift.summary}`);

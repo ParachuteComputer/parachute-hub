@@ -65,6 +65,7 @@ import {
   persistEnrollment,
 } from "../two-factor-store.ts";
 import {
+  InvalidUsernameError,
   SingleUserModeError,
   UsernameTakenError,
   createUser,
@@ -508,6 +509,10 @@ async function runSetPassword(args: readonly string[], deps: AuthDeps): Promise<
         return 1;
       }
       if (err instanceof UsernameTakenError) {
+        console.error(err.message);
+        return 1;
+      }
+      if (err instanceof InvalidUsernameError) {
         console.error(err.message);
         return 1;
       }

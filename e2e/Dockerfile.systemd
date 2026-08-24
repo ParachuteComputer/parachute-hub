@@ -7,8 +7,8 @@
 # postinstall scripts assume it present on Linux).
 #
 # We DO NOT pre-install bun or @openparachute/hub — installing those is the
-# test (Stage 1 of e2e/stages.sh runs the real `curl bun.sh/install` +
-# `bun add -g @openparachute/hub` an operator runs). Baking them in would
+# test (Stage 1 of e2e/stages.sh runs `curl bun.sh/install` pinned to
+# bun-v1.4.0 + `bun add -g @openparachute/hub`). Baking them in would
 # defeat the whole point of the harness.
 #
 # systemd-as-PID-1 is the load-bearing choice: `parachute init` installs and

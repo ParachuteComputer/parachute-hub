@@ -16,7 +16,7 @@ import {
   seedInitialAdminIfNeeded,
 } from "../commands/serve.ts";
 import { openHubDb } from "../hub-db.ts";
-import { getUserByUsername, userCount } from "../users.ts";
+import { InvalidUsernameError, getUserByUsername, userCount } from "../users.ts";
 
 describe("hubServeOptions — the production listener wires the WS bridge", () => {
   // Regression guard: the WS bridge handler was wired into hub-server.ts's
@@ -392,6 +392,132 @@ describe("seedInitialAdminIfNeeded", () => {
     );
     expect(result).toBe("needs-setup");
     expect(userCount(db)).toBe(0);
+  });
+
+  test("hub#864 — first-boot reserved `admin` seeds, then warns it cannot link", async () => {
+    const db = openHubDb(dbPath);
+    const log = mock<(line: string) => void>(() => {});
+    const result = await seedInitialAdminIfNeeded(
+      db,
+      {
+        PARACHUTE_INITIAL_ADMIN_USERNAME: "admin",
+        PARACHUTE_INITIAL_ADMIN_PASSWORD: "correct horse battery staple",
+      },
+      log,
+    );
+    expect(result).toBe("seeded");
+    expect(userCount(db)).toBe(1);
+    const joined = log.mock.calls.map((c) => c[0] ?? "").join("\n");
+    expect(joined).toContain("seeded initial admin");
+    expect(joined).toContain("cannot run the pubkey-linkage ceremony");
+    expect(joined).toContain('"admin" (reserved)');
+  });
+
+  test("hub#864 — invalid env username is refused and nothing is seeded", async () => {
+    const db = openHubDb(dbPath);
+    const log = mock<(line: string) => void>(() => {});
+    await expect(
+      seedInitialAdminIfNeeded(
+        db,
+        {
+          PARACHUTE_INITIAL_ADMIN_USERNAME: "Alice",
+          PARACHUTE_INITIAL_ADMIN_PASSWORD: "correct horse battery staple",
+        },
+        log,
+      ),
+    ).rejects.toThrow(InvalidUsernameError);
+    expect(userCount(db)).toBe(0);
+    expect(log.mock.calls[0]?.[0] ?? "").toContain("PARACHUTE_INITIAL_ADMIN_USERNAME");
+    expect(log.mock.calls[0]?.[0] ?? "").toContain("invalid (format)");
+  });
+
+  test("hub#864 — existing grandfathered row logs the unlinkable warning", async () => {
+    const db = openHubDb(dbPath);
+    await seedInitialAdminIfNeeded(
+      db,
+      {
+        PARACHUTE_INITIAL_ADMIN_USERNAME: "ops",
+        PARACHUTE_INITIAL_ADMIN_PASSWORD: "first-pw",
+      },
+      () => {},
+    );
+    const stamp = new Date().toISOString();
+    db.prepare(
+      `INSERT INTO users (id, username, password_hash, created_at, updated_at, password_changed, email)
+       VALUES (?, ?, ?, ?, ?, 1, NULL)`,
+    ).run("legacy-1", "Alice", "not-a-real-hash", stamp, stamp);
+    const log = mock<(line: string) => void>(() => {});
+    const result = await seedInitialAdminIfNeeded(
+      db,
+      {
+        PARACHUTE_INITIAL_ADMIN_USERNAME: "ops",
+        PARACHUTE_INITIAL_ADMIN_PASSWORD: "ignored",
+      },
+      log,
+    );
+    expect(result).toBe("exists");
+    expect(log.mock.calls[0]?.[0] ?? "").toContain("cannot run the pubkey-linkage ceremony");
+    expect(log.mock.calls[0]?.[0] ?? "").toContain('"Alice" (format)');
+  });
+
+  test("hub#864 — grandfathered username with a newline cannot forge extra log lines", async () => {
+    const db = openHubDb(dbPath);
+    await seedInitialAdminIfNeeded(
+      db,
+      {
+        PARACHUTE_INITIAL_ADMIN_USERNAME: "ops",
+        PARACHUTE_INITIAL_ADMIN_PASSWORD: "first-pw",
+      },
+      () => {},
+    );
+    // Pre-#864 rows could contain control chars; a raw interpolation would
+    // split the boot warning into extra operator-log lines.
+    const forged = "Alice\nFORGED extra operator line";
+    const stamp = new Date().toISOString();
+    db.prepare(
+      `INSERT INTO users (id, username, password_hash, created_at, updated_at, password_changed, email)
+       VALUES (?, ?, ?, ?, ?, 1, NULL)`,
+    ).run("legacy-nl", forged, "not-a-real-hash", stamp, stamp);
+    const log = mock<(line: string) => void>(() => {});
+    const result = await seedInitialAdminIfNeeded(
+      db,
+      {
+        PARACHUTE_INITIAL_ADMIN_USERNAME: "ops",
+        PARACHUTE_INITIAL_ADMIN_PASSWORD: "ignored",
+      },
+      log,
+    );
+    expect(result).toBe("exists");
+    expect(log.mock.calls).toHaveLength(1);
+    const line = log.mock.calls[0]?.[0] ?? "";
+    expect(line).not.toContain("\n");
+    expect(line).not.toContain("\r");
+    expect(line).toContain(JSON.stringify(forged));
+    expect(line).toContain("cannot run the pubkey-linkage ceremony");
+  });
+
+  test("hub#864 — invalid env username with a newline cannot forge extra log lines", async () => {
+    const db = openHubDb(dbPath);
+    const forged = "Alice\nFORGED extra operator line";
+    const log = mock<(line: string) => void>(() => {});
+    await expect(
+      seedInitialAdminIfNeeded(
+        db,
+        {
+          PARACHUTE_INITIAL_ADMIN_USERNAME: forged,
+          PARACHUTE_INITIAL_ADMIN_PASSWORD: "correct horse battery staple",
+        },
+        log,
+      ),
+    ).rejects.toThrow(InvalidUsernameError);
+    expect(userCount(db)).toBe(0);
+    expect(log.mock.calls).toHaveLength(1);
+    const line = log.mock.calls[0]?.[0] ?? "";
+    expect(line).not.toContain("\n");
+    expect(line).not.toContain("\r");
+    expect(line).toContain(JSON.stringify(forged));
+    expect(line).toContain("PARACHUTE_INITIAL_ADMIN_USERNAME");
+    expect(line).toContain("invalid (format)");
   });
 });
 

@@ -17,7 +17,8 @@
  *   GET  ""           → the caller's own linked keys
  *   POST "/challenge" → mint a single-use challenge + the event template
  *   POST "/verify"    → present a signed NIP-01 event; link on success
- *   POST "/unlink"    → drop one of the caller's own links
+ *   POST "/unlink"    → drop one of the caller's own live links; retain its
+ *                        proof for historical registry attribution
  *
  * ## The ceremony
  *
@@ -35,15 +36,16 @@
  *     type- and length-checked before any hashing or curve math)
  *   - `kind === 27235`
  *   - `created_at` within ±5 minutes of the hub's clock
- *   - the `u` tag naming an origin this hub answers on AND the verify path
- *   - the `method` tag exactly `POST`
+ *   - exactly one `u` tag, naming an origin this hub answers on AND the verify path
+ *   - exactly one `method` tag, with the value `POST`
  *   - `content` exactly the linkage statement for THIS session's account and
  *     that origin
  *   - a recomputed NIP-01 id matching the claimed `id`
  *   - a BIP-340 Schnorr signature over that id verifying against the claimed
  *     x-only pubkey
- *   - a challenge that exists, belongs to THIS user, is unconsumed, and is
- *     unexpired — consumed atomically with the link write
+ *   - exactly one `challenge` tag, naming a challenge that exists, belongs to
+ *     THIS user, is unconsumed, and is unexpired — consumed atomically with
+ *     the link write
  *
  * Four independent defenses stack here. Against REPLAY: the server-issued
  * single-use challenge (primary), the `created_at` window, and the `u`/`method`
@@ -63,7 +65,7 @@
  *
  * Nothing. No scope, no claim, no authentication path. A linked key is an
  * attribution label; `sub` remains the only principal the hub authorizes on.
- * See `pubkey-links.ts` and migration v17.
+ * See `pubkey-links.ts` and migrations v17/v18.
  */
 import type { Database } from "bun:sqlite";
 import {
@@ -150,17 +152,12 @@ export const MAX_PUBKEY_LABEL_LEN = 64;
  *     signer pane that truncates cannot hide the `Account:` prefix and leave a
  *     forged tail behind.
  *   - We REFUSE to build the statement at all when `validateUsername` rejects
- *     the name. `createUser` does not run the validator, and two write paths
- *     reach it ungated — `parachute auth set-password --username` (auth.ts) and
- *     `PARACHUTE_INITIAL_ADMIN_USERNAME` (serve.ts) — so a hostile username CAN
- *     reach the DB. The ceremony must not trust that it didn't: an account
- *     whose username the validator rejects simply cannot run the ceremony
- *     (`username_unlinkable`). (The two username validators still diverge —
- *     `setup-wizard.ts` accepts a looser `[A-Za-z0-9_.-]` superset; reconciling
- *     them onto `validateUsername` touches a shipped-door setup path and
- *     `admin`-as-reserved / period / length compat, so it is filed as a
- *     follow-up rather than folded here. This refusal closes the exploit
- *     independent of that reconciliation.)
+ *     the name. `createUser` now runs the validator (hub#864), so new writes
+ *     cannot land a hostile username. Existing rows (and a seeded first-user
+ *     `admin`) are grandfathered and still cannot run the ceremony
+ *     (`username_unlinkable`) until renamed. The ceremony must not trust that
+ *     the row was gated: an account whose username the validator rejects
+ *     simply cannot run it.
  *
  * @throws if `validateUsername(username)` fails — callers on this surface guard
  * with the same check first and return `username_unlinkable`, so this throw is
@@ -174,9 +171,9 @@ export function linkageStatement(origin: string, username: string): string {
     );
   }
   // EIP-4361 / SIWE shape: one legible sentence, the bound account isolated on
-  // its own line, its value JSON-encoded. `validateUsername` has already pinned
-  // the charset to [a-z0-9_-], so the encoding can never actually need to
-  // escape anything — it is defense-in-depth for the ungated-write paths above.
+  // its own line, its value JSON-encoded. `validateUsername` (and createUser)
+  // pin the charset to [a-z0-9_-] for new writes; the encoding is still
+  // defense-in-depth for grandfathered rows that reached the DB before #864.
   return [
     `${origin} asks you to link a Nostr key to a Parachute account.`,
     "",
@@ -378,7 +375,7 @@ function requestOrigin(req: Request): string {
  *   1. label validation (pure string check — reject before anything else so a
  *      bad label can't burn a challenge)
  *   2. event shape + bounds (`parseNostrEvent`; no hashing yet)
- *   3. kind / created_at / `u` / `method` / challenge-tag presence — all pure
+ *   3. kind / created_at / exactly-one `u` / `method` / `challenge` tags — all pure
  *   4. the legible statement in `content` (see `linkageStatement`), recomputed
  *      from the SESSION's user and the `u` tag's already-validated origin
  *   5. rate limit (before any curve math)
@@ -560,6 +557,24 @@ async function handleVerify(
  */
 type BindingResult = { ok: true; origin: string } | { ok: false; res: Response };
 
+type BindingTagName = "u" | "method" | "challenge";
+
+/**
+ * Return the first security-critical binding tag that appears more than once.
+ * `tagValue` is intentionally first-wins for general Nostr use, but a stored
+ * linkage proof must have one unambiguous interpretation for every verifier.
+ */
+function duplicateBindingTag(event: NostrEvent): BindingTagName | null {
+  const seen = new Set<BindingTagName>();
+  for (const tag of event.tags) {
+    const name = tag[0];
+    if (name !== "u" && name !== "method" && name !== "challenge") continue;
+    if (seen.has(name)) return name;
+    seen.add(name);
+  }
+  return null;
+}
+
 function checkBinding(
   event: NostrEvent,
   req: Request,
@@ -570,6 +585,11 @@ function checkBinding(
     ok: false,
     res: jsonError(400, "invalid_event", why),
   });
+
+  const duplicate = duplicateBindingTag(event);
+  if (duplicate !== null) {
+    return generic(`event must carry exactly one \`${duplicate}\` tag`);
+  }
 
   if (event.kind !== NOSTR_AUTH_KIND) {
     return generic(`event kind must be ${NOSTR_AUTH_KIND}`);

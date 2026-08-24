@@ -12,10 +12,18 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   compareVersions,
+  coreVersion,
   decidePublish,
+  disallowedStablePromotionPaths,
   distTagFor,
+  driftLogArgs,
   emitOutputs,
+  latestMatchingRcTag,
+  matchingRcVersions,
+  rcTagListArgs,
   readRegistry,
+  stablePromotionDiffArgs,
+  tagPrefixFor,
   unpublishedDrift,
 } from "../../scripts/release-plan.ts";
 
@@ -115,6 +123,140 @@ describe("decidePublish", () => {
     const d = decidePublish("0.7.9", { ambiguous: true }, { isTagPush: true });
     expect(d).toMatchObject({ publish: true });
   });
+
+  test("a stable without a matching rc is refused — 0.7.13 through 0.7.16 skipped this", () => {
+    // Cutting @latest with new code and no rc of the same X.Y.Z is how
+    // 0.7.13–0.7.16 shipped. Stable is a suffix-drop, never a skip.
+    const d = decidePublish("0.7.17", {
+      versionExists: false,
+      currentDistTagVersion: "0.7.16",
+      publishedVersions: ["0.7.16", "0.7.12-rc.2"],
+    });
+    expect(d).toMatchObject({ refuse: true });
+    expect("refuse" in d && d.reason).toMatch(/0\.7\.17-rc/);
+    expect("refuse" in d && d.reason).toMatch(/suffix-drop|Cut an rc first/i);
+  });
+
+  test("a stable whose only published rcs are a different X.Y.Z is still refused", () => {
+    const d = decidePublish("0.7.17", {
+      versionExists: false,
+      currentDistTagVersion: "0.7.16",
+      publishedVersions: ["0.7.16", "0.7.16-rc.1"],
+    });
+    expect(d).toMatchObject({ refuse: true });
+  });
+
+  test("a stable with a matching rc publishes — suffix-drop is the only legal stable", () => {
+    const d = decidePublish("0.7.17", {
+      versionExists: false,
+      currentDistTagVersion: "0.7.16",
+      publishedVersions: ["0.7.16", "0.7.17-rc.1"],
+    });
+    expect(d).toMatchObject({ publish: true });
+  });
+
+  test("omitted publishedVersions still refuses a stable when latest already exists", () => {
+    // Callers that forget to plumb the version list must not silently skip
+    // the gate — that's how 0.7.13–0.7.16 would keep shipping.
+    const d = decidePublish("0.7.17", {
+      versionExists: false,
+      currentDistTagVersion: "0.7.16",
+    });
+    expect(d).toMatchObject({ refuse: true });
+  });
+
+  test("tag-push still overrides the rc-required check", () => {
+    const d = decidePublish(
+      "0.7.17",
+      {
+        versionExists: false,
+        currentDistTagVersion: "0.7.16",
+        publishedVersions: ["0.7.16"],
+      },
+      { isTagPush: true },
+    );
+    expect(d).toMatchObject({ publish: true });
+  });
+});
+
+describe("matchingRcVersions", () => {
+  test("matches only the same X.Y.Z rc chain", () => {
+    expect(
+      matchingRcVersions("0.7.17", ["0.7.16", "0.7.16-rc.1", "0.7.17-rc.1", "0.7.17-rc.2"]),
+    ).toEqual(["0.7.17-rc.1", "0.7.17-rc.2"]);
+  });
+
+  test("a prerelease still matches siblings of its core", () => {
+    expect(matchingRcVersions("0.7.17-rc.3", ["0.7.17-rc.1", "0.7.16-rc.1"])).toEqual([
+      "0.7.17-rc.1",
+    ]);
+  });
+});
+
+describe("coreVersion", () => {
+  test("strips the rc suffix and leaves a stable alone", () => {
+    expect(coreVersion("0.7.17-rc.1")).toBe("0.7.17");
+    expect(coreVersion("0.7.17")).toBe("0.7.17");
+  });
+});
+
+describe("latestMatchingRcTag", () => {
+  test("picks the highest N for hub's bare-v tags", () => {
+    expect(
+      latestMatchingRcTag(
+        ["v0.7.16-rc.1", "v0.7.17-rc.1", "v0.7.17-rc.2", "v0.7.17"],
+        "0.7.17",
+        "v",
+      ),
+    ).toBe("v0.7.17-rc.2");
+  });
+
+  test("namespaces sub-package tags — a hub v tag is not door-contract's", () => {
+    expect(
+      latestMatchingRcTag(
+        ["v0.7.0-rc.9", "door-contract-v0.7.0-rc.1", "door-contract-v0.7.0-rc.2"],
+        "0.7.0",
+        "door-contract-v",
+      ),
+    ).toBe("door-contract-v0.7.0-rc.2");
+  });
+
+  test("undefined when the chain has no rc tag", () => {
+    expect(latestMatchingRcTag(["v0.7.16"], "0.7.17", "v")).toBeUndefined();
+  });
+});
+
+describe("disallowedStablePromotionPaths", () => {
+  test("version/changelog/lockfile-only is a suffix-drop", () => {
+    expect(disallowedStablePromotionPaths(["package.json", "CHANGELOG.md", "bun.lock"])).toEqual(
+      [],
+    );
+  });
+
+  test("a source file is new code — the 0.7.13–0.7.16 skip-rc shape", () => {
+    expect(disallowedStablePromotionPaths(["package.json", "src/users.ts"])).toEqual([
+      "src/users.ts",
+    ]);
+  });
+});
+
+describe("rcTagListArgs / stablePromotionDiffArgs", () => {
+  test("hub lists its own bare-v rc tags", () => {
+    expect(rcTagListArgs(".", "0.7.17")).toEqual(["git", "tag", "-l", "v0.7.17-rc.*"]);
+  });
+
+  test("door-contract lists door-contract-v, not hub's v", () => {
+    expect(rcTagListArgs("packages/door-contract", "0.7.0")[3]).toBe("door-contract-v0.7.0-rc.*");
+  });
+
+  test("the suffix-drop diff is name-only from the rc tag to HEAD", () => {
+    expect(stablePromotionDiffArgs("v0.7.17-rc.1")).toEqual([
+      "git",
+      "diff",
+      "--name-only",
+      "v0.7.17-rc.1..HEAD",
+    ]);
+  });
 });
 
 describe("readRegistry", () => {
@@ -127,7 +269,11 @@ describe("readRegistry", () => {
         versions: { "0.7.9-rc.1": {}, "0.7.9-rc.2": {} },
         "dist-tags": { rc: "0.7.9-rc.2", latest: "0.7.8" },
       })) as unknown as typeof fetch);
-    expect(v).toMatchObject({ versionExists: true, currentDistTagVersion: "0.7.9-rc.2" });
+    expect(v).toMatchObject({
+      versionExists: true,
+      currentDistTagVersion: "0.7.9-rc.2",
+      publishedVersions: ["0.7.9-rc.1", "0.7.9-rc.2"],
+    });
   });
 
   test("picks the dist-tag matching the version's channel", async () => {
@@ -178,6 +324,113 @@ describe("unpublishedDrift", () => {
 
   test("blank lines from git's trailing newline don't inflate the count", () => {
     expect(unpublishedDrift(["abc one", ""]).count).toBe(1);
+  });
+});
+
+/**
+ * hub#830: the drift advisory has to be able to RUN.
+ *
+ * Two independent defects made it dead code in CI:
+ *
+ *   1. The `plan` job used a bare `actions/checkout@v6`, which fetches
+ *      `--depth=1 --no-tags`. `git log v0.7.14..HEAD` in that clone exits 128
+ *      ("unknown revision"), the `proc.exitCode === 0` guard skips, and the
+ *      advisory reports nothing — indistinguishable from "everything is
+ *      shipped", which is the exact confusion it was built to end.
+ *   2. The revision range hardcoded a `v` prefix. Sub-package tags are
+ *      namespaced (`door-contract-v0.7.0`), so door-contract@0.7.0 would have
+ *      been compared against HUB's `v0.7.0` tag — a real tag, pointing at
+ *      unrelated history, so the advisory would have listed nine months of hub
+ *      commits as "door-contract's unpublished work". Masked only by defect 1.
+ *
+ * The prefixes here are not invented: they're the ones `tag-record` pushes at
+ * the bottom of release.yml, and the ones the `on: push: tags:` filters match.
+ */
+describe("tagPrefixFor", () => {
+  test("the root package is hub, whose tags are bare `vX.Y.Z`", () => {
+    expect(tagPrefixFor(".")).toBe("v");
+    expect(tagPrefixFor("")).toBe("v");
+    expect(tagPrefixFor("./")).toBe("v");
+  });
+
+  test("sub-packages get their namespaced prefix — same strings tag-record pushes", () => {
+    expect(tagPrefixFor("packages/scope-guard")).toBe("scope-guard-v");
+    expect(tagPrefixFor("packages/depcheck")).toBe("depcheck-v");
+    expect(tagPrefixFor("packages/door-contract")).toBe("door-contract-v");
+    // Trailing slash is the same package.
+    expect(tagPrefixFor("packages/door-contract/")).toBe("door-contract-v");
+  });
+
+  test("the prefixes match what release.yml's tag-record actually pushes", () => {
+    const workflow = readFileSync(
+      join(import.meta.dir, "../../.github/workflows/release.yml"),
+      "utf8",
+    );
+    for (const [dir, prefix] of [
+      [".", "v"],
+      ["packages/scope-guard", "scope-guard-v"],
+      ["packages/depcheck", "depcheck-v"],
+      ["packages/door-contract", "door-contract-v"],
+    ] as const) {
+      expect(tagPrefixFor(dir)).toBe(prefix);
+      expect(workflow).toMatch(
+        new RegExp(`tag_if\\s+"${prefix}"\\s+"${dir === "." ? "\\." : dir}"`),
+      );
+    }
+  });
+});
+
+describe("driftLogArgs", () => {
+  test("hub compares against its own bare-v tag", () => {
+    expect(driftLogArgs(".", "0.7.14")).toEqual([
+      "git",
+      "log",
+      "v0.7.14..HEAD",
+      "--oneline",
+      "--no-merges",
+      "--",
+      ".",
+    ]);
+  });
+
+  test("door-contract compares against door-contract-v, NOT hub's v tag", () => {
+    const args = driftLogArgs("packages/door-contract", "0.7.0");
+    expect(args).toContain("door-contract-v0.7.0..HEAD");
+    // The bug: `v0.7.0` is a real HUB tag, so the wrong range would have
+    // resolved and listed hub's history as door-contract's drift.
+    expect(args).not.toContain("v0.7.0..HEAD");
+  });
+
+  test("the listing is scoped to the package — a hub commit isn't scope-guard drift", () => {
+    expect(driftLogArgs("packages/scope-guard", "0.5.1").slice(-2)).toEqual([
+      "--",
+      "packages/scope-guard",
+    ]);
+  });
+});
+
+describe("release.yml drift advisory can execute (hub#830)", () => {
+  const workflow = readFileSync(
+    join(import.meta.dir, "../../.github/workflows/release.yml"),
+    "utf8",
+  );
+  // Scope every assertion to the `plan` job — the other jobs' shallow
+  // checkouts are fine, only `plan` reads git history.
+  const planJob = workflow.match(/\n {2}plan:\n([\s\S]*?)\n {2}[a-z][\w-]*:\n/)?.[1];
+
+  test("the plan job is findable (guards the slicing above)", () => {
+    expect(planJob).toBeTruthy();
+    expect(planJob).toContain("bun scripts/release-plan.ts . @openparachute/hub");
+  });
+
+  test("the plan job's checkout fetches full history — depth=1 has no merge base", () => {
+    expect(planJob).toMatch(/actions\/checkout@v6\n\s*with:\n(?:\s*.+\n)*?\s*fetch-depth:\s*0/);
+  });
+
+  test("the plan job's checkout fetches tags — the advisory's range is a TAG", () => {
+    // Bare checkout passes `--no-tags`; without this the range never resolves
+    // and the advisory silently reports nothing, forever.
+    expect(planJob).toMatch(/fetch-tags:\s*true/);
   });
 });
 

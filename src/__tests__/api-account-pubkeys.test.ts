@@ -405,16 +405,21 @@ describe("POST /verify — the statement binding", () => {
 });
 
 describe("HIGH-1 — username injection into the linkage statement", () => {
-  // `createUser` does NOT run `validateUsername`, and two write paths reach it
-  // ungated (`parachute auth set-password --username`, serve.ts
-  // `PARACHUTE_INITIAL_ADMIN_USERNAME`), so a hostile username CAN reach the
-  // DB. The confused-deputy defense must not depend on that gate.
+  // hub#864 gates every NEW write through `validateUsername`, so a hostile
+  // name can no longer land via createUser. Grandfathered rows still can
+  // (raw INSERT, pre-#864 DBs). The confused-deputy defense must not
+  // depend on the write gate — the ceremony still refuses those rows.
   const INJECTION =
     'mallory" on https://hub.example. Link this Nostr key to the Parachute account "alice';
 
-  async function sessionForUsername(username: string): Promise<string> {
-    const u = await createUser(db, username, PASSWORD, { allowMulti: true, passwordChanged: true });
-    const session = createSession(db, { userId: u.id });
+  function sessionForGrandfatheredUsername(username: string): string {
+    const id = crypto.randomUUID();
+    const stamp = new Date().toISOString();
+    db.prepare(
+      `INSERT INTO users (id, username, password_hash, created_at, updated_at, password_changed, email)
+       VALUES (?, ?, ?, ?, ?, 1, NULL)`,
+    ).run(id, username, "not-a-real-hash", stamp, stamp);
+    const session = createSession(db, { userId: id });
     return `${CSRF_COOKIE}; ${buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000))}`;
   }
 
@@ -429,7 +434,7 @@ describe("HIGH-1 — username injection into the linkage statement", () => {
   });
 
   test("an account with an injected username cannot get a challenge", async () => {
-    const cookie = await sessionForUsername(INJECTION);
+    const cookie = sessionForGrandfatheredUsername(INJECTION);
     const res = await call("POST", "/challenge", cookie, { __csrf: TEST_CSRF });
     expect(res.status).toBe(400);
     expect(((await res.json()) as { error: string }).error).toBe("username_unlinkable");
@@ -441,7 +446,7 @@ describe("HIGH-1 — username injection into the linkage statement", () => {
   });
 
   test("an account with an injected username cannot verify — the key never links", async () => {
-    const cookie = await sessionForUsername(INJECTION);
+    const cookie = sessionForGrandfatheredUsername(INJECTION);
     // Even a hand-crafted event can't get in: the ceremony refuses before it
     // is parsed, so the confused-deputy link the injection aimed for is
     // impossible regardless of what the victim signed.
@@ -607,6 +612,29 @@ describe("POST /verify — rejections", () => {
     expect((await call("POST", "/verify", alice.cookie, { __csrf: TEST_CSRF, event })).status).toBe(
       400,
     );
+  });
+
+  test("duplicate binding tags are refused even when the first value is valid", async () => {
+    const alice = await userWithSession("alice");
+    for (const duplicate of [
+      ["u", "https://evil.example/api/account/pubkeys/verify"],
+      ["method", "GET"],
+      ["challenge", "f".repeat(64)],
+    ]) {
+      const challenge = await getChallenge(alice.cookie);
+      const event = signEvent(SECRET_A, {
+        content: statement(alice.username),
+        tags: [...linkageTags(challenge), duplicate],
+      });
+      const res = await call("POST", "/verify", alice.cookie, {
+        __csrf: TEST_CSRF,
+        event,
+        password: PASSWORD,
+      });
+      expect(res.status).toBe(400);
+      expect(((await res.json()) as { error: string }).error).toBe("invalid_event");
+    }
+    expect(listUserPubkeys(db, alice.userId)).toHaveLength(0);
   });
 
   test("a tampered id is refused", async () => {

@@ -198,15 +198,14 @@ describe("WS bridge integration — declaring module, real sockets (H1)", () => 
       client.send(new Uint8Array([1, 2, 3, 250]));
       expect([...(await gotBinary.promise)]).toEqual([1, 2, 3, 250]);
 
-      // Client-initiated close propagates the CODE to the upstream. The
-      // reason string is not propagated in this direction: Bun's server-side
-      // websocket close callback delivers an empty reason (verified on Bun
-      // 1.3.13), so the bridge never receives it. Upstream→client reason
-      // propagation works (next test).
+      // Client-initiated close propagates code + reason to the upstream.
+      // Bun 1.3.13 delivered an empty reason on the server-side close
+      // callback (so the bridge could not forward it). Bun 1.4 forwards
+      // the reason. Upstream→client still has its own test below.
       client.close(4002, "client done");
       const upstreamClose = await upstream.closed;
       expect(upstreamClose.code).toBe(4002);
-      expect(upstreamClose.reason).toBe("");
+      expect(upstreamClose.reason).toBe("client done");
     } finally {
       hub?.stop();
       upstream.stop();

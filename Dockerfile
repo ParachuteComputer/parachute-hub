@@ -44,7 +44,7 @@
 #                                       `--channel rc|latest` and `--tag`
 #                                       still override.
 
-ARG BUN_VERSION=1.3
+ARG BUN_VERSION=1.4
 FROM oven/bun:${BUN_VERSION}-alpine AS builder
 
 WORKDIR /app

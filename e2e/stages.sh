@@ -87,16 +87,25 @@ wait_for() {
 hr "STAGE 1 — fresh install happy path"
 
 # --- install bun ---
-note "Installing bun (curl bun.sh/install)…"
+# Floor is 1.4 — same pin as oven-sh/setup-bun in e2e.yml and ARG
+# BUN_VERSION in the hub Dockerfile. An operator still runs unversioned
+# `curl | bash`; this harness must not, or a later bun.sh latest silently
+# changes the operator-install assertions.
+BUN_PIN="${BUN_PIN:-1.4.0}"
+note "Installing bun ${BUN_PIN} (curl bun.sh/install bun-v${BUN_PIN})…"
 export BUN_INSTALL=/root/.bun
 export PATH="$BUN_INSTALL/bin:$PATH"
-if ! curl -fsSL https://bun.sh/install | bash >/tmp/bun-install.log 2>&1; then
+if ! curl -fsSL https://bun.sh/install | bash -s "bun-v${BUN_PIN}" >/tmp/bun-install.log 2>&1; then
   cat /tmp/bun-install.log >&2
   die "stage1-install-bun" "bun install script failed"
 fi
 hash -r
 command -v bun >/dev/null 2>&1 || die "stage1-install-bun" "bun not on PATH after install"
-note "bun $(bun --version) installed"
+INSTALLED="$(bun --version)"
+note "bun ${INSTALLED} installed"
+if [ "$INSTALLED" != "$BUN_PIN" ]; then
+  die "stage1-install-bun" "expected bun ${BUN_PIN} (1.4 floor), got ${INSTALLED}"
+fi
 
 # --- install @openparachute/hub ---
 # Regression pin hub#568: a "Blocked N postinstall" line means bun refused to
