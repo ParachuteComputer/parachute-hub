@@ -242,11 +242,11 @@ export function createWsBridgeHandlers(opts: WsBridgeOptions = {}): WebSocketHan
       // one teardown funnel every accepted socket passes through. The
       // closure latches, so re-entry is harmless.
       ws.data.releaseCap?.();
-      // Client → upstream close propagation. Note: Bun's server-side close
-      // callback delivers the client's close CODE but an empty `reason`
-      // (verified on Bun 1.3.13), so only the code propagates upstream in
-      // this direction. Upstream → client propagation (the close listener in
-      // open()) carries both.
+      // Client → upstream close propagation. Bun 1.3.13 delivered the
+      // close CODE but an empty `reason` on this callback; Bun 1.4
+      // forwards the reason. The bridge already passes both through.
+      // Upstream → client (the close listener in open()) has always
+      // carried both.
       const state = ws.data._bridge;
       if (!state || state.closed) return;
       state.closed = true;
