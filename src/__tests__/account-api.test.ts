@@ -684,7 +684,8 @@ describe("handleAccountCreateVault", () => {
       expect(lifetime).toBe(ACCESS_TOKEN_TTL_SECONDS);
       expect(lifetime).toBeLessThan(ACCOUNT_VAULT_TOKEN_TTL_SECONDS);
       const row = findTokenRowByJti(h.db, validated.payload.jti ?? "");
-      expect(row?.createdVia).toBe("cli_mint");
+      // hub#848: distinct from `cli_mint` — hub-signed create-time handoff.
+      expect(row?.createdVia).toBe("vault_create_handoff");
       expect(row?.clientId).toBe("parachute-hub-spa");
       expect(row?.scopes).toEqual(["vault:work:read", "vault:work:write"]);
     } finally {
@@ -780,9 +781,10 @@ describe("handleAccountCreateVault", () => {
     }
   });
 
-  // Admin tier is unchanged: it still gets the CLI's own guidance verbatim,
-  // because for admin the route that guidance points at actually works.
-  test("admin-tier create still forwards the CLI token_guidance verbatim", async () => {
+  // hub#827: admin-tier create used to return the raw CLI bootstrap token
+  // (unbounded, unregistered, unrevocable). Mint a bounded registered
+  // vault:admin handoff the same way write-tier does.
+  test("account:self:admin create returns a bounded vault:admin token, not the CLI bootstrap", async () => {
     const h = makeHarness(["default"]);
     try {
       const token = await bearer(h, [ACCOUNT_ADMIN_SCOPE]);
@@ -810,14 +812,30 @@ describe("handleAccountCreateVault", () => {
       );
       expect(res.status).toBe(201);
       const body = (await res.json()) as { vault_token: string; token_guidance?: string };
-      expect(body.vault_token).toBe("hubjwt.work.admin");
-      expect(body.token_guidance).toBe(guidance);
+      expect(body.vault_token).not.toBe("hubjwt.work.admin");
+      expect(JSON.stringify(body)).not.toContain("hubjwt.work.admin");
+      expect(body.token_guidance).not.toBe(guidance);
+      expect(body.token_guidance ?? "").toContain("admin access");
+      expect(body.token_guidance ?? "").toContain("/account/vaults/work/token");
+
+      const validated = await validateAccessToken(h.db, body.vault_token, ISSUER);
+      expect(validated.payload.scope).toBe("vault:work:admin");
+      expect(validated.payload.aud).toBe("vault.work");
+      expect(validated.payload.client_id).toBe("parachute-hub-spa");
+      const lifetime = (validated.payload.exp ?? 0) - (validated.payload.iat ?? 0);
+      expect(lifetime).toBe(ACCESS_TOKEN_TTL_SECONDS);
+      expect(lifetime).toBeLessThan(ACCOUNT_VAULT_TOKEN_TTL_SECONDS);
+      const row = findTokenRowByJti(h.db, validated.payload.jti ?? "");
+      // hub#848: distinct from `cli_mint` — hub-signed create-time handoff.
+      expect(row?.createdVia).toBe("vault_create_handoff");
+      expect(row?.clientId).toBe("parachute-hub-spa");
+      expect(row?.scopes).toEqual(["vault:work:admin"]);
     } finally {
       h.cleanup();
     }
   });
 
-  test("201 returns the vault token + services block on a fresh create", async () => {
+  test("201 returns a hub-signed vault token + services block on a fresh create", async () => {
     const h = makeHarness(["default"]);
     try {
       const token = await bearer(h, [HOST_ADMIN_SCOPE]);
@@ -847,7 +865,10 @@ describe("handleAccountCreateVault", () => {
       };
       expect(body.name).toBe("work");
       expect(body.url).toBe(`${ISSUER}/vault/work`);
-      expect(body.vault_token).toBe("hubjwt.work.access");
+      expect(body.vault_token).not.toBe("hubjwt.work.access");
+      expect(JSON.stringify(body)).not.toContain("hubjwt.work.access");
+      const validated = await validateAccessToken(h.db, body.vault_token, ISSUER);
+      expect(validated.payload.scope).toBe("vault:work:admin");
       expect(body.services["vault:work"]?.url).toBe(`${ISSUER}/vault/work`);
       expect(body.services["vault:work"]?.version).toBe("0.4.2");
     } finally {
@@ -855,7 +876,7 @@ describe("handleAccountCreateVault", () => {
     }
   });
 
-  test("empty vault_token + token_guidance flow through so the app can fall back", async () => {
+  test("admin-tier create still mints a hub-signed token when the CLI bootstrap is empty", async () => {
     const h = makeHarness(["default"]);
     try {
       const token = await bearer(h, [ACCOUNT_ADMIN_SCOPE]);
@@ -882,8 +903,46 @@ describe("handleAccountCreateVault", () => {
       );
       expect(res.status).toBe(201);
       const body = (await res.json()) as { vault_token: string; token_guidance?: string };
-      expect(body.vault_token).toBe("");
-      expect(body.token_guidance).toBe("no hub origin reachable to mint against");
+      expect(body.vault_token.length).toBeGreaterThan(0);
+      expect(body.token_guidance ?? "").not.toContain("no hub origin reachable");
+      const validated = await validateAccessToken(h.db, body.vault_token, ISSUER);
+      expect(validated.payload.scope).toBe("vault:work:admin");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("admin-tier create whose token mint fails returns a distinguishable error and does not leak the CLI token", async () => {
+    const h = makeHarness(["default"]);
+    try {
+      const token = await bearer(h, [ACCOUNT_ADMIN_SCOPE]);
+      h.db.run(
+        `CREATE TRIGGER fail_token_insert BEFORE INSERT ON tokens
+         BEGIN SELECT RAISE(ABORT, 'simulated registry failure'); END`,
+      );
+      const runCommand = async (_cmd: readonly string[]): Promise<RunResult> => {
+        upsertService(
+          {
+            name: "parachute-vault",
+            port: 4101,
+            paths: ["/vault/default", "/vault/work"],
+            health: "/health",
+            version: "0.4.2",
+          },
+          h.manifestPath,
+        );
+        return { exitCode: 0, stdout: vaultCreateJson("work", "hubjwt.work.admin"), stderr: "" };
+      };
+      const res = await handleAccountCreateVault(
+        jsonReq("/account/vaults", token, "POST", { name: "work" }),
+        deps(h, { runCommand }),
+      );
+      expect(res.status).toBe(500);
+      const body = (await res.json()) as { error: string; vault: string; message: string };
+      expect(body.error).toBe("vault_created_token_mint_failed");
+      expect(body.vault).toBe("work");
+      expect(body.message).toContain("WAS created");
+      expect(JSON.stringify(body)).not.toContain("hubjwt.work.admin");
     } finally {
       h.cleanup();
     }

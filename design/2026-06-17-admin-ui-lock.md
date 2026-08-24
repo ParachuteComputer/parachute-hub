@@ -30,15 +30,14 @@ don't mistake it for at-rest protection.
 ## The single chokepoint (why the lock cascades for free)
 
 The admin SPA and **every** module config UI obtain their working Bearer from
-one of four cookie-gated mint endpoints, all sharing the identical
+one of three cookie-gated mint endpoints, all sharing the identical
 `parseSessionCookie → findSession → [isFirstAdmin] → signAccessToken` shape:
 
 | Endpoint | Bearer for |
 |---|---|
 | `GET /admin/host-admin-token` | the admin SPA itself (`parachute:host:admin/auth`) |
-| `GET /admin/channel-token` | channel chat + config UIs |
 | `GET /admin/vault-admin-token/<name>` | per-vault admin SPA (`vault:<name>:admin`) |
-| `GET /admin/module-token/<short>` | generic module config UI (`<short>:admin`) |
+| `GET /admin/module-token/<short>` | generic module config UI (`<short>:admin`) — this is also where the agent chat + config UI mints today (`short=agent`); the standalone `/admin/channel-token` endpoint was folded into this generic mint in #646, before the channel→agent module rename (#667) |
 
 Inserting **one gate** — `admin-lock.ts:requireUnlocked(db, sessionId)` — into
 each handler makes the lock cascade to the **entire admin surface with no
@@ -67,7 +66,7 @@ runs a full PKCE `authorize → token` flow that succeeds and yields a valid
 ### Also untouched: friend `/account/*` surfaces
 
 The lock is the **first admin's** screen lock for the **admin console**, keyed
-per-session. The four gated mints are all `isFirstAdmin`-gated, so the lock only
+per-session. The three gated mints are all `isFirstAdmin`-gated, so the lock only
 ever affects the admin's own session. The assigned-user (friend) path —
 `POST /account/vault-admin-token/<name>` and `/account/vault-token/<name>` — is
 a different principal on the `/account/*` home and is **not** gated: the admin's
@@ -156,8 +155,8 @@ the argon2id verify, so a stolen cookie can't grind PINs unbounded.
 - `src/admin-lock.ts` — PIN hash storage, in-memory unlock state, the
   `requireUnlocked` gate, the unlock limiter.
 - `src/api-admin-lock.ts` — the `/api/admin-lock*` management router.
-- `src/admin-{host-admin,channel,vault-admin,module}-token.ts` — the gate
-  inserted into all four mint chokepoints.
+- `src/admin-{host-admin,vault-admin,module}-token.ts` — the gate
+  inserted into all three mint chokepoints.
 - `src/hub-server.ts` — route wiring + CSRF belt.
 - `src/hub-settings.ts` — the two new KV keys.
 - `web/ui/src/components/LockScreen.tsx`, `lib/useAdminLock.ts`,

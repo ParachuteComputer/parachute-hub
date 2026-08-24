@@ -12,7 +12,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
-import { resolveIssuer, resolveIssuerSource } from "../hub-server.ts";
+import { linkageBoundOrigins, resolveIssuer, resolveIssuerSource } from "../hub-server.ts";
 import { setHubOrigin } from "../hub-settings.ts";
 
 let dir: string;
@@ -354,5 +354,68 @@ describe("resolveIssuerSource — expose attribution (#531)", () => {
     const r = req("http://127.0.0.1:1939/oauth/token");
     expect(resolveIssuer(r, db, undefined, () => EXPOSED)).toBe(EXPOSED);
     expect(resolveIssuerSource(db, undefined, () => EXPOSED)).toBe("expose");
+  });
+});
+
+/**
+ * hub#833 MEDIUM-1 — the /pubkeys linkage ceremony writes a DURABLE proof, so
+ * the origin set its `u` tag may bind to must NOT include the request-sourced
+ * (Host-derived) issuer. `linkageBoundOrigins` drops the issuer when
+ * `resolveIssuerSource === "request"` and keeps it otherwise.
+ */
+describe("linkageBoundOrigins — durable-proof origin pinning (MEDIUM-1)", () => {
+  const LOOPBACK = 1939;
+  const PUBLIC = "https://hub.example.com";
+  const ATTACKER_HOST = "https://attacker.example"; // what `resolveIssuer` returns from a chosen Host
+
+  test("request-sourced issuer is DROPPED — an attacker-chosen Host can't anchor a proof", () => {
+    // Plain `parachute serve` before `expose`: resolveIssuer fell back to the
+    // request's own origin, which an attacker who controls Host can pick.
+    const bound = linkageBoundOrigins({
+      issuerSource: "request",
+      issuer: ATTACKER_HOST,
+      loopbackPort: LOOPBACK,
+    });
+    expect(bound).not.toContain(ATTACKER_HOST);
+    // Loopback aliases survive, so a genuine local ceremony still verifies.
+    expect(bound).toContain(`http://127.0.0.1:${LOOPBACK}`);
+    expect(bound).toContain(`http://localhost:${LOOPBACK}`);
+  });
+
+  test("a request-sourced issuer that happens to be loopback still leaves loopback bound", () => {
+    // The drop must not strip the loopback origin the local ceremony needs.
+    const bound = linkageBoundOrigins({
+      issuerSource: "request",
+      issuer: `http://127.0.0.1:${LOOPBACK}`,
+      loopbackPort: LOOPBACK,
+    });
+    expect(bound).toContain(`http://127.0.0.1:${LOOPBACK}`);
+    expect(bound).toContain(`http://localhost:${LOOPBACK}`);
+  });
+
+  test("settings/env/expose issuers are KEPT — operator- or expose-asserted, not request-derived", () => {
+    for (const source of ["settings", "env", "expose"] as const) {
+      const bound = linkageBoundOrigins({
+        issuerSource: source,
+        issuer: PUBLIC,
+        loopbackPort: LOOPBACK,
+      });
+      expect(bound).toContain(PUBLIC);
+    }
+  });
+
+  test("platform + expose origins are kept even when the issuer is request-sourced", () => {
+    const EXPOSED = "https://parachute.taildf9ce2.ts.net";
+    const PLATFORM = "https://parachute-hub.onrender.com";
+    const bound = linkageBoundOrigins({
+      issuerSource: "request",
+      issuer: ATTACKER_HOST,
+      loopbackPort: LOOPBACK,
+      exposeHubOrigin: EXPOSED,
+      platformOrigin: PLATFORM,
+    });
+    expect(bound).not.toContain(ATTACKER_HOST);
+    expect(bound).toContain(EXPOSED);
+    expect(bound).toContain(PLATFORM);
   });
 });

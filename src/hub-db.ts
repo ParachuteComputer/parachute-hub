@@ -7,7 +7,9 @@
  * (v12, the `invites` table; v13 adds the pre-named `username` column;
  * v14 adds refresh-token rotation grace; v15 generalizes invites into
  * multi-use public-signup links + email-as-username + the `vault_caps`
- * per-vault storage-cap table).
+ * per-vault storage-cap table), and Nostr-pubkey ↔ user linkage plus the
+ * additive `tokens.subject_pubkey` attribution snapshot (v17, hub#833
+ * phase 1).
  *
  * Each open() runs `migrate()` to bring the schema up to date. A
  * `schema_version` table records every applied migration so re-opens are
@@ -570,6 +572,94 @@ const MIGRATIONS: readonly Migration[] = [
       -- accumulating before a sweep — that is O(total tokens) per client. This
       -- makes it O(tokens for that client). IF NOT EXISTS so re-opens are inert.
       CREATE INDEX IF NOT EXISTS tokens_client ON tokens (client_id);
+    `,
+  },
+  {
+    version: 17,
+    sql: `
+      -- Nostr-pubkey ↔ hub-user linkage + verifiable write attribution
+      -- (hub#833 phase 1; team-vault design
+      -- "2026-08-22 Multi-user Parachute — draft for reaction" §3 phase 1a/1b).
+      --
+      -- Deliberately NO new principal entity. The design's §2.1 finding is
+      -- that the hub already has \`users\` and that \`users.id\` is what every
+      -- minted token's \`sub\` carries — so a linked key hangs off the users
+      -- row that already exists, and \`sub\` semantics are untouched.
+      --
+      -- (1) \`user_pubkeys\` — the link itself, one row per (verified) key.
+      --
+      --   * pubkey (TEXT PK) — 32-byte x-only secp256k1 key, LOWERCASE hex
+      --     (64 chars), the NIP-01 canonical spelling. PRIMARY KEY, so a key
+      --     names AT MOST ONE user hub-wide. That is a security property, not
+      --     a convenience: if two users could both claim one key, attribution
+      --     resolved through that key would be ambiguous, and the second
+      --     claimant could launder writes as the first. A second claim is
+      --     refused (the API returns a generic conflict that does NOT reveal
+      --     who holds it — no cross-account existence oracle).
+      --   * user_id — ON DELETE CASCADE. A deleted account's links go with
+      --     it; already-written \`tokens.subject_pubkey\` history does not
+      --     (see (3)).
+      --   * label — optional operator-chosen nickname ("laptop", "phone").
+      --     Free text, length-capped at the API edge, never interpreted.
+      --   * proof_event / proof_event_id — the VERBATIM signed NIP-01 event
+      --     that proved possession, stored so the proof stays independently
+      --     re-verifiable after the fact: a third party can re-serialize the
+      --     event, recompute the id, and check the BIP-340 signature without
+      --     trusting the hub's say-so. This is the whole difference between
+      --     "the hub asserts alice holds this key" and "here is alice's
+      --     signature saying so." Bounded at the API edge (content ≤1 KiB,
+      --     ≤20 tags) so the column can't be stuffed.
+      --   * linked_at — FIRST successful link (never rewritten on re-verify).
+      --   * last_verified_at — most recent successful proof.
+      --
+      -- (2) \`pubkey_challenges\` — replay protection for the ceremony.
+      --
+      --   The row stores sha256(challenge), NEVER the raw value, matching the
+      --   \`invites\` precedent (migration v12): a DB read must not be enough
+      --   to complete a ceremony. Each row is bound to the issuing user, is
+      --   single-use (consumed_at stamped inside the same transaction as the
+      --   link insert, so two concurrent verifies of one challenge can't both
+      --   land), and expires. Nothing in the schema is user-supplied.
+      --
+      -- (3) ONE additive column on \`tokens\`: \`subject_pubkey\`.
+      --
+      --   The mint-time SNAPSHOT of the primary key linked to the row's
+      --   principal. Nullable, no default, no backfill — every pre-v17 row
+      --   and every mint by a principal with no linked key keeps NULL, the
+      --   same "we don't fabricate attribution we don't have" posture
+      --   vault#298 took with its four \`notes\` columns.
+      --
+      --   It is a SNAPSHOT on purpose. Unlinking a key (e.g. after a
+      --   compromise) removes it from \`user_pubkeys\` and from live
+      --   resolution, but does NOT rewrite registry rows: an audit record
+      --   states what was true when the token was minted. The two reads
+      --   answer different questions — "which key does this account hold
+      --   now?" (user_pubkeys) vs "which key was this credential minted
+      --   under?" (tokens.subject_pubkey).
+      --
+      --   NOT authorization: nothing in the hub grants any authority from a
+      --   linked key. \`sub\` remains the only principal the scope checks read.
+      CREATE TABLE user_pubkeys (
+        pubkey TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        label TEXT,
+        proof_event TEXT NOT NULL,
+        proof_event_id TEXT NOT NULL,
+        linked_at TEXT NOT NULL,
+        last_verified_at TEXT NOT NULL
+      );
+      CREATE INDEX user_pubkeys_user ON user_pubkeys (user_id, linked_at, pubkey);
+      CREATE TABLE pubkey_challenges (
+        challenge_hash TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        expires_at TEXT NOT NULL,
+        consumed_at TEXT,
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX pubkey_challenges_expiry ON pubkey_challenges (expires_at);
+      ALTER TABLE tokens ADD COLUMN subject_pubkey TEXT;
+      CREATE INDEX tokens_subject_pubkey ON tokens (subject_pubkey)
+        WHERE subject_pubkey IS NOT NULL;
     `,
   },
 ];

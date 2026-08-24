@@ -117,7 +117,10 @@ parachute status
 
 Vault is up on `127.0.0.1:1940`; Claude Code picks up the MCP on your next
 session. Point any other local MCP client (Codex, Goose, OpenCode, Cursor, Zed,
-Cline, your own agent) at `http://127.0.0.1:1940/vault/<name>/mcp`.
+Cline, your own agent) at `http://127.0.0.1:1940/mcp` — the canonical,
+vault-agnostic MCP door; the token's audience (picked at OAuth consent, or
+named explicitly) names the target vault. (Per-vault `/vault/<name>/mcp` still
+works if you want to skip the vault picker.)
 
 ### Want the wizard in the terminal instead of the browser?
 

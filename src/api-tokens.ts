@@ -24,7 +24,8 @@
  *         "revoked_at": "ISO-8601" | null,
  *         "created_at": "ISO-8601",
  *         "created_via": "oauth_refresh" | "cli_mint" | "operator_mint" | "connection_provision",
- *         "permissions": "<json-string>" | null
+ *         "permissions": "<json-string>" | null,
+ *         "subject_pubkey": "<64-hex>" | null
  *       }
  *     ],
  *     "next_cursor": "<opaque>" | null
@@ -99,6 +100,16 @@ interface TokenWireShape {
    * list response.
    */
   permissions: Record<string, unknown> | null;
+  /**
+   * Phase-1b attribution snapshot (hub#833, migration v17) — the Nostr pubkey
+   * the row's principal had proved possession of AT MINT TIME, or null. ADDITIVE:
+   * every pre-v17 row, and every mint by a principal with no linked key, reports
+   * null, so an existing consumer that ignores the field is unaffected.
+   *
+   * A snapshot, not a live join — resolve the CURRENT set via
+   * `GET /api/auth/attribution?subject=…`, which also carries the signed proof.
+   */
+  subject_pubkey: string | null;
 }
 
 interface TokensListResponse {
@@ -200,6 +211,7 @@ export async function handleApiTokens(req: Request, deps: ApiTokensDeps): Promis
       created_at: r.createdAt,
       created_via: r.createdVia,
       permissions: parsePermissions(r.permissions),
+      subject_pubkey: r.subjectPubkey,
     })),
     next_cursor: page.nextCursor,
   };

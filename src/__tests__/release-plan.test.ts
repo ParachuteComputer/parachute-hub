@@ -230,6 +230,35 @@ describe("release.yml image tags (hub#829)", () => {
 });
 
 /**
+ * The tag-push override (hub#841).
+ *
+ * `decidePublish`'s `isTagPush` short-circuit is unit-tested above, but
+ * unreachable unless the workflow actually passes `--tag-push` on a tag
+ * push. That was the bug: the `plan` steps never passed it, so the flag path
+ * was dead code and a stale comment claimed otherwise. Assert the wiring
+ * directly on the YAML, same rationale as the hub#829 block below — a
+ * `run:` string is otherwise only exercised by shipping a release.
+ */
+describe("release.yml tag-push override (hub#841)", () => {
+  const workflow = readFileSync(
+    join(import.meta.dir, "../../.github/workflows/release.yml"),
+    "utf8",
+  );
+
+  test("every plan step passes --tag-push on a tag push, nothing on a merge", () => {
+    const flag = "${{ github.ref_type == 'tag' && '--tag-push' || '' }}";
+    for (const cmd of [
+      "bun scripts/release-plan.ts . @openparachute/hub",
+      "bun scripts/release-plan.ts packages/scope-guard @openparachute/scope-guard",
+      "bun scripts/release-plan.ts packages/depcheck @openparachute/depcheck",
+      "bun scripts/release-plan.ts packages/door-contract @openparachute/door-contract",
+    ]) {
+      expect(workflow).toContain(`${cmd} ${flag}`);
+    }
+  });
+});
+
+/**
  * The step outputs are the wire between `plan` and every publish job. Losing
  * one is silent — the consuming expression just interpolates to an empty
  * string.

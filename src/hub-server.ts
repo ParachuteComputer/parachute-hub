@@ -103,6 +103,10 @@
  *   /api/admin-lock/{set,change,remove,unlock,lock,heartbeat} (POST) → manage the optional admin idle PIN lock (cookie-gated; CSRF)
  *   /api/account/2fa/{start,confirm,disable} (POST) → self-service 2FA for the SPA (cookie-gated; CSRF; self-only) — hub#85
  *   /api/account/password         (POST)       → self-service password change for the SPA (cookie-gated; CSRF; self-only) — hub#85
+ *   /api/account/pubkeys          (GET)        → the signed-in user's linked Nostr pubkeys (cookie-gated; self-only) — hub#833 phase 1a
+ *   /api/account/pubkeys/challenge (POST)      → mint a single-use, user-bound linkage challenge + the event template to sign (cookie-gated; CSRF)
+ *   /api/account/pubkeys/verify   (POST)       → present a signed NIP-01 (kind 27235) event; verify BIP-340 possession + consume the challenge → link (cookie-gated; CSRF)
+ *   /api/account/pubkeys/unlink   (POST)       → drop one of the caller's own links (cookie-gated; CSRF; does NOT rewrite tokens.subject_pubkey history)
  *   /api/hub                      (GET)        → hub version + uptime + install-source (host:admin)
  *   /api/hub/upgrade              (POST)       → SPA-driven hub self-upgrade → 202 + detached helper (host:admin, §5.3/D4)
  *   /api/hub/upgrade/status       (GET)        → poll the on-disk hub-upgrade status (host:admin)
@@ -119,7 +123,8 @@
  *   /api/settings/root-redirect   (GET + PUT)  → bare-`/` redirect target (host:admin)
  *   /api/auth/mint-token          (POST)       → CLI/automation token mint (bearer)
  *   /api/auth/revoke-token        (POST)       → revoke registry-row token by jti
- *   /api/auth/tokens              (GET)        → paginated registry list
+ *   /api/auth/tokens              (GET)        → paginated registry list (carries the additive subject_pubkey snapshot)
+ *   /api/auth/attribution         (GET)        → subject → linked Nostr pubkey(s) + signed proof (bearer; parachute:host:auth) — hub#833 phase 1b
  *   /api/grants                   (GET)        → OAuth consent grants list
  *   /api/grants/<client_id>       (DELETE)     → revoke a single OAuth grant
  *   /api/oauth/clients/<id>       (GET)        → OAuth client details
@@ -269,6 +274,7 @@ import {
   handleAccountHomeGet,
 } from "./api-account.ts";
 import { handleAdminLock } from "./api-admin-lock.ts";
+import { handleApiAttribution } from "./api-attribution.ts";
 import { handleHubUpgrade, handleHubUpgradeStatus } from "./api-hub-upgrade.ts";
 import { handleApiHub } from "./api-hub.ts";
 import { handleCreateInvite, handleListInvites, handleRevokeInvite } from "./api-invites.ts";
@@ -1902,6 +1908,46 @@ export function resolveIssuerSource(
 }
 
 /**
+ * hub#833 MEDIUM-1 — the origin set the `/api/account/pubkeys` linkage ceremony
+ * may bind a DURABLE proof to.
+ *
+ * The general `buildHubBoundOrigins` set legitimately includes the per-request
+ * issuer, because `resolveIssuer` derives it from the request's Host when
+ * nothing is configured and the OAuth same-origin / known-issuer checks WANT to
+ * accept a browser POST from whatever public Host the operator is actually on
+ * (token provenance is signature-gated regardless — see `buildHubBoundOrigins`
+ * jsdoc). A stored linkage proof is different: it is re-checkable by third
+ * parties forever, so the origin it commits to must be one the hub can vouch
+ * for INDEPENDENTLY of the incoming request. A Host-derived origin is
+ * attacker-influenceable and must not anchor it.
+ *
+ * So when the issuer is request-sourced (`resolveIssuerSource === "request"`:
+ * plain `parachute serve` with no hub_origin / PARACHUTE_ISSUER / expose-state)
+ * we rebuild the set with the issuer DROPPED, keeping only the structurally
+ * trusted sources — loopback aliases (re-added from `loopbackPort`, so a local
+ * ceremony still works), expose-state, and the platform-injected URL. An
+ * unconfigured-but-Host-exposed hub then cannot complete the ceremony until the
+ * operator pins an origin (set hub_origin in the admin SPA, or run `parachute
+ * expose`), which is the correct posture for a durable proof. When the issuer
+ * is settings/env/expose-sourced it is operator- or expose-asserted, not
+ * request-derived, so it is kept — behavior is identical to the general set.
+ */
+export function linkageBoundOrigins(args: {
+  issuerSource: IssuerSource;
+  issuer: string;
+  loopbackPort?: number;
+  exposeHubOrigin?: string;
+  platformOrigin?: string;
+}): readonly string[] {
+  return buildHubBoundOrigins({
+    issuer: args.issuerSource === "request" ? "" : args.issuer,
+    loopbackPort: args.loopbackPort,
+    exposeHubOrigin: args.exposeHubOrigin,
+    platformOrigin: args.platformOrigin,
+  });
+}
+
+/**
  * Minimal structural type for the Bun `Server` handle the fetch callback
  * receives as its 2nd argument. We need `requestIP` (item E / #526) to
  * resolve the peer address for `layerOf`, and `upgrade` (H1) to hand a
@@ -3432,7 +3478,24 @@ export function hubFetch(
           if (rejected) return rejected;
         }
         const subpath = pathname.slice("/api/account".length);
-        return handleApiAccount(req, subpath, { db: getDb() });
+        return handleApiAccount(req, subpath, {
+          db: getDb(),
+          // Only the /pubkeys sub-surface reads this — the hub#833 linkage
+          // ceremony binds the signed event's `u` tag to an origin this hub
+          // actually answers on, so a NIP-98 signature harvested for another
+          // service (or another hub) can't be replayed here. MEDIUM-1: unlike
+          // the OAuth same-origin set, the ceremony writes a durable proof, so
+          // we drop the request-sourced (Host-derived) issuer via
+          // `linkageBoundOrigins` — an attacker who controls Host must not be
+          // able to choose the origin a stored proof commits to.
+          hubBoundOrigins: linkageBoundOrigins({
+            issuerSource: resolveIssuerSource(getDb(), configuredIssuer, loadExposeHubOrigin),
+            issuer: resolveIssuer(req, getDb(), configuredIssuer, loadExposeHubOrigin),
+            loopbackPort,
+            exposeHubOrigin: loadExposeHubOrigin(),
+            platformOrigin: process.env.RENDER_EXTERNAL_URL ?? flyDefaultOrigin(process.env),
+          }),
+        });
       }
 
       // SPA-driven hub self-upgrade (design 2026-06-01 §5.3 / D4). Dedicated
@@ -3655,6 +3718,20 @@ export function hubFetch(
       if (pathname === "/api/auth/tokens") {
         if (!getDb) return dbNotConfigured();
         return handleApiTokens(req, {
+          db: getDb(),
+          issuer: oauthDeps(req).issuer,
+          knownIssuers: oauthDeps(req).hubBoundOrigins(),
+        });
+      }
+
+      // Phase-1b attribution resolution (hub#833): subject → linked Nostr
+      // pubkey(s) + the signed proof. Same bearer posture as the rest of
+      // /api/auth/* (parachute:host:auth) — this is a directory of who holds
+      // which key, so it is operator-level on purpose; see the handler's
+      // docstring for why widening it is an ACL question, not a phase-1 one.
+      if (pathname === "/api/auth/attribution") {
+        if (!getDb) return dbNotConfigured();
+        return handleApiAttribution(req, {
           db: getDb(),
           issuer: oauthDeps(req).issuer,
           knownIssuers: oauthDeps(req).hubBoundOrigins(),

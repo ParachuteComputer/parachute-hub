@@ -18,7 +18,12 @@ import { readFileSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { resolveBundleDistFrom } from "./bundle-serve.ts";
-import { FIRST_PARTY_FALLBACKS, KNOWN_MODULES, shortNameForManifest } from "./service-spec.ts";
+import {
+  FIRST_PARTY_FALLBACKS,
+  KNOWN_MODULES,
+  SEED_VERSION,
+  shortNameForManifest,
+} from "./service-spec.ts";
 
 export type InstallSourceKind = "bun-linked" | "npm" | "unknown";
 
@@ -32,9 +37,9 @@ export interface InstallSource {
   /** Short git HEAD hash for bun-linked sources where the path is a git repo. */
   readonly gitHead?: string;
   /**
-   * Version from the live `package.json` at `path`. For bun-linked sources
-   * this can differ from the entry's cached `services.json.version` — that's
-   * the drift case we surface.
+   * Version from the live `package.json` at `path`. For EITHER kind this can
+   * differ from the entry's cached `services.json.version` — that's the drift
+   * case we surface (see `isStale`; npm drift is hub#839).
    */
   readonly livePackageVersion?: string;
 }
@@ -251,17 +256,45 @@ function findNearestPackageDir(
 
 /**
  * True when an entry's cached `services.json` version differs from the live
- * `package.json` version at its bun-linked path. The single drift case the
- * operator can act on — `parachute upgrade <svc>` for the bun-linked path
- * doesn't refresh `services.json` on rebuild, so a freshly-built source can
- * still report the pre-rebuild version through status.
+ * `package.json` version at its install path.
  *
- * Only meaningful for `kind === "bun-linked"`. NPM-installed services
- * don't have a "live" source separate from the cached version.
+ * The `services.json` version is a CACHE of the running version — services
+ * own its write side and stamp it on their own boot. The `package.json` at
+ * `source.path` is what is installed on disk right now. When the two
+ * disagree, what `status` prints in VERSION is not what SOURCE points at,
+ * and the operator's deploy-verification step ("did my new build land?")
+ * silently answers the wrong question.
+ *
+ * hub#839 — this used to bail out for anything that wasn't `bun-linked`, on
+ * the premise that "NPM-installed services don't have a live source separate
+ * from the cached version." hub#831 falsified that: the npm arm drifts too,
+ * in two ways nobody was warned about.
+ *
+ *   1. An out-of-band `bun add -g @openparachute/<svc>@<newer>` with no
+ *      restart. The package on disk moves; the row keeps the version the
+ *      still-running old process stamped. This is the exact shape of a
+ *      deploy that looks applied and isn't.
+ *   2. hub#836's refresh-write-failure path. `upgrade` writes the installed
+ *      version back to the row after a successful restart, but a write
+ *      failure there is deliberately non-fatal (the package IS installed and
+ *      the service IS running). That leaves a correct install behind a lying
+ *      row, and it was the one case #836 could not itself cover.
+ *
+ * Neither case is bun-link-specific, and neither produced a `STALE:` line.
+ * The check is now source-agnostic; the two guards that remain are the ones
+ * that would be false positives rather than drift:
+ *
+ *   - No `livePackageVersion` (an `unknown` row, or a `package.json` we
+ *     couldn't read) — nothing to compare, so nothing to claim.
+ *   - `SEED_VERSION` — the "module installed, no instance yet" sentinel the
+ *     CLI writes post-install. That row isn't asserting a running version at
+ *     all, so a mismatch against the installed package isn't drift; flagging
+ *     it would put a STALE line under every freshly installed module.
  */
 export function isStale(entryVersion: string, source: InstallSource): boolean {
-  if (source.kind !== "bun-linked") return false;
+  if (source.kind === "unknown") return false;
   if (!source.livePackageVersion) return false;
+  if (entryVersion === SEED_VERSION) return false;
   return source.livePackageVersion !== entryVersion;
 }
 

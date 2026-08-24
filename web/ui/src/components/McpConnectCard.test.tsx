@@ -147,7 +147,7 @@ describe("McpConnectCard", () => {
     render(<McpConnectCard vaultName="work" vaultUrl={VAULT_URL} />);
     expect(screen.getByRole("link", { name: /full connect docs/i })).toHaveAttribute(
       "href",
-      "https://parachute.computer/install#connect-mcp-clients",
+      "https://parachute.computer/start/#connect-mcp-clients",
     );
   });
 });

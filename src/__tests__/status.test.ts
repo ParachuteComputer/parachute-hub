@@ -189,6 +189,80 @@ describe("status — table + hub row", () => {
       cleanup();
     }
   });
+
+  // hub#839: `isStale` short-circuited on anything not bun-linked, so an
+  // npm-installed module whose package moved out from under its
+  // services.json row rendered a clean table — VERSION saying one thing,
+  // SOURCE saying another, and no STALE line to reconcile them. That is the
+  // hub#831 shape (`parachute-app 1944 0.22.10 active 8670 npm (0.22.11)`),
+  // and it defeats the operator's deploy-verification glance.
+  describe("hub#839: npm VERSION/SOURCE drift renders a STALE line", () => {
+    /**
+     * Install-source deps that classify a row as npm (its `installDir` sits
+     * under the stubbed bun-global prefix) and report `liveVersion` as the
+     * installed package's version.
+     */
+    function npmInstallSource(liveVersion: string) {
+      return {
+        bunGlobalPrefixes: () => ["/bun/global/node_modules"],
+        resolveBunGlobal: () => null,
+        readJson: () => ({ version: liveVersion }),
+        readGitHead: () => undefined,
+      };
+    }
+
+    const NPM_INSTALL_DIR = "/bun/global/node_modules/@openparachute/vault";
+
+    async function renderNpmRow(rowVersion: string, liveVersion: string): Promise<string> {
+      const { path, configDir, cleanup } = makeTempPath();
+      try {
+        upsertService(
+          {
+            name: "parachute-vault",
+            port: 1940,
+            paths: ["/vault/default"],
+            health: "/vault/default/health",
+            version: rowVersion,
+            installDir: NPM_INSTALL_DIR,
+          },
+          path,
+        );
+        const lines: string[] = [];
+        await status({
+          ...supervisorOpts(configDir, path, {
+            moduleStates: {
+              supervisorAvailable: true,
+              modules: [runningModule("vault", rowVersion)],
+            },
+          }),
+          installSourceDeps: npmInstallSource(liveVersion),
+          print: (l) => lines.push(l),
+        });
+        return lines.join("\n");
+      } finally {
+        cleanup();
+      }
+    }
+
+    test("out-of-band `bun add -g` without a restart is flagged", async () => {
+      const out = await renderNpmRow("0.22.10", "0.22.11");
+      // SOURCE already told the truth; VERSION didn't. Now they're reconciled.
+      expect(out).toMatch(/npm \(0\.22\.11\)/);
+      expect(out).toMatch(/STALE: services\.json cached 0\.22\.10; live package\.json 0\.22\.11/);
+    });
+
+    test("hub#836's refresh-write-failure leaves a row that is now flagged", async () => {
+      // upgrade installed 0.23.0 and restarted; only the row write failed.
+      const out = await renderNpmRow("0.22.11", "0.23.0");
+      expect(out).toMatch(/STALE: services\.json cached 0\.22\.11; live package\.json 0\.23\.0/);
+    });
+
+    test("an npm row in agreement with its package renders no STALE line", async () => {
+      const out = await renderNpmRow("0.22.11", "0.22.11");
+      expect(out).toMatch(/npm \(0\.22\.11\)/);
+      expect(out).not.toMatch(/STALE:/);
+    });
+  });
 });
 
 describe("status — per-module URL deep-links (manifestRowBase / urlForEntry)", () => {
