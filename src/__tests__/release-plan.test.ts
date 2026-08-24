@@ -12,11 +12,17 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   compareVersions,
+  coreVersion,
   decidePublish,
+  disallowedStablePromotionPaths,
   distTagFor,
   driftLogArgs,
   emitOutputs,
+  latestMatchingRcTag,
+  matchingRcVersions,
+  rcTagListArgs,
   readRegistry,
+  stablePromotionDiffArgs,
   tagPrefixFor,
   unpublishedDrift,
 } from "../../scripts/release-plan.ts";
@@ -117,6 +123,140 @@ describe("decidePublish", () => {
     const d = decidePublish("0.7.9", { ambiguous: true }, { isTagPush: true });
     expect(d).toMatchObject({ publish: true });
   });
+
+  test("a stable without a matching rc is refused — 0.7.13 through 0.7.16 skipped this", () => {
+    // Cutting @latest with new code and no rc of the same X.Y.Z is how
+    // 0.7.13–0.7.16 shipped. Stable is a suffix-drop, never a skip.
+    const d = decidePublish("0.7.17", {
+      versionExists: false,
+      currentDistTagVersion: "0.7.16",
+      publishedVersions: ["0.7.16", "0.7.12-rc.2"],
+    });
+    expect(d).toMatchObject({ refuse: true });
+    expect("refuse" in d && d.reason).toMatch(/0\.7\.17-rc/);
+    expect("refuse" in d && d.reason).toMatch(/suffix-drop|Cut an rc first/i);
+  });
+
+  test("a stable whose only published rcs are a different X.Y.Z is still refused", () => {
+    const d = decidePublish("0.7.17", {
+      versionExists: false,
+      currentDistTagVersion: "0.7.16",
+      publishedVersions: ["0.7.16", "0.7.16-rc.1"],
+    });
+    expect(d).toMatchObject({ refuse: true });
+  });
+
+  test("a stable with a matching rc publishes — suffix-drop is the only legal stable", () => {
+    const d = decidePublish("0.7.17", {
+      versionExists: false,
+      currentDistTagVersion: "0.7.16",
+      publishedVersions: ["0.7.16", "0.7.17-rc.1"],
+    });
+    expect(d).toMatchObject({ publish: true });
+  });
+
+  test("omitted publishedVersions still refuses a stable when latest already exists", () => {
+    // Callers that forget to plumb the version list must not silently skip
+    // the gate — that's how 0.7.13–0.7.16 would keep shipping.
+    const d = decidePublish("0.7.17", {
+      versionExists: false,
+      currentDistTagVersion: "0.7.16",
+    });
+    expect(d).toMatchObject({ refuse: true });
+  });
+
+  test("tag-push still overrides the rc-required check", () => {
+    const d = decidePublish(
+      "0.7.17",
+      {
+        versionExists: false,
+        currentDistTagVersion: "0.7.16",
+        publishedVersions: ["0.7.16"],
+      },
+      { isTagPush: true },
+    );
+    expect(d).toMatchObject({ publish: true });
+  });
+});
+
+describe("matchingRcVersions", () => {
+  test("matches only the same X.Y.Z rc chain", () => {
+    expect(
+      matchingRcVersions("0.7.17", ["0.7.16", "0.7.16-rc.1", "0.7.17-rc.1", "0.7.17-rc.2"]),
+    ).toEqual(["0.7.17-rc.1", "0.7.17-rc.2"]);
+  });
+
+  test("a prerelease still matches siblings of its core", () => {
+    expect(matchingRcVersions("0.7.17-rc.3", ["0.7.17-rc.1", "0.7.16-rc.1"])).toEqual([
+      "0.7.17-rc.1",
+    ]);
+  });
+});
+
+describe("coreVersion", () => {
+  test("strips the rc suffix and leaves a stable alone", () => {
+    expect(coreVersion("0.7.17-rc.1")).toBe("0.7.17");
+    expect(coreVersion("0.7.17")).toBe("0.7.17");
+  });
+});
+
+describe("latestMatchingRcTag", () => {
+  test("picks the highest N for hub's bare-v tags", () => {
+    expect(
+      latestMatchingRcTag(
+        ["v0.7.16-rc.1", "v0.7.17-rc.1", "v0.7.17-rc.2", "v0.7.17"],
+        "0.7.17",
+        "v",
+      ),
+    ).toBe("v0.7.17-rc.2");
+  });
+
+  test("namespaces sub-package tags — a hub v tag is not door-contract's", () => {
+    expect(
+      latestMatchingRcTag(
+        ["v0.7.0-rc.9", "door-contract-v0.7.0-rc.1", "door-contract-v0.7.0-rc.2"],
+        "0.7.0",
+        "door-contract-v",
+      ),
+    ).toBe("door-contract-v0.7.0-rc.2");
+  });
+
+  test("undefined when the chain has no rc tag", () => {
+    expect(latestMatchingRcTag(["v0.7.16"], "0.7.17", "v")).toBeUndefined();
+  });
+});
+
+describe("disallowedStablePromotionPaths", () => {
+  test("version/changelog/lockfile-only is a suffix-drop", () => {
+    expect(disallowedStablePromotionPaths(["package.json", "CHANGELOG.md", "bun.lock"])).toEqual(
+      [],
+    );
+  });
+
+  test("a source file is new code — the 0.7.13–0.7.16 skip-rc shape", () => {
+    expect(disallowedStablePromotionPaths(["package.json", "src/users.ts"])).toEqual([
+      "src/users.ts",
+    ]);
+  });
+});
+
+describe("rcTagListArgs / stablePromotionDiffArgs", () => {
+  test("hub lists its own bare-v rc tags", () => {
+    expect(rcTagListArgs(".", "0.7.17")).toEqual(["git", "tag", "-l", "v0.7.17-rc.*"]);
+  });
+
+  test("door-contract lists door-contract-v, not hub's v", () => {
+    expect(rcTagListArgs("packages/door-contract", "0.7.0")[3]).toBe("door-contract-v0.7.0-rc.*");
+  });
+
+  test("the suffix-drop diff is name-only from the rc tag to HEAD", () => {
+    expect(stablePromotionDiffArgs("v0.7.17-rc.1")).toEqual([
+      "git",
+      "diff",
+      "--name-only",
+      "v0.7.17-rc.1..HEAD",
+    ]);
+  });
 });
 
 describe("readRegistry", () => {
@@ -129,7 +269,11 @@ describe("readRegistry", () => {
         versions: { "0.7.9-rc.1": {}, "0.7.9-rc.2": {} },
         "dist-tags": { rc: "0.7.9-rc.2", latest: "0.7.8" },
       })) as unknown as typeof fetch);
-    expect(v).toMatchObject({ versionExists: true, currentDistTagVersion: "0.7.9-rc.2" });
+    expect(v).toMatchObject({
+      versionExists: true,
+      currentDistTagVersion: "0.7.9-rc.2",
+      publishedVersions: ["0.7.9-rc.1", "0.7.9-rc.2"],
+    });
   });
 
   test("picks the dist-tag matching the version's channel", async () => {
