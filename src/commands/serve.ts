@@ -463,7 +463,7 @@ export async function seedInitialAdminIfNeeded(
   } catch (err) {
     if (err instanceof InvalidUsernameError) {
       log(
-        `parachute serve: PARACHUTE_INITIAL_ADMIN_USERNAME "${username}" is invalid (${err.reason}); ${describeUsernameReason(err.reason)}. First-boot seed may use "admin"; other reserved words, uppercase, periods, and names outside 2–32 chars are rejected.`,
+        `parachute serve: PARACHUTE_INITIAL_ADMIN_USERNAME ${JSON.stringify(username)} is invalid (${err.reason}); ${describeUsernameReason(err.reason)}. First-boot seed may use "admin"; other reserved words, uppercase, periods, and names outside 2–32 chars are rejected.`,
       );
     }
     throw err;
@@ -481,7 +481,7 @@ function logUnlinkableUsernamesWarning(
   if (bad.length === 0) return;
   log(
     `parachute serve: ${bad.length} existing username(s) cannot run the pubkey-linkage ceremony until renamed: ${bad
-      .map((b) => `"${b.username}" (${b.reason})`)
+      .map((b) => `${JSON.stringify(b.username)} (${b.reason})`)
       .join(", ")}`,
   );
 }

@@ -459,6 +459,66 @@ describe("seedInitialAdminIfNeeded", () => {
     expect(log.mock.calls[0]?.[0] ?? "").toContain("cannot run the pubkey-linkage ceremony");
     expect(log.mock.calls[0]?.[0] ?? "").toContain('"Alice" (format)');
   });
+
+  test("hub#864 — grandfathered username with a newline cannot forge extra log lines", async () => {
+    const db = openHubDb(dbPath);
+    await seedInitialAdminIfNeeded(
+      db,
+      {
+        PARACHUTE_INITIAL_ADMIN_USERNAME: "ops",
+        PARACHUTE_INITIAL_ADMIN_PASSWORD: "first-pw",
+      },
+      () => {},
+    );
+    // Pre-#864 rows could contain control chars; a raw interpolation would
+    // split the boot warning into extra operator-log lines.
+    const forged = "Alice\nFORGED extra operator line";
+    const stamp = new Date().toISOString();
+    db.prepare(
+      `INSERT INTO users (id, username, password_hash, created_at, updated_at, password_changed, email)
+       VALUES (?, ?, ?, ?, ?, 1, NULL)`,
+    ).run("legacy-nl", forged, "not-a-real-hash", stamp, stamp);
+    const log = mock<(line: string) => void>(() => {});
+    const result = await seedInitialAdminIfNeeded(
+      db,
+      {
+        PARACHUTE_INITIAL_ADMIN_USERNAME: "ops",
+        PARACHUTE_INITIAL_ADMIN_PASSWORD: "ignored",
+      },
+      log,
+    );
+    expect(result).toBe("exists");
+    expect(log.mock.calls).toHaveLength(1);
+    const line = log.mock.calls[0]?.[0] ?? "";
+    expect(line).not.toContain("\n");
+    expect(line).not.toContain("\r");
+    expect(line).toContain(JSON.stringify(forged));
+    expect(line).toContain("cannot run the pubkey-linkage ceremony");
+  });
+
+  test("hub#864 — invalid env username with a newline cannot forge extra log lines", async () => {
+    const db = openHubDb(dbPath);
+    const forged = "Alice\nFORGED extra operator line";
+    const log = mock<(line: string) => void>(() => {});
+    await expect(
+      seedInitialAdminIfNeeded(
+        db,
+        {
+          PARACHUTE_INITIAL_ADMIN_USERNAME: forged,
+          PARACHUTE_INITIAL_ADMIN_PASSWORD: "correct horse battery staple",
+        },
+        log,
+      ),
+    ).rejects.toThrow(InvalidUsernameError);
+    expect(userCount(db)).toBe(0);
+    expect(log.mock.calls).toHaveLength(1);
+    const line = log.mock.calls[0]?.[0] ?? "";
+    expect(line).not.toContain("\n");
+    expect(line).not.toContain("\r");
+    expect(line).toContain(JSON.stringify(forged));
+    expect(line).toContain("PARACHUTE_INITIAL_ADMIN_USERNAME");
+    expect(line).toContain("invalid (format)");
+  });
 });
 
 describe("formatListeningBanner", () => {

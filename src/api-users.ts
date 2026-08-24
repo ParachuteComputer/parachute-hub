@@ -836,5 +836,3 @@ export async function handleResetUserPassword(
     },
   );
 }
-
-
