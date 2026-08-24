@@ -3,8 +3,8 @@
  * attribution snapshot on `tokens` rows (phase 1b).
  *
  * Coverage:
- *   - migration v17 lands `user_pubkeys`, `pubkey_challenges`, and the
- *     additive `tokens.subject_pubkey` column
+ *   - migrations v17/v18 land live linkage, registry attribution, and the
+ *     durable proof archive
  *   - challenges: issued hashed (raw value is NOT recoverable from the DB),
  *     single-use, TTL-bounded, user-bound
  *   - link: happy path; replay of a consumed challenge; expired challenge;
@@ -20,11 +20,12 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { hubDbPath, openHubDb } from "../hub-db.ts";
+import { hubDbPath, migrate, openHubDb } from "../hub-db.ts";
 import { findTokenRowByJti, recordTokenMint, signRefreshToken } from "../jwt-sign.ts";
 import {
   MAX_PUBKEYS_PER_USER,
   PUBKEY_CHALLENGE_TTL_MS,
+  attributionProofsForSubject,
   attributionPubkey,
   issuePubkeyChallenge,
   linkPubkey,
@@ -70,14 +71,15 @@ async function user(name: string): Promise<string> {
   return u.id;
 }
 
-describe("migration v17", () => {
-  test("creates the linkage tables and the additive tokens column", () => {
+describe("migrations v17/v18", () => {
+  test("creates the linkage and proof tables plus the additive tokens column", () => {
     const tables = db
       .query<{ name: string }, []>("SELECT name FROM sqlite_master WHERE type = 'table'")
       .all()
       .map((r) => r.name);
     expect(tables).toContain("user_pubkeys");
     expect(tables).toContain("pubkey_challenges");
+    expect(tables).toContain("attribution_proofs");
 
     const cols = db.query<{ name: string; notnull: number }, []>("PRAGMA table_info(tokens)").all();
     const subjectPubkey = cols.find((c) => c.name === "subject_pubkey");
@@ -110,6 +112,39 @@ describe("migration v17", () => {
         now,
       }),
     ).toEqual({ ok: false, reason: "pubkey_taken" });
+  });
+
+  test("v18 backfills proofs from links that existed at migration time", async () => {
+    const alice = await user("alice");
+    const now = new Date(1_700_000_000_000);
+    const { challenge } = issuePubkeyChallenge(db, alice, now);
+    const signedProof = proof(PK_A, challenge);
+    expect(
+      linkPubkey(db, {
+        userId: alice,
+        pubkey: PK_A,
+        challenge,
+        proofEvent: signedProof,
+        proofEventId: "proof-before-v18",
+        now,
+      }).ok,
+    ).toBe(true);
+
+    // Recreate the exact pre-v18 schema state while retaining its live link.
+    db.exec("DROP TABLE attribution_proofs; DELETE FROM schema_version WHERE version = 18");
+    migrate(db);
+
+    expect(attributionProofsForSubject(db, alice)).toEqual([
+      {
+        pubkey: PK_A,
+        userId: alice,
+        label: null,
+        proofEvent: signedProof,
+        proofEventId: "proof-before-v18",
+        linkedAt: now.toISOString(),
+        lastVerifiedAt: now.toISOString(),
+      },
+    ]);
   });
 });
 
@@ -154,6 +189,45 @@ describe("linkPubkey", () => {
     expect(res.link.label).toBe("laptop");
     expect(res.link.linkedAt).toBe(now.toISOString());
     expect(proofEventFor(db, PK_A)).toBe(proof(PK_A, challenge));
+    expect(attributionProofsForSubject(db, alice)).toEqual([
+      expect.objectContaining({
+        pubkey: PK_A,
+        userId: alice,
+        proofEvent: proof(PK_A, challenge),
+      }),
+    ]);
+  });
+
+  test("keeps each subject's proof when an unlinked key is linked to someone else", async () => {
+    const alice = await user("alice");
+    const bob = await user("bob");
+    const first = issuePubkeyChallenge(db, alice, new Date(1_700_000_000_000));
+    expect(
+      linkPubkey(db, {
+        userId: alice,
+        pubkey: PK_A,
+        challenge: first.challenge,
+        proofEvent: proof(PK_A, first.challenge),
+        now: new Date(1_700_000_000_000),
+      }).ok,
+    ).toBe(true);
+    expect(unlinkPubkey(db, alice, PK_A)).toBe(true);
+
+    const second = issuePubkeyChallenge(db, bob, new Date(1_700_000_001_000));
+    expect(
+      linkPubkey(db, {
+        userId: bob,
+        pubkey: PK_A,
+        challenge: second.challenge,
+        proofEvent: proof(PK_A, second.challenge),
+        now: new Date(1_700_000_001_000),
+      }).ok,
+    ).toBe(true);
+
+    expect(attributionProofsForSubject(db, alice)[0]?.proofEvent).toBe(
+      proof(PK_A, first.challenge),
+    );
+    expect(attributionProofsForSubject(db, bob)[0]?.proofEvent).toBe(proof(PK_A, second.challenge));
   });
 
   test("a challenge is single-use — replay is refused", async () => {

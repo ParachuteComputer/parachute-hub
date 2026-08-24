@@ -17,7 +17,8 @@
  *   GET  ""           → the caller's own linked keys
  *   POST "/challenge" → mint a single-use challenge + the event template
  *   POST "/verify"    → present a signed NIP-01 event; link on success
- *   POST "/unlink"    → drop one of the caller's own links
+ *   POST "/unlink"    → drop one of the caller's own live links; retain its
+ *                        proof for historical registry attribution
  *
  * ## The ceremony
  *
@@ -64,7 +65,7 @@
  *
  * Nothing. No scope, no claim, no authentication path. A linked key is an
  * attribution label; `sub` remains the only principal the hub authorizes on.
- * See `pubkey-links.ts` and migration v17.
+ * See `pubkey-links.ts` and migrations v17/v18.
  */
 import type { Database } from "bun:sqlite";
 import {
