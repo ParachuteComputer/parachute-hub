@@ -6,6 +6,46 @@ All notable changes to `@openparachute/hub` are documented here. The format foll
 >
 > This backfill covers the 0.6.x line only. Two pre-existing gaps remain undocumented and are **not** addressed here: the `0.5.13` stable itself (the file's newest entry is `0.5.13-rc.48`, never the stable) and the entire `0.5.14-rc` chain (rc.1–rc.21 on npm), which never promoted to a `0.5.14` stable — its work folded forward into 0.6.0.
 
+## [0.7.17-rc.1] - 2026-08-24
+
+**Username chokepoint, attribution that survives unlink, and an rc-before-stable
+publish gate.** Six PRs over 0.7.16 plus this hook. Soaks on `@rc`; stable later
+is a suffix-drop only.
+
+- **Every username write hits one validator (#865, closes hub#864).** Create
+  and rename both go through `[a-z0-9_-]` 2–32 and the reserved-word list
+  (`admin|root|system|setup|parachute|hub`). First-boot seed may still be
+  exactly `admin`; later `admin` creates are refused.
+
+- **Duplicate linkage binding tags are refused without naming the other
+  holder (#866, closes hub#859).** A ceremony that repeats a binding tag is
+  rejected; the 4xx does not leak who already holds the key.
+
+- **Attribution proofs survive unlink (#868, closes hub#860).**
+  `GET /api/auth/attribution` reads `attribution_proofs` (migration v18), not
+  the live `user_pubkeys` table. Unlink / account-delete cannot erase a proof
+  that already existed. A linked key still grants nothing (no login, no
+  scope) — it is an attribution label. **No account-page UI** — the ceremony
+  is API-only (`/api/account/pubkeys`).
+
+- **Test-suite `PARACHUTE_HOME` sandbox (#867, closes hub#840).** bunfig.toml
+  `[test]` preload replaces any inherited home with a fresh temp dir before
+  config.ts freezes paths. Does **not** make `bun test ./src` safe on a live
+  operator box (launchd-touching tests still ignore `PARACHUTE_HOME`).
+
+- **Unpublished-drift advisory actually runs (#857, closes hub#830).** The
+  `plan` job now fetches full history + tags, and the revision range uses each
+  package's own tag prefix, so a skip-path release can warn instead of looking
+  like "everything is shipped".
+
+- **CI/Docker Bun 1.4 floor (#869).** setup-bun, e2e systemd container, and
+  comments pin 1.4.0. Lockfiles stay `lockfileVersion: 1`.
+
+- **Stable cannot skip rc.** `release-plan.ts` refuses a stable publish unless
+  npm already has a matching `X.Y.Z-rc.*`, and refuses again unless `git diff`
+  from that rc tag only touches version/changelog/lockfile paths. Tag-push
+  still overrides. 0.7.13–0.7.16 skipped this; the gate starts here.
+
 ## [0.7.16] - 2026-08-21
 
 **Train CI + token de-escalation on both create doors: `next`-targeted PRs

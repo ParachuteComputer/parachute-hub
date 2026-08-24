@@ -36,14 +36,24 @@ Per [governance rule 2 (updated 2026-05-24)](https://github.com/ParachuteCompute
 
 ### Releasing hub
 
+Always cut an **rc** first. Stable is a suffix-drop from that rc, never a
+skip — `release-plan.ts` refuses a stable unless npm already has a matching
+`X.Y.Z-rc.*`, and refuses again unless the tree is a suffix-drop from that
+rc tag (version / changelog / lockfile only). `0.7.13`–`0.7.16` skipped this;
+the hook starts at `0.7.17-rc.1`. An explicit tag push still overrides.
+
+Feature work lands on `next`. The rc cut is a version bump on `next`, then
+`next` → `main`. That merge publishes `@rc`.
+
 ```sh
-git fetch && git checkout -b release/hub-X.Y.Z origin/main
-# Bump the version in ./package.json (rc.N or drop -rc for stable) + CHANGELOG.
-git commit -am "chore(release): hub X.Y.Z — <what shipped>"
-gh pr create
+git fetch && git checkout -b release/hub-X.Y.Z-rc.N origin/next
+# Bump ./package.json to X.Y.Z-rc.N + CHANGELOG.
+git commit -am "release: hub X.Y.Z-rc.N — <what shipped>"
+gh pr create --base next
+# After that merges: open next → main. That click publishes @rc.
 ```
 
-Merge it to `main`. CI takes over — watch the run at [Actions](https://github.com/ParachuteComputer/parachute-hub/actions). On success:
+Merge the `next` → `main` PR. CI takes over — watch the run at [Actions](https://github.com/ParachuteComputer/parachute-hub/actions). On success:
 - npm gets the new version with the appropriate dist-tag
 - ghcr gets a new image at `:vX.Y.Z` plus `:rc`, or `:stable` + `:latest`
 - a `vX.Y.Z` git tag is pushed as a record
@@ -56,7 +66,12 @@ Same shape: bump the version in `./packages/<name>/package.json` and merge. Each
 
 ### Promoting an rc chain to stable
 
-Open a release PR that drops the `-rc.N` suffix from the relevant `package.json` and merge it. CI publishes with `dist-tag=latest` (and, for hub, moves `:stable` + `:latest` on ghcr).
+**No new code.** Branch from the rc tag (or from `main` at that tag), drop
+the `-rc.N` suffix from `package.json`, update CHANGELOG, and PR to `main`.
+Do **not** merge `next` — anything landed on `next` after the rc waits for
+the next rc. CI publishes with `dist-tag=latest` (and, for hub, moves
+`:stable` + `:latest` on ghcr). A merge that isn't a suffix-drop from the
+latest matching rc tag is refused at publish time.
 
 ### Doc-only PRs
 
