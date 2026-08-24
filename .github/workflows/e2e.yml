@@ -40,7 +40,7 @@ jobs:
       - name: Install bun (host — needed for HUB_SOURCE=local pack)
         uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version: 1.4
 
       - name: Run Tier-1 E2E
         env:
