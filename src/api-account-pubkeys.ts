@@ -35,15 +35,16 @@
  *     type- and length-checked before any hashing or curve math)
  *   - `kind === 27235`
  *   - `created_at` within ±5 minutes of the hub's clock
- *   - the `u` tag naming an origin this hub answers on AND the verify path
- *   - the `method` tag exactly `POST`
+ *   - exactly one `u` tag, naming an origin this hub answers on AND the verify path
+ *   - exactly one `method` tag, with the value `POST`
  *   - `content` exactly the linkage statement for THIS session's account and
  *     that origin
  *   - a recomputed NIP-01 id matching the claimed `id`
  *   - a BIP-340 Schnorr signature over that id verifying against the claimed
  *     x-only pubkey
- *   - a challenge that exists, belongs to THIS user, is unconsumed, and is
- *     unexpired — consumed atomically with the link write
+ *   - exactly one `challenge` tag, naming a challenge that exists, belongs to
+ *     THIS user, is unconsumed, and is unexpired — consumed atomically with
+ *     the link write
  *
  * Four independent defenses stack here. Against REPLAY: the server-issued
  * single-use challenge (primary), the `created_at` window, and the `u`/`method`
@@ -373,7 +374,7 @@ function requestOrigin(req: Request): string {
  *   1. label validation (pure string check — reject before anything else so a
  *      bad label can't burn a challenge)
  *   2. event shape + bounds (`parseNostrEvent`; no hashing yet)
- *   3. kind / created_at / `u` / `method` / challenge-tag presence — all pure
+ *   3. kind / created_at / exactly-one `u` / `method` / `challenge` tags — all pure
  *   4. the legible statement in `content` (see `linkageStatement`), recomputed
  *      from the SESSION's user and the `u` tag's already-validated origin
  *   5. rate limit (before any curve math)
@@ -555,6 +556,24 @@ async function handleVerify(
  */
 type BindingResult = { ok: true; origin: string } | { ok: false; res: Response };
 
+type BindingTagName = "u" | "method" | "challenge";
+
+/**
+ * Return the first security-critical binding tag that appears more than once.
+ * `tagValue` is intentionally first-wins for general Nostr use, but a stored
+ * linkage proof must have one unambiguous interpretation for every verifier.
+ */
+function duplicateBindingTag(event: NostrEvent): BindingTagName | null {
+  const seen = new Set<BindingTagName>();
+  for (const tag of event.tags) {
+    const name = tag[0];
+    if (name !== "u" && name !== "method" && name !== "challenge") continue;
+    if (seen.has(name)) return name;
+    seen.add(name);
+  }
+  return null;
+}
+
 function checkBinding(
   event: NostrEvent,
   req: Request,
@@ -565,6 +584,11 @@ function checkBinding(
     ok: false,
     res: jsonError(400, "invalid_event", why),
   });
+
+  const duplicate = duplicateBindingTag(event);
+  if (duplicate !== null) {
+    return generic(`event must carry exactly one \`${duplicate}\` tag`);
+  }
 
   if (event.kind !== NOSTR_AUTH_KIND) {
     return generic(`event kind must be ${NOSTR_AUTH_KIND}`);

@@ -614,6 +614,29 @@ describe("POST /verify — rejections", () => {
     );
   });
 
+  test("duplicate binding tags are refused even when the first value is valid", async () => {
+    const alice = await userWithSession("alice");
+    for (const duplicate of [
+      ["u", "https://evil.example/api/account/pubkeys/verify"],
+      ["method", "GET"],
+      ["challenge", "f".repeat(64)],
+    ]) {
+      const challenge = await getChallenge(alice.cookie);
+      const event = signEvent(SECRET_A, {
+        content: statement(alice.username),
+        tags: [...linkageTags(challenge), duplicate],
+      });
+      const res = await call("POST", "/verify", alice.cookie, {
+        __csrf: TEST_CSRF,
+        event,
+        password: PASSWORD,
+      });
+      expect(res.status).toBe(400);
+      expect(((await res.json()) as { error: string }).error).toBe("invalid_event");
+    }
+    expect(listUserPubkeys(db, alice.userId)).toHaveLength(0);
+  });
+
   test("a tampered id is refused", async () => {
     const alice = await userWithSession("alice");
     const challenge = await getChallenge(alice.cookie);
