@@ -2,10 +2,12 @@ name: e2e
 
 # Tier-1 end-to-end harness: systemd-in-container fresh-install flow.
 #
-# Runs the REAL operator install path (curl bun.sh/install → bun add -g
-# @openparachute/hub → parachute init → wizard → MCP OAuth dance) against a
-# privileged Ubuntu+systemd container, replaying recent field-failure
-# scenarios as staged assertions. See e2e/README.md.
+# Runs the REAL operator install path (curl bun.sh/install bun-v1.4.0 →
+# bun add -g @openparachute/hub → parachute init → wizard → MCP OAuth dance)
+# against a privileged Ubuntu+systemd container, replaying recent
+# field-failure scenarios as staged assertions. See e2e/README.md.
+# The container's bun install is pinned to 1.4.0 in e2e/stages.sh — not
+# unversioned curl|bash — so a later bun.sh latest cannot drift the harness.
 #
 # Triggers:
 #   workflow_dispatch  — manual, with a hub_source input (default npm:rc).
