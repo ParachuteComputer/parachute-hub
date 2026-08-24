@@ -49,7 +49,13 @@ import { getHubOrigin } from "../hub-settings.ts";
 import { writeHubFile } from "../hub.ts";
 import { enrichedPath } from "../spawn-path.ts";
 import { Supervisor } from "../supervisor.ts";
-import { createUser, userCount } from "../users.ts";
+import {
+  InvalidUsernameError,
+  createUser,
+  describeUsernameReason,
+  listUnlinkableUsernames,
+  userCount,
+} from "../users.ts";
 import { sanitizePublicOrigin } from "../vault-hub-origin-env.ts";
 import { WELL_KNOWN_DIR } from "../well-known.ts";
 import { createWsBridgeHandlers } from "../ws-bridge.ts";
@@ -441,7 +447,10 @@ export async function seedInitialAdminIfNeeded(
   env: NodeJS.ProcessEnv,
   log: (line: string) => void = () => {},
 ): Promise<"seeded" | "exists" | "needs-setup"> {
-  if (userCount(db) > 0) return "exists";
+  if (userCount(db) > 0) {
+    logUnlinkableUsernamesWarning(db, log);
+    return "exists";
+  }
   const username = env.PARACHUTE_INITIAL_ADMIN_USERNAME?.trim();
   const password = env.PARACHUTE_INITIAL_ADMIN_PASSWORD;
   if (!username || !password) return "needs-setup";
@@ -449,9 +458,32 @@ export async function seedInitialAdminIfNeeded(
   // multi-user-Phase-1 force-change-password redirect by landing
   // `password_changed=true`. Same treatment as the wizard's first admin.
   // `assignedVault` stays null — admin posture (no per-vault restriction).
-  await createUser(db, username, password, { passwordChanged: true });
+  try {
+    await createUser(db, username, password, { passwordChanged: true });
+  } catch (err) {
+    if (err instanceof InvalidUsernameError) {
+      log(
+        `parachute serve: PARACHUTE_INITIAL_ADMIN_USERNAME "${username}" is invalid (${err.reason}); ${describeUsernameReason(err.reason)}. First-boot seed may use "admin"; other reserved words, uppercase, periods, and names outside 2–32 chars are rejected.`,
+      );
+    }
+    throw err;
+  }
   log(`parachute serve: seeded initial admin "${username}" from PARACHUTE_INITIAL_ADMIN_*`);
+  logUnlinkableUsernamesWarning(db, log);
   return "seeded";
+}
+
+function logUnlinkableUsernamesWarning(
+  db: ReturnType<typeof openHubDb>,
+  log: (line: string) => void,
+): void {
+  const bad = listUnlinkableUsernames(db);
+  if (bad.length === 0) return;
+  log(
+    `parachute serve: ${bad.length} existing username(s) cannot run the pubkey-linkage ceremony until renamed: ${bad
+      .map((b) => `"${b.username}" (${b.reason})`)
+      .join(", ")}`,
+  );
 }
 
 /**

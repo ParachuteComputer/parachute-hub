@@ -48,10 +48,12 @@ import { type AdminAuthError, adminAuthErrorResponse, requireScope } from "./adm
 import { HOST_ADMIN_SCOPE } from "./admin-vaults.ts";
 import { SERVICES_MANIFEST_PATH } from "./config.ts";
 import {
+  InvalidUsernameError,
   PASSWORD_MAX_LEN,
   type User,
   UsernameTakenError,
   createUser,
+  describeUsernameReason,
   deleteUser,
   getFirstAdminId,
   getUserById,
@@ -342,6 +344,9 @@ export async function handleCreateUser(req: Request, deps: ApiUsersDeps): Promis
     // INSERT and snagged the username. Surface as the same 409.
     if (err instanceof UsernameTakenError) {
       return jsonError(409, "username_taken", err.message);
+    }
+    if (err instanceof InvalidUsernameError) {
+      return jsonError(400, "invalid_username", describeUsernameReason(err.reason));
     }
     const msg = err instanceof Error ? err.message : String(err);
     return jsonError(500, "server_error", `failed to create user: ${msg}`);
@@ -832,13 +837,4 @@ export async function handleResetUserPassword(
   );
 }
 
-function describeUsernameReason(reason: "format" | "length" | "reserved"): string {
-  switch (reason) {
-    case "length":
-      return "username must be 2-32 characters long";
-    case "format":
-      return "username must contain only lowercase letters, digits, hyphens, and underscores ([a-z0-9_-])";
-    case "reserved":
-      return "username is reserved (admin, root, system, setup, parachute, hub)";
-  }
-}
+

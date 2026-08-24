@@ -86,7 +86,7 @@ import {
   findActiveSession,
 } from "./sessions.ts";
 import type { Supervisor } from "./supervisor.ts";
-import { createUser, userCount } from "./users.ts";
+import { createUser, isSeedAdminUsername, userCount, validateUsername } from "./users.ts";
 import { sanitizePublicOrigin } from "./vault-hub-origin-env.ts";
 import { DEFAULT_VAULT_NAME, validateVaultName } from "./vault-name.ts";
 
@@ -684,10 +684,10 @@ export function renderAccountStep(props: RenderAccountStepProps): string {
         <label class="field">
           <span class="field-label">Username</span>
           <input type="text" name="username" autocomplete="username"${usernameAutofocus}
-            required minlength="2" maxlength="64"
-            pattern="[A-Za-z0-9_.-]+" title="letters, digits, _ . - (2–64 chars)"
+            required minlength="2" maxlength="32"
+            pattern="[a-z0-9_-]+" title="lowercase letters, digits, hyphens, underscores (2–32 chars). First account may be named admin."
             ${usernameAttr} />
-          <span class="field-hint">letters, digits, <code>_</code>, <code>.</code>, <code>-</code></span>
+          <span class="field-hint">lowercase letters, digits, <code>_</code>, <code>-</code>; 2–32 chars. First account may be <code>admin</code>.</span>
         </label>
         <label class="field">
           <span class="field-label">Password</span>
@@ -2771,11 +2771,19 @@ function validateAccountFields(input: {
   password: string;
   confirm: string;
 }): string | undefined {
-  if (input.username.length < 2 || input.username.length > 64) {
-    return "Username must be 2–64 characters.";
-  }
-  if (!/^[A-Za-z0-9_.-]+$/.test(input.username)) {
-    return "Username may use letters, digits, underscore, period, hyphen.";
+  // Same vocabulary as createUser (hub#864). The wizard is always the
+  // first-user path, so reserved `admin` is allowed; other reserved
+  // words, uppercase, periods, and names outside 2–32 are not.
+  const u = validateUsername(input.username);
+  if (!u.valid && !isSeedAdminUsername(input.username, 0)) {
+    switch (u.reason) {
+      case "length":
+        return "Username must be 2–32 characters.";
+      case "format":
+        return "Username may use lowercase letters, digits, underscore, hyphen.";
+      case "reserved":
+        return "Username is reserved (admin is allowed for this first account; root, system, setup, parachute, hub are not).";
+    }
   }
   if (input.password.length < 8) {
     return "Password must be at least 8 characters.";
