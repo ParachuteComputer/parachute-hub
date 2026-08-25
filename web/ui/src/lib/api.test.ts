@@ -488,3 +488,80 @@ describe("resolveManagementUrl", () => {
     ).toBe("https://elsewhere.example/manage");
   });
 });
+
+describe("listAccountTokens / mintAccountToken", () => {
+  it("GETs /api/account/tokens with same-origin credentials and parses next_cursor", async () => {
+    const fetchMock = vi.fn(async () => jsonResponse(200, { tokens: [], next_cursor: "abc" }));
+    vi.stubGlobal("fetch", fetchMock);
+    const api = await import("./api.ts");
+    const page = await api.listAccountTokens({ cursor: "prev" });
+    expect(page.next_cursor).toBe("abc");
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/account/tokens?cursor=prev",
+      expect.objectContaining({
+        method: "GET",
+        credentials: "same-origin",
+      }),
+    );
+  });
+
+  it("POSTs mint with CSRF + scope + label", async () => {
+    const fetchMock = vi.fn(async () =>
+      jsonResponse(200, {
+        jti: "j1",
+        token: "eyJ",
+        expires_at: "2030-01-01T00:00:00.000Z",
+        scope: "vault:work:read",
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const api = await import("./api.ts");
+    const minted = await api.mintAccountToken("csrf-x", {
+      scope: "vault:work:read",
+      label: "laptop",
+    });
+    expect(minted.jti).toBe("j1");
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/account/tokens",
+      expect.objectContaining({
+        method: "POST",
+        credentials: "same-origin",
+        body: JSON.stringify({
+          __csrf: "csrf-x",
+          scope: "vault:work:read",
+          label: "laptop",
+        }),
+      }),
+    );
+  });
+});
+
+describe("verifyPubkeyLink", () => {
+  it("surfaces first-link password_required instead of bouncing to login", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        jsonResponse(401, {
+          error: "password_required",
+          error_description:
+            "Re-enter your current password to link your first key to this account.",
+        }),
+      ),
+    );
+    const api = await import("./api.ts");
+    await expect(
+      api.verifyPubkeyLink("csrf-x", {
+        event: {
+          id: "a",
+          pubkey: "b",
+          created_at: 1,
+          kind: 27235,
+          tags: [],
+          content: "x",
+          sig: "c",
+        },
+      }),
+    ).rejects.toMatchObject({ status: 401, message: expect.stringMatching(/re-enter/i) });
+    expect(auth.redirectToLoginAndHang).not.toHaveBeenCalled();
+  });
+});

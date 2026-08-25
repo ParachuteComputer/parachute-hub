@@ -22,6 +22,7 @@ import {
   OPERATOR_TOKEN_AUDIENCE,
   OPERATOR_TOKEN_CLIENT_ID,
   OPERATOR_TOKEN_FILENAME,
+  OPERATOR_TOKEN_SCOPE_SETS,
   OPERATOR_TOKEN_SCOPE_SET_CLAIM,
   issueOperatorToken,
   operatorTokenPath,
@@ -323,6 +324,40 @@ describe("selfHealOperatorTokenIssuer", () => {
         });
         expect(status.kind).toBe("skipped");
         if (status.kind === "skipped") expect(status.reason).toBe("no-sub");
+
+        const onDisk = await readOperatorTokenFile(h.dir);
+        expect(onDisk).toBe(signed.token);
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("sub is not a users row (stale iss, aud=operator, valid scope-set) → skipped:sub-not-user, untouched", async () => {
+    const h = makeHarness();
+    try {
+      const db = openHubDb(hubDbPath(h.dir));
+      try {
+        rotateSigningKey(db);
+        plantOperatorUsers(db);
+        const signed = await signAccessToken(db, {
+          sub: "operator",
+          scopes: [...OPERATOR_TOKEN_SCOPE_SETS.admin],
+          audience: OPERATOR_TOKEN_AUDIENCE,
+          clientId: OPERATOR_TOKEN_CLIENT_ID,
+          issuer: LOOPBACK_ISSUER,
+          extraClaims: { [OPERATOR_TOKEN_SCOPE_SET_CLAIM]: "admin" },
+        });
+        await writeOperatorTokenFile(signed.token, h.dir);
+
+        const status = await selfHealOperatorTokenIssuer(db, {
+          issuer: PUBLIC_ISSUER,
+          configDir: h.dir,
+        });
+        expect(status.kind).toBe("skipped");
+        if (status.kind === "skipped") expect(status.reason).toBe("sub-not-user");
 
         const onDisk = await readOperatorTokenFile(h.dir);
         expect(onDisk).toBe(signed.token);
