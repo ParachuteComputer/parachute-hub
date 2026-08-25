@@ -34,8 +34,14 @@ import { EXPOSE_STATE_PATH, readExposeState } from "./expose-state.ts";
 import { validateHostAdminToken } from "./host-admin-token-validation.ts";
 import { readHubPort } from "./hub-control.ts";
 import { HUB_UNIT_DEFAULT_PORT } from "./hub-unit.ts";
-import { recordTokenMint, signAccessToken, validateAccessToken } from "./jwt-sign.ts";
+import {
+  TokenMintPrincipalGoneError,
+  recordTokenMint,
+  signAccessToken,
+  validateAccessToken,
+} from "./jwt-sign.ts";
 import { buildHubBoundOrigins } from "./origin-check.ts";
+import { getUserById } from "./users.ts";
 import { isLoopbackOrigin } from "./vault-hub-origin-env.ts";
 
 export const OPERATOR_TOKEN_FILENAME = "operator.token";
@@ -156,10 +162,16 @@ export async function mintOperatorToken(
   userId: string,
   opts: MintOperatorTokenOpts,
 ): Promise<{ token: string; jti: string; expiresAt: string; scopeSet: OperatorScopeSet }> {
+  const user = getUserById(db, userId);
+  if (!user) {
+    throw new TokenMintPrincipalGoneError(
+      `mintOperatorToken: no hub user ${userId}; operator mint is a person-mint`,
+    );
+  }
   const scopeSet = opts.scopeSet ?? OPERATOR_TOKEN_DEFAULT_SCOPE_SET;
   const scopes = [...OPERATOR_TOKEN_SCOPE_SETS[scopeSet]];
   const minted = await signAccessToken(db, {
-    sub: userId,
+    sub: user.id,
     scopes,
     audience: opts.audience ?? OPERATOR_TOKEN_AUDIENCE,
     clientId: OPERATOR_TOKEN_CLIENT_ID,
@@ -174,16 +186,15 @@ export async function mintOperatorToken(
     ...(opts.now !== undefined ? { now: opts.now } : {}),
   });
   // Register every operator-mint with the unified token registry (hub#212
-  // Phase 1). Per design: operator-mint rows have user_id NULL; the
-  // subject column carries the canonical "operator" identity string.
-  // (Storing user_id here would require an FK-valid users row, which the
-  // operator-mint path doesn't always have access to in test fixtures —
-  // and conceptually the operator is a role, not a hub user.) Powers the
-  // revocation list endpoint.
+  // Phase 1 / hub#833). JWT sub is the hub user id; user_id is set so
+  // account delete / password-reset revoke this row. subject stays the
+  // "operator" display label.
   recordTokenMint(db, {
     jti: minted.jti,
     createdVia: "operator_mint",
     subject: "operator",
+    userId: user.id,
+    userUpdatedAt: user.updatedAt,
     clientId: OPERATOR_TOKEN_CLIENT_ID,
     scopes,
     expiresAt: minted.expiresAt,

@@ -1009,7 +1009,8 @@ describe("handleAccountMintVaultToken", () => {
   test("mints a vault token with aud=vault.<name> and default read+write scope", async () => {
     const h = makeHarness(["field-notes"]);
     try {
-      const token = await bearer(h, [ACCOUNT_ADMIN_SCOPE]);
+      const u = await createUser(h.db, "owner", "pw");
+      const token = await bearer(h, [ACCOUNT_ADMIN_SCOPE], u.id);
       const res = await handleAccountMintVaultToken(
         withBearer("/account/vaults/field-notes/token", token, { method: "POST" }),
         "field-notes",
@@ -1038,7 +1039,8 @@ describe("handleAccountMintVaultToken", () => {
   test("honors an explicit scopes list", async () => {
     const h = makeHarness(["field-notes"]);
     try {
-      const token = await bearer(h, [ACCOUNT_ADMIN_SCOPE]);
+      const u = await createUser(h.db, "owner", "pw");
+      const token = await bearer(h, [ACCOUNT_ADMIN_SCOPE], u.id);
       const res = await handleAccountMintVaultToken(
         jsonReq("/account/vaults/field-notes/token", token, "POST", {
           scopes: ["vault:field-notes:read"],
@@ -1050,6 +1052,30 @@ describe("handleAccountMintVaultToken", () => {
       const body = (await res.json()) as { vault_token: string };
       const validated = await validateAccessToken(h.db, body.vault_token, ISSUER);
       expect(validated.payload.scope).toBe("vault:field-notes:read");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("non-user bearer sub fails closed instead of minting with user_id NULL", async () => {
+    const h = makeHarness(["field-notes"]);
+    try {
+      const token = await bearer(h, [ACCOUNT_ADMIN_SCOPE], "not-a-user");
+      const res = await handleAccountMintVaultToken(
+        withBearer("/account/vaults/field-notes/token", token, { method: "POST" }),
+        "field-notes",
+        deps(h),
+      );
+      expect(res.status).toBe(403);
+      const body = (await res.json()) as { error: string };
+      expect(body.error).toBe("invalid_subject");
+      const n =
+        h.db
+          .query<{ n: number }, []>(
+            "SELECT COUNT(*) AS n FROM tokens WHERE created_via = 'cli_mint'",
+          )
+          .get()?.n ?? 0;
+      expect(n).toBe(0);
     } finally {
       h.cleanup();
     }

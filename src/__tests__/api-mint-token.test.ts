@@ -4,10 +4,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { handleApiMintToken } from "../api-mint-token.ts";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
-import { signAccessToken, validateAccessToken } from "../jwt-sign.ts";
+import { findTokenRowByJti, signAccessToken, validateAccessToken } from "../jwt-sign.ts";
 import { mintOperatorToken } from "../operator-token.ts";
 import { rotateSigningKey } from "../signing-keys.ts";
-import { createUser } from "../users.ts";
+import { createUser, deleteUser, resetUserPassword } from "../users.ts";
 
 interface Harness {
   dir: string;
@@ -895,10 +895,36 @@ describe("POST /api/auth/mint-token (hub#212 Phase 1)", () => {
     });
 
     // Item A (subject-pin) — audit-attribution forgery. A non-operator
-    // (vault-admin-only) bearer may NOT override the minted token's `sub`:
-    // forging a foreign subject would mis-attribute the registry + revocation
-    // rows. It may still mint under its OWN sub (subject omitted / equal).
-    test("subject override by non-operator bearer → 403 (forgery blocked)", async () => {
+    // (vault-admin-only) bearer may NOT mint as another account via `user`.
+    // A deprecated `subject` that does not match a hub account is a label,
+    // not a principal override.
+    test("user override by non-operator bearer → 403 (forgery blocked)", async () => {
+      const h = makeHarness();
+      try {
+        const { db, userId } = await bootstrap(h.dir);
+        try {
+          const other = await createUser(db, "friend", "pw", { allowMulti: true });
+          const bearer = await mintVaultAdminBearer(db, userId, "work");
+          const resp = await handleApiMintToken(
+            jsonRequest(
+              { scope: "vault:work:read", user: other.id },
+              { authorization: `Bearer ${bearer}` },
+            ),
+            { db, issuer: ISSUER },
+          );
+          expect(resp.status).toBe(403);
+          const body = (await resp.json()) as { error: string; error_description: string };
+          expect(body.error).toBe("insufficient_scope");
+          expect(body.error_description).toContain("non-operator");
+        } finally {
+          db.close();
+        }
+      } finally {
+        h.cleanup();
+      }
+    });
+
+    test("deprecated subject that is not a hub account is a label, JWT sub stays own", async () => {
       const h = makeHarness();
       try {
         const { db, userId } = await bootstrap(h.dir);
@@ -911,10 +937,18 @@ describe("POST /api/auth/mint-token (hub#212 Phase 1)", () => {
             ),
             { db, issuer: ISSUER },
           );
-          expect(resp.status).toBe(403);
-          const body = (await resp.json()) as { error: string; error_description: string };
-          expect(body.error).toBe("insufficient_scope");
-          expect(body.error_description).toContain("non-operator");
+          expect(resp.status).toBe(200);
+          const body = (await resp.json()) as { jti: string; token: string; warnings?: string[] };
+          expect(body.warnings?.some((w) => w.includes("deprecated"))).toBe(true);
+          const validated = await validateAccessToken(db, body.token, ISSUER);
+          expect(validated.payload.sub).toBe(userId);
+          const row = db
+            .query<{ subject: string; user_id: string }, [string]>(
+              "SELECT subject, user_id FROM tokens WHERE jti = ?",
+            )
+            .get(body.jti);
+          expect(row?.subject).toBe("someone-else");
+          expect(row?.user_id).toBe(userId);
         } finally {
           db.close();
         }
@@ -951,12 +985,160 @@ describe("POST /api/auth/mint-token (hub#212 Phase 1)", () => {
     });
   });
 
-  // Item A (subject-pin) — the operator carve-out: a host operator
-  // (parachute:host:auth / parachute:host:admin) MAY override `sub` to stamp a
-  // service-account subject. This is the documented service-account override
-  // that the non-operator pin above must NOT break.
-  describe("subject override — operator carve-out (item A)", () => {
-    test("host:auth operator overrides subject → 200, registry row carries override", async () => {
+  // hub#833 — `subject` is a deprecated label; `service` is the remaining
+  // non-account principal; `user` mints as that account.
+  describe("principal is users.id (hub#833)", () => {
+    test("person-mint writes user_id and JWT sub is users.id", async () => {
+      const h = makeHarness();
+      try {
+        const { db, userId } = await bootstrap(h.dir);
+        try {
+          const op = await mintOperatorToken(db, userId, { issuer: ISSUER });
+          const resp = await handleApiMintToken(
+            jsonRequest({ scope: "scribe:transcribe" }, { authorization: `Bearer ${op.token}` }),
+            { db, issuer: ISSUER },
+          );
+          expect(resp.status).toBe(200);
+          const body = (await resp.json()) as { jti: string; token: string };
+          const validated = await validateAccessToken(db, body.token, ISSUER);
+          expect(validated.payload.sub).toBe(userId);
+          const row = db
+            .query<{ user_id: string; subject: string }, [string]>(
+              "SELECT user_id, subject FROM tokens WHERE jti = ?",
+            )
+            .get(body.jti);
+          expect(row?.user_id).toBe(userId);
+          expect(row?.subject).toBe(userId);
+        } finally {
+          db.close();
+        }
+      } finally {
+        h.cleanup();
+      }
+    });
+
+    test("label sets tokens.subject; JWT sub stays the account id", async () => {
+      const h = makeHarness();
+      try {
+        const { db, userId } = await bootstrap(h.dir);
+        try {
+          const op = await mintOperatorToken(db, userId, { issuer: ISSUER });
+          const resp = await handleApiMintToken(
+            jsonRequest(
+              { scope: "scribe:transcribe", label: "laptop" },
+              { authorization: `Bearer ${op.token}` },
+            ),
+            { db, issuer: ISSUER },
+          );
+          expect(resp.status).toBe(200);
+          const body = (await resp.json()) as { jti: string; token: string };
+          const validated = await validateAccessToken(db, body.token, ISSUER);
+          expect(validated.payload.sub).toBe(userId);
+          const row = db
+            .query<{ user_id: string; subject: string }, [string]>(
+              "SELECT user_id, subject FROM tokens WHERE jti = ?",
+            )
+            .get(body.jti);
+          expect(row?.user_id).toBe(userId);
+          expect(row?.subject).toBe("laptop");
+        } finally {
+          db.close();
+        }
+      } finally {
+        h.cleanup();
+      }
+    });
+
+    test("operator user field mints as that account", async () => {
+      const h = makeHarness();
+      try {
+        const { db, userId } = await bootstrap(h.dir);
+        try {
+          const friend = await createUser(db, "friend", "pw", { allowMulti: true });
+          const op = await mintOperatorToken(db, userId, { issuer: ISSUER, scopeSet: "auth" });
+          const resp = await handleApiMintToken(
+            jsonRequest(
+              { scope: "vault:work:read", user: "friend" },
+              { authorization: `Bearer ${op.token}` },
+            ),
+            { db, issuer: ISSUER },
+          );
+          expect(resp.status).toBe(200);
+          const body = (await resp.json()) as { jti: string; token: string };
+          const validated = await validateAccessToken(db, body.token, ISSUER);
+          expect(validated.payload.sub).toBe(friend.id);
+          const row = db
+            .query<{ user_id: string }, [string]>("SELECT user_id FROM tokens WHERE jti = ?")
+            .get(body.jti);
+          expect(row?.user_id).toBe(friend.id);
+        } finally {
+          db.close();
+        }
+      } finally {
+        h.cleanup();
+      }
+    });
+
+    test("operator service field mints with user_id NULL and JWT sub = service name", async () => {
+      const h = makeHarness();
+      try {
+        const { db, userId } = await bootstrap(h.dir);
+        try {
+          const op = await mintOperatorToken(db, userId, { issuer: ISSUER, scopeSet: "auth" });
+          const resp = await handleApiMintToken(
+            jsonRequest(
+              { scope: "vault:work:read", service: "svc-account" },
+              { authorization: `Bearer ${op.token}` },
+            ),
+            { db, issuer: ISSUER },
+          );
+          expect(resp.status).toBe(200);
+          const body = (await resp.json()) as { jti: string; token: string };
+          const validated = await validateAccessToken(db, body.token, ISSUER);
+          expect(validated.payload.sub).toBe("svc-account");
+          const row = db
+            .query<{ user_id: string | null; subject: string }, [string]>(
+              "SELECT user_id, subject FROM tokens WHERE jti = ?",
+            )
+            .get(body.jti);
+          expect(row?.user_id).toBeNull();
+          expect(row?.subject).toBe("svc-account");
+        } finally {
+          db.close();
+        }
+      } finally {
+        h.cleanup();
+      }
+    });
+
+    test("deprecated subject matching a username is treated as user", async () => {
+      const h = makeHarness();
+      try {
+        const { db, userId } = await bootstrap(h.dir);
+        try {
+          const friend = await createUser(db, "friend", "pw", { allowMulti: true });
+          const op = await mintOperatorToken(db, userId, { issuer: ISSUER, scopeSet: "auth" });
+          const resp = await handleApiMintToken(
+            jsonRequest(
+              { scope: "vault:work:read", subject: "friend" },
+              { authorization: `Bearer ${op.token}` },
+            ),
+            { db, issuer: ISSUER },
+          );
+          expect(resp.status).toBe(200);
+          const body = (await resp.json()) as { token: string; warnings?: string[] };
+          expect(body.warnings?.some((w) => w.includes("treating as `user`"))).toBe(true);
+          const validated = await validateAccessToken(db, body.token, ISSUER);
+          expect(validated.payload.sub).toBe(friend.id);
+        } finally {
+          db.close();
+        }
+      } finally {
+        h.cleanup();
+      }
+    });
+
+    test("host:auth operator deprecated subject that is not an account is a label", async () => {
       const h = makeHarness();
       try {
         const { db, userId } = await bootstrap(h.dir);
@@ -972,36 +1154,14 @@ describe("POST /api/auth/mint-token (hub#212 Phase 1)", () => {
           expect(resp.status).toBe(200);
           const body = (await resp.json()) as { jti: string; token: string };
           const validated = await validateAccessToken(db, body.token, ISSUER);
-          expect(validated.payload.sub).toBe("svc-account");
+          expect(validated.payload.sub).toBe(userId);
           const row = db
-            .query<{ subject: string }, [string]>("SELECT subject FROM tokens WHERE jti = ?")
+            .query<{ subject: string; user_id: string }, [string]>(
+              "SELECT subject, user_id FROM tokens WHERE jti = ?",
+            )
             .get(body.jti);
           expect(row?.subject).toBe("svc-account");
-        } finally {
-          db.close();
-        }
-      } finally {
-        h.cleanup();
-      }
-    });
-
-    test("host:admin operator overrides subject → 200", async () => {
-      const h = makeHarness();
-      try {
-        const { db, userId } = await bootstrap(h.dir);
-        try {
-          const op = await mintOperatorToken(db, userId, { issuer: ISSUER });
-          const resp = await handleApiMintToken(
-            jsonRequest(
-              { scope: "vault:work:admin", subject: "svc-account" },
-              { authorization: `Bearer ${op.token}` },
-            ),
-            { db, issuer: ISSUER },
-          );
-          expect(resp.status).toBe(200);
-          const body = (await resp.json()) as { token: string };
-          const validated = await validateAccessToken(db, body.token, ISSUER);
-          expect(validated.payload.sub).toBe("svc-account");
+          expect(row?.user_id).toBe(userId);
         } finally {
           db.close();
         }
@@ -1408,6 +1568,149 @@ describe("POST /api/auth/mint-token (hub#212 Phase 1)", () => {
         const req = new Request("http://localhost/api/auth/mint-token", { method: "GET" });
         const resp = await handleApiMintToken(req, { db, issuer: ISSUER });
         expect(resp.status).toBe(405);
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+});
+
+// hub#833 fold 2 — CAS insert after the crypto await. `afterSign` is the
+// test seam: it runs after `signAccessToken` and before `recordTokenMint`,
+// so the race is deterministic (no wall-clock). Watched failing before the
+// CAS existed (plain insert landed a live unrevoked row + returned the JWT).
+describe("CAS after crypto await (hub#833)", () => {
+  test("deleteUser during afterSign → 409, no token in body, no live unrevoked row", async () => {
+    const h = makeHarness();
+    try {
+      const { db, userId } = await bootstrap(h.dir);
+      try {
+        const op = await mintOperatorToken(db, userId, { issuer: ISSUER });
+        let signedJti: string | undefined;
+        let signedToken: string | undefined;
+        const resp = await handleApiMintToken(
+          jsonRequest(
+            { scope: "scribe:transcribe", expires_in: 3600 },
+            { authorization: `Bearer ${op.token}` },
+          ),
+          {
+            db,
+            issuer: ISSUER,
+            afterSign: ({ token, jti }) => {
+              signedToken = token;
+              signedJti = jti;
+              deleteUser(db, userId);
+            },
+          },
+        );
+        expect(resp.status).toBe(409);
+        const body = (await resp.json()) as { error?: string; token?: string };
+        expect(body.token).toBeUndefined();
+        expect(body.error).toBe("conflict");
+        expect(signedJti).toBeDefined();
+        const row = findTokenRowByJti(db, signedJti!);
+        expect(row === null || row.revokedAt !== null).toBe(true);
+        // The signed JWT was never returned. Missing-row bypass in
+        // validateAccessToken is out of this PR (historical pre-v6 tokens);
+        // fail-closed for NEW mints is the insert gate + not emitting the JWT.
+        expect(signedToken).toBeDefined();
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("unlink racing mint does not leave a dangling user_id (INSERT-time snapshot)", async () => {
+    const h = makeHarness();
+    try {
+      const { db, userId } = await bootstrap(h.dir);
+      try {
+        const { issuePubkeyChallenge, linkPubkey, unlinkPubkey } = await import(
+          "../pubkey-links.ts"
+        );
+        const now = new Date();
+        const { challenge } = issuePubkeyChallenge(db, userId, now);
+        const pubkey = "a".repeat(64);
+        const linked = linkPubkey(db, {
+          userId,
+          pubkey,
+          challenge,
+          proofEvent: JSON.stringify({
+            id: "0".repeat(64),
+            pubkey,
+            kind: 27235,
+            tags: [["challenge", challenge]],
+          }),
+          now,
+        });
+        expect(linked.ok).toBe(true);
+        const op = await mintOperatorToken(db, userId, { issuer: ISSUER });
+        const resp = await handleApiMintToken(
+          jsonRequest(
+            { scope: "scribe:transcribe", expires_in: 3600 },
+            { authorization: `Bearer ${op.token}` },
+          ),
+          {
+            db,
+            issuer: ISSUER,
+            afterSign: () => {
+              expect(unlinkPubkey(db, userId, pubkey)).toBe(true);
+            },
+          },
+        );
+        expect(resp.status).toBe(200);
+        const body = (await resp.json()) as { jti: string; token: string };
+        const row = db
+          .query<{ user_id: string | null; subject_pubkey: string | null }, [string]>(
+            "SELECT user_id, subject_pubkey FROM tokens WHERE jti = ?",
+          )
+          .get(body.jti);
+        expect(row?.user_id).toBe(userId);
+        // Snapshot is taken at INSERT, after the unlink, so it is NULL. The
+        // user row is still there — unlink is not logout (v17 snapshot).
+        expect(row?.subject_pubkey).toBeNull();
+        const validated = await validateAccessToken(db, body.token, ISSUER);
+        expect(validated.payload.sub).toBe(userId);
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("resetUserPassword during afterSign → 409, no token in body, no live unrevoked row", async () => {
+    const h = makeHarness();
+    try {
+      const { db, userId } = await bootstrap(h.dir);
+      try {
+        const op = await mintOperatorToken(db, userId, { issuer: ISSUER });
+        let signedJti: string | undefined;
+        const resp = await handleApiMintToken(
+          jsonRequest(
+            { scope: "scribe:transcribe", expires_in: 3600 },
+            { authorization: `Bearer ${op.token}` },
+          ),
+          {
+            db,
+            issuer: ISSUER,
+            afterSign: async ({ jti }) => {
+              signedJti = jti;
+              await resetUserPassword(db, userId, "new-password-after-reset");
+            },
+          },
+        );
+        expect(resp.status).toBe(409);
+        const body = (await resp.json()) as { error?: string; token?: string };
+        expect(body.token).toBeUndefined();
+        expect(body.error).toBe("conflict");
+        expect(signedJti).toBeDefined();
+        const row = findTokenRowByJti(db, signedJti!);
+        expect(row === null || row.revokedAt !== null).toBe(true);
       } finally {
         db.close();
       }

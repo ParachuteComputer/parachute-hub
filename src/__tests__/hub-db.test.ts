@@ -416,6 +416,42 @@ describe("openHubDb + migrate", () => {
     }
   });
 
+  test("v19 backfills tokens.user_id where subject equals a users.id; leaves the rest", () => {
+    const h = makeHarness();
+    try {
+      const db = openHubDb(h.dbPath);
+      try {
+        const stamp = new Date().toISOString();
+        db.prepare(
+          `INSERT INTO users (id, username, password_hash, created_at, updated_at, password_changed)
+           VALUES (?, ?, 'x', ?, ?, 1)`,
+        ).run("user-backfill", "owner", stamp, stamp);
+        db.prepare(
+          `INSERT INTO tokens (jti, user_id, client_id, scopes, expires_at, created_at, created_via, subject)
+           VALUES (?, NULL, 'c', 'vault:read', ?, ?, 'cli_mint', ?)`,
+        ).run("t-account", stamp, stamp, "user-backfill");
+        db.prepare(
+          `INSERT INTO tokens (jti, user_id, client_id, scopes, expires_at, created_at, created_via, subject)
+           VALUES (?, NULL, 'c', 'vault:read', ?, ?, 'operator_mint', 'operator')`,
+        ).run("t-operator", stamp, stamp);
+        db.exec("DELETE FROM schema_version WHERE version = 19");
+        migrate(db);
+        const account = db
+          .query<{ user_id: string | null }, [string]>("SELECT user_id FROM tokens WHERE jti = ?")
+          .get("t-account");
+        const operator = db
+          .query<{ user_id: string | null }, [string]>("SELECT user_id FROM tokens WHERE jti = ?")
+          .get("t-operator");
+        expect(account?.user_id).toBe("user-backfill");
+        expect(operator?.user_id).toBeNull();
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
   test("v10 FK cascade: deleting a user drops their user_vaults rows", () => {
     const h = makeHarness();
     try {
