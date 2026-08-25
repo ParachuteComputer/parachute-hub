@@ -31,7 +31,7 @@ import {
 } from "../jwt-sign.ts";
 import { upsertService } from "../services-manifest.ts";
 import { rotateSigningKey } from "../signing-keys.ts";
-import { createUser } from "../users.ts";
+import { createUser, resetUserPassword } from "../users.ts";
 import { getVaultCap } from "../vault-caps.ts";
 
 const ISSUER = "http://127.0.0.1:1939";
@@ -95,7 +95,10 @@ function makeHarness(vaultNames: string[] = ["beta", "personal"]): Harness {
 
 function deps(
   h: Harness,
-  extra: Partial<{ runCommand: (cmd: readonly string[]) => Promise<RunResult> }> = {},
+  extra: Partial<{
+    runCommand: (cmd: readonly string[]) => Promise<RunResult>;
+    afterSign: (ctx: { token: string; jti: string; userId: string | null }) => void | Promise<void>;
+  }> = {},
 ) {
   return { db: h.db, issuer: ISSUER, manifestPath: h.manifestPath, ...extra };
 }
@@ -736,6 +739,47 @@ describe("handleAccountCreateVault", () => {
       expect(body.message).toContain("WAS created");
       // And it must NOT leak the CLI bootstrap admin token as a consolation.
       expect(JSON.stringify(body)).not.toContain("hubjwt.work.admin");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("resetUserPassword during afterSign → vault exists, no JWT returned, no live unrevoked row (hub#873)", async () => {
+    const h = makeHarness(["default"]);
+    try {
+      const user = await createUser(h.db, "owner", "owner-password-123");
+      const token = await bearer(h, [ACCOUNT_WRITE_SCOPE], user.id);
+      let signedJti: string | undefined;
+      const runCommand = async (_cmd: readonly string[]): Promise<RunResult> => {
+        upsertService(
+          {
+            name: "parachute-vault",
+            port: 4101,
+            paths: ["/vault/default", "/vault/work"],
+            health: "/health",
+            version: "0.4.2",
+          },
+          h.manifestPath,
+        );
+        return { exitCode: 0, stdout: vaultCreateJson("work", "hubjwt.work.access"), stderr: "" };
+      };
+      const res = await handleAccountCreateVault(
+        jsonReq("/account/vaults", token, "POST", { name: "work" }),
+        deps(h, {
+          runCommand,
+          afterSign: async ({ jti }) => {
+            signedJti = jti;
+            await resetUserPassword(h.db, user.id, "new-password-after-reset");
+          },
+        }),
+      );
+      expect(res.status).toBe(500);
+      const body = (await res.json()) as { error: string; vault_token?: string };
+      expect(body.error).toBe("vault_created_token_mint_failed");
+      expect(body.vault_token).toBeUndefined();
+      expect(signedJti).toBeDefined();
+      const row = findTokenRowByJti(h.db, signedJti!);
+      expect(row === null || row.revokedAt !== null).toBe(true);
     } finally {
       h.cleanup();
     }

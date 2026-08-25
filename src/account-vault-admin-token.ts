@@ -61,7 +61,7 @@ import type { Database } from "bun:sqlite";
 import { renderAdminError } from "./admin-login-ui.ts";
 import { VAULT_ADMIN_TOKEN_TTL_SECONDS } from "./admin-vault-admin-token.ts";
 import { CSRF_FIELD_NAME, verifyCsrfToken } from "./csrf.ts";
-import { recordTokenMint, signAccessToken } from "./jwt-sign.ts";
+import { TokenMintPrincipalGoneError, recordTokenMint, signAccessToken } from "./jwt-sign.ts";
 import { findActiveSession } from "./sessions.ts";
 import { getUserById, vaultVerbsForUserVault } from "./users.ts";
 import { VAULT_NAME_CHARSET_RE } from "./vault-name.ts";
@@ -87,6 +87,11 @@ export interface AccountVaultAdminTokenDeps {
   managementUrl?: string;
   /** Test seam for the clock (mint). */
   now?: () => Date;
+  /**
+   * Test seam (hub#873): runs after `signAccessToken` and before
+   * `recordTokenMint`. Production omits it.
+   */
+  afterSign?: (ctx: { token: string; jti: string; userId: string | null }) => void | Promise<void>;
 }
 
 function htmlResponse(body: string, status = 200, extra: Record<string, string> = {}): Response {
@@ -238,19 +243,37 @@ export async function handleAccountVaultAdminTokenPost(
     vaultScope: [vaultName],
     ...(deps.now !== undefined ? { now: deps.now } : {}),
   });
-
-  recordTokenMint(deps.db, {
-    jti: minted.jti,
-    createdVia: "cli_mint",
-    subject: user.id,
-    // Anchor the registry row to the user's id so the operator's token registry
-    // + the revocation list attribute it correctly.
-    userId: user.id,
-    clientId: ACCOUNT_VAULT_ADMIN_CLIENT_ID,
-    scopes: [scope],
-    expiresAt: minted.expiresAt,
-    ...(deps.now !== undefined ? { now: deps.now } : {}),
-  });
+  if (deps.afterSign) {
+    await deps.afterSign({ token: minted.token, jti: minted.jti, userId: user.id });
+  }
+  try {
+    recordTokenMint(deps.db, {
+      jti: minted.jti,
+      createdVia: "cli_mint",
+      subject: user.id,
+      // Anchor the registry row to the user's id so the operator's token registry
+      // + the revocation list attribute it correctly. Pin updated_at so a
+      // resetUserPassword racing the crypto await cannot land a live row
+      // (hub#873).
+      userId: user.id,
+      userUpdatedAt: user.updatedAt,
+      clientId: ACCOUNT_VAULT_ADMIN_CLIENT_ID,
+      scopes: [scope],
+      expiresAt: minted.expiresAt,
+      ...(deps.now !== undefined ? { now: deps.now } : {}),
+    });
+  } catch (err) {
+    if (err instanceof TokenMintPrincipalGoneError) {
+      return htmlResponse(
+        renderAdminError({
+          title: "Could not mint a token",
+          message: err.message,
+        }),
+        409,
+      );
+    }
+    throw err;
+  }
 
   // Build the redirect target: <vault-url>/<managementUrl>#token=<jwt>. The
   // vault URL is the hub-mounted path (`<hubOrigin>/vault/<name>`); the

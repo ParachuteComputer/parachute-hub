@@ -19,7 +19,7 @@
  * before posting.
  */
 import { type FormEvent, useEffect, useState } from "react";
-import { useSearchParams } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
 import {
   type AdminTokenCreatedVia,
   type AdminTokenListing,
@@ -257,9 +257,11 @@ export function Tokens() {
       </div>
 
       <p className="muted">
-        The hub's token registry. Every CLI / OAuth / operator-mint writes a row here. Revoking
-        flips <code>revoked_at</code>; resource servers on{" "}
-        <code>@openparachute/scope-guard@^0.2.0</code> reject within ~60s of the next poll.
+        The operator registry. Every CLI / OAuth / operator-mint writes a row here. Your own tokens
+        — the ones a friend can mint without this page — live on{" "}
+        <Link to="/account">My account</Link>. Revoking flips <code>revoked_at</code>; resource
+        servers on <code>@openparachute/scope-guard@^0.2.0</code> reject within ~60s of the next
+        poll.
       </p>
 
       {mint.kind === "minted" ? (
@@ -482,7 +484,11 @@ function renderList({
   filtersActive,
 }: RenderListProps) {
   if (list.kind === "loading") {
-    return <p className="muted" data-loading="true">Loading…</p>;
+    return (
+      <p className="muted" data-loading="true">
+        Loading…
+      </p>
+    );
   }
   if (list.kind === "error") {
     return (

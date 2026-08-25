@@ -167,6 +167,11 @@ export interface AccountApiDeps {
   manifestPath?: string;
   /** Test seam for the clock (mint + registry row). */
   now?: () => Date;
+  /**
+   * Test seam (hub#873): runs after `signAccessToken` and before
+   * `recordTokenMint` on the create-vault handoff. Production omits it.
+   */
+  afterSign?: (ctx: { token: string; jti: string; userId: string | null }) => void | Promise<void>;
   /** Test seam threaded into `provisionVault` so create can be exercised
    * without spawning the real `parachute-vault create` binary. */
   runCommand?: (cmd: readonly string[]) => Promise<{
@@ -591,6 +596,10 @@ export async function handleAccountCreateVault(
     // below tells caller and operator exactly what state the box is in: the
     // vault EXISTS, only the handoff failed.
     try {
+      // Snapshot the users row BEFORE the crypto await (hub#873). A
+      // reset/delete racing sign used to re-fetch after sign and mint with
+      // user_id NULL — a live JWT the account-delete revoke set misses.
+      const subjectUser = getUserById(deps.db, auth.sub);
       const minted = await signAccessToken(deps.db, {
         sub: auth.sub,
         scopes,
@@ -601,7 +610,13 @@ export async function handleAccountCreateVault(
         vaultScope: [entry.name],
         ...(deps.now !== undefined ? { now: deps.now } : {}),
       });
-      const subjectIsUser = getUserById(deps.db, auth.sub) !== null;
+      if (deps.afterSign) {
+        await deps.afterSign({
+          token: minted.token,
+          jti: minted.jti,
+          userId: subjectUser?.id ?? null,
+        });
+      }
       recordTokenMint(deps.db, {
         jti: minted.jti,
         // hub#848: distinct from `cli_mint` — this row is a hub-signed
@@ -609,7 +624,7 @@ export async function handleAccountCreateVault(
         // door stamps, so registry forensics can find both.
         createdVia: "vault_create_handoff",
         subject: auth.sub,
-        ...(subjectIsUser ? { userId: auth.sub } : {}),
+        ...(subjectUser ? { userId: subjectUser.id, userUpdatedAt: subjectUser.updatedAt } : {}),
         clientId,
         scopes,
         expiresAt: minted.expiresAt,

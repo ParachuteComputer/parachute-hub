@@ -98,12 +98,14 @@ describe("Administer group", () => {
     renderRoute();
 
     const administer = await screen.findByTestId("home-administer");
-    // These six sections should be present; /vaults should not.
+    // Hub-native sections; /vaults is module-owned and must not appear.
     for (const path of [
       "/connections",
       "/modules",
       "/users",
+      "/account",
       "/tokens",
+      "/grants",
       "/permissions",
       "/settings",
     ]) {
