@@ -15,7 +15,7 @@ import {
   readOperatorTokenFile,
   writeOperatorTokenFile,
 } from "../operator-token.ts";
-import { createUser, listUsers, verifyPassword } from "../users.ts";
+import { createUser, deleteUser, listUsers, verifyPassword } from "../users.ts";
 
 function makeRunner(result: number | (() => Promise<number>) = 0): {
   runner: Runner;
@@ -1799,7 +1799,43 @@ describe("parachute auth mint-token", () => {
     }
   });
 
-  test("--sub override emits the JWT with that subject", async () => {
+  test("--sub that is not a hub account is a label; JWT sub stays the account id", async () => {
+    const tmp = makeTmp();
+    try {
+      const deps: AuthDeps = {
+        dbPath: tmp.dbPath,
+        configDir: tmp.dir,
+        isInteractive: () => false,
+      };
+      await captureOutput(() => auth(["set-password", "--password", "pw"], deps));
+      const { code, stdout, stderr } = await captureOutput(() =>
+        auth(["mint-token", "--scope", "scribe:transcribe", "--sub", "agent:scribe-runner"], deps),
+      );
+      expect(code).toBe(0);
+      expect(stderr).toContain("--sub is deprecated");
+      expect(stderr).toContain("treating as --label");
+      const token = stdout.trim();
+      const db = openHubDb(tmp.dbPath);
+      try {
+        const validated = await validateAccessToken(db, token);
+        const users = listUsers(db);
+        expect(validated.payload.sub).toBe(users[0]!.id);
+        const row = db
+          .query<{ subject: string; user_id: string }, [string]>(
+            "SELECT subject, user_id FROM tokens WHERE jti = ?",
+          )
+          .get(validated.payload.jti as string);
+        expect(row?.subject).toBe("agent:scribe-runner");
+        expect(row?.user_id).toBe(users[0]!.id);
+      } finally {
+        db.close();
+      }
+    } finally {
+      tmp.cleanup();
+    }
+  });
+
+  test("--label sets tokens.subject; JWT sub stays the account id", async () => {
     const tmp = makeTmp();
     try {
       const deps: AuthDeps = {
@@ -1809,17 +1845,84 @@ describe("parachute auth mint-token", () => {
       };
       await captureOutput(() => auth(["set-password", "--password", "pw"], deps));
       const { code, stdout } = await captureOutput(() =>
-        auth(["mint-token", "--scope", "scribe:transcribe", "--sub", "agent:scribe-runner"], deps),
+        auth(["mint-token", "--scope", "scribe:transcribe", "--label", "laptop"], deps),
       );
       expect(code).toBe(0);
       const token = stdout.trim();
       const db = openHubDb(tmp.dbPath);
       try {
         const validated = await validateAccessToken(db, token);
-        expect(validated.payload.sub).toBe("agent:scribe-runner");
+        const users = listUsers(db);
+        expect(validated.payload.sub).toBe(users[0]!.id);
+        const row = db
+          .query<{ subject: string }, [string]>("SELECT subject FROM tokens WHERE jti = ?")
+          .get(validated.payload.jti as string);
+        expect(row?.subject).toBe("laptop");
       } finally {
         db.close();
       }
+    } finally {
+      tmp.cleanup();
+    }
+  });
+
+  test("--service mints a non-account principal (user_id NULL, JWT sub = name)", async () => {
+    const tmp = makeTmp();
+    try {
+      const deps: AuthDeps = {
+        dbPath: tmp.dbPath,
+        configDir: tmp.dir,
+        isInteractive: () => false,
+      };
+      await captureOutput(() => auth(["set-password", "--password", "pw"], deps));
+      const { code, stdout } = await captureOutput(() =>
+        auth(["mint-token", "--scope", "scribe:transcribe", "--service", "surface:notes"], deps),
+      );
+      expect(code).toBe(0);
+      const token = stdout.trim();
+      const db = openHubDb(tmp.dbPath);
+      try {
+        const validated = await validateAccessToken(db, token);
+        expect(validated.payload.sub).toBe("surface:notes");
+        const row = db
+          .query<{ user_id: string | null; subject: string }, [string]>(
+            "SELECT user_id, subject FROM tokens WHERE jti = ?",
+          )
+          .get(validated.payload.jti as string);
+        expect(row?.user_id).toBeNull();
+        expect(row?.subject).toBe("surface:notes");
+      } finally {
+        db.close();
+      }
+    } finally {
+      tmp.cleanup();
+    }
+  });
+
+  test("CAS: deleteUser during afterSign fails closed and does not print the JWT", async () => {
+    const tmp = makeTmp();
+    try {
+      const deps: AuthDeps = {
+        dbPath: tmp.dbPath,
+        configDir: tmp.dir,
+        isInteractive: () => false,
+        afterSign: ({ userId }) => {
+          if (!userId) return;
+          const db = openHubDb(tmp.dbPath);
+          try {
+            deleteUser(db, userId);
+          } finally {
+            db.close();
+          }
+        },
+      };
+      await captureOutput(() => auth(["set-password", "--password", "pw"], deps));
+      const { code, stdout, stderr } = await captureOutput(() =>
+        auth(["mint-token", "--scope", "scribe:transcribe"], deps),
+      );
+      expect(code).toBe(1);
+      expect(stdout.trim()).toBe("");
+      expect(stderr).toContain("no longer exists");
     } finally {
       tmp.cleanup();
     }

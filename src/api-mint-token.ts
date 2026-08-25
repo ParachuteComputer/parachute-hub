@@ -46,7 +46,12 @@
  */
 import type { Database } from "bun:sqlite";
 import { inferAudience } from "./jwt-audience.ts";
-import { recordTokenMint, signAccessToken, validateAccessToken } from "./jwt-sign.ts";
+import {
+  TokenMintPrincipalGoneError,
+  recordTokenMint,
+  signAccessToken,
+  validateAccessToken,
+} from "./jwt-sign.ts";
 import {
   MINT_HOST_ADMIN_SCOPE,
   MINT_HOST_AUTH_SCOPE,
@@ -59,6 +64,7 @@ import {
   isWellFormedOrNonVaultScope,
   vaultScopeName,
 } from "./scope-explanations.ts";
+import { getUserById, resolveUser } from "./users.ts";
 
 // Re-export `canGrant` so existing importers (and the symmetric revoke path)
 // have a single name to reach for; the implementation lives in the shared
@@ -115,13 +121,25 @@ export interface ApiMintTokenDeps {
   knownVaultNames?: ReadonlySet<string>;
   /** Test seam for time. */
   now?: () => Date;
+  /**
+   * Test seam (hub#833): runs after `signAccessToken` and before
+   * `recordTokenMint`. The CAS insert is what keeps a signed JWT from
+   * leaking when the target account vanishes during the crypto await;
+   * this hook is how the race test deletes / resets the user in that
+   * window. Production callers omit it.
+   */
+  afterSign?: (ctx: { token: string; jti: string; userId: string | null }) => void | Promise<void>;
 }
 
 interface MintTokenRequest {
   scope?: unknown;
   audience?: unknown;
   expires_in?: unknown;
+  /** @deprecated Use `label` (display) or `user` (account principal). */
   subject?: unknown;
+  label?: unknown;
+  user?: unknown;
+  service?: unknown;
   permissions?: unknown;
 }
 
@@ -313,28 +331,111 @@ export async function handleApiMintToken(req: Request, deps: ApiMintTokenDeps): 
     ttlSeconds = body.expires_in;
   }
 
-  let subject: string;
-  if (body.subject === undefined) {
-    subject = bearerSub;
-  } else if (typeof body.subject === "string" && body.subject.length > 0) {
-    // Subject override is an OPERATOR-only capability (audit-attribution
-    // forgery otherwise). A host operator (`parachute:host:auth` /
-    // `parachute:host:admin`) may stamp a service-account `sub` other than its
-    // own — the documented service-account override. A merely vault-scoped
-    // bearer (`vault:<N>:admin` only, no host authority) has no business
-    // forging the minted token's subject: it would let a vault admin mint a
-    // token the registry + revocation list attribute to a foreign subject. So
-    // a non-operator bearer may only mint tokens carrying its OWN `sub`.
-    if (!isOperatorBearer(bearerScopes) && body.subject !== bearerSub) {
+  // Identity (hub#833): person-mint JWT `sub` is always `users.id`.
+  // `tokens.subject` is a display label. `subject` (body) is a deprecated
+  // alias of `label`, unless the value matches a hub account — then it is
+  // treated as `user` (one-release back-compat). Never silently mint a
+  // fake principal.
+  const warnings: string[] = [];
+  const asNonEmpty = (v: unknown): string | null =>
+    typeof v === "string" && v.length > 0 ? v : null;
+
+  const readOptional = (
+    value: unknown,
+    present: boolean,
+    field: string,
+  ): { ok: true; value: string | null } | { ok: false; res: Response } => {
+    if (!present) return { ok: true, value: null };
+    const parsed = asNonEmpty(value);
+    if (parsed === null) {
+      return {
+        ok: false,
+        res: jsonError(400, "invalid_request", `${field} must be a non-empty string when present`),
+      };
+    }
+    return { ok: true, value: parsed };
+  };
+  const labelField = readOptional(body.label, body.label !== undefined, "label");
+  if (!labelField.ok) return labelField.res;
+  const userField = readOptional(body.user, body.user !== undefined, "user");
+  if (!userField.ok) return userField.res;
+  const serviceField = readOptional(body.service, body.service !== undefined, "service");
+  if (!serviceField.ok) return serviceField.res;
+  const subjectField = readOptional(body.subject, body.subject !== undefined, "subject");
+  if (!subjectField.ok) return subjectField.res;
+
+  if (userField.value && serviceField.value) {
+    return jsonError(400, "invalid_request", "pass user OR service, not both");
+  }
+
+  let asUser = userField.value;
+  const asService = serviceField.value;
+  let asLabel = labelField.value;
+  if (subjectField.value !== null) {
+    if (asUser || asService || asLabel) {
+      return jsonError(
+        400,
+        "invalid_request",
+        "`subject` is deprecated; pass `user`, `label`, or `service` instead (not together with `subject`)",
+      );
+    }
+    const matched = resolveUser(deps.db, subjectField.value);
+    if (matched) {
+      warnings.push(
+        "`subject` is deprecated; treating as `user` because it matches a hub account. JWT sub is the account id.",
+      );
+      asUser = matched.id;
+    } else {
+      warnings.push(
+        "`subject` is deprecated; treating as `label`. JWT sub stays the bearer account id.",
+      );
+      asLabel = subjectField.value;
+    }
+  }
+
+  let jwtSub: string;
+  let mintUserId: string | null = null;
+  let mintUserUpdatedAt: string | undefined;
+  let subjectLabel: string;
+  if (asService) {
+    if (!isOperatorBearer(bearerScopes)) {
       return jsonError(
         403,
         "insufficient_scope",
-        "non-operator bearers may not override subject; omit `subject` to mint under your own identity",
+        "non-operator bearers may not mint a service principal; omit `service` to mint under your own account",
       );
     }
-    subject = body.subject;
+    jwtSub = asService;
+    subjectLabel = asLabel ?? asService;
+  } else if (asUser) {
+    const target = resolveUser(deps.db, asUser);
+    if (!target) {
+      return jsonError(400, "invalid_request", `no hub account matching user "${asUser}"`);
+    }
+    if (!isOperatorBearer(bearerScopes) && target.id !== bearerSub) {
+      return jsonError(
+        403,
+        "insufficient_scope",
+        "non-operator bearers may not mint as another account; omit `user` to mint under your own identity",
+      );
+    }
+    jwtSub = target.id;
+    mintUserId = target.id;
+    mintUserUpdatedAt = target.updatedAt;
+    subjectLabel = asLabel ?? target.id;
   } else {
-    return jsonError(400, "invalid_request", "subject must be a non-empty string when present");
+    const bearerUser = getUserById(deps.db, bearerSub);
+    if (!bearerUser) {
+      return jsonError(
+        401,
+        "unauthenticated",
+        "bearer subject is not a hub user; person-mint requires a users.id principal",
+      );
+    }
+    jwtSub = bearerUser.id;
+    mintUserId = bearerUser.id;
+    mintUserUpdatedAt = bearerUser.updatedAt;
+    subjectLabel = asLabel ?? bearerUser.id;
   }
 
   let permissionsClaim: Record<string, unknown> | undefined;
@@ -385,9 +486,12 @@ export async function handleApiMintToken(req: Request, deps: ApiMintTokenDeps): 
   }
   const vaultScopePin = [...vaultScopePinSet];
 
-  // 6. Mint + register.
+  // 6. Mint + register. Person-mint JWT sub is users.id; service mint uses
+  // the service name. Registry insert for person-mints is a CAS against the
+  // users row (hub#833) so a delete/reset racing the crypto await cannot
+  // land a live unregistered JWT.
   const minted = await signAccessToken(deps.db, {
-    sub: subject,
+    sub: jwtSub,
     scopes,
     audience,
     clientId: API_MINT_TOKEN_CLIENT_ID,
@@ -406,20 +510,30 @@ export async function handleApiMintToken(req: Request, deps: ApiMintTokenDeps): 
     ...(deps.now !== undefined ? { now: deps.now } : {}),
   });
 
-  recordTokenMint(deps.db, {
-    jti: minted.jti,
-    createdVia: "cli_mint",
-    subject,
-    // user_id intentionally omitted — CLI-mint rows store subject only,
-    // matching the CLI path's shape (so HTTP and CLI mints look identical
-    // in the registry). The bearer's user identity is implicit via the
-    // bearer's own user_id (which is in its own tokens row).
-    clientId: API_MINT_TOKEN_CLIENT_ID,
-    scopes,
-    expiresAt: minted.expiresAt,
-    ...(permissionsCanonical !== undefined ? { permissions: permissionsCanonical } : {}),
-    ...(deps.now !== undefined ? { now: deps.now } : {}),
-  });
+  if (deps.afterSign) {
+    await deps.afterSign({ token: minted.token, jti: minted.jti, userId: mintUserId });
+  }
+
+  try {
+    recordTokenMint(deps.db, {
+      jti: minted.jti,
+      createdVia: "cli_mint",
+      subject: subjectLabel,
+      ...(mintUserId
+        ? { userId: mintUserId, ...(mintUserUpdatedAt ? { userUpdatedAt: mintUserUpdatedAt } : {}) }
+        : {}),
+      clientId: API_MINT_TOKEN_CLIENT_ID,
+      scopes,
+      expiresAt: minted.expiresAt,
+      ...(permissionsCanonical !== undefined ? { permissions: permissionsCanonical } : {}),
+      ...(deps.now !== undefined ? { now: deps.now } : {}),
+    });
+  } catch (err) {
+    if (err instanceof TokenMintPrincipalGoneError) {
+      return jsonError(409, "conflict", err.message);
+    }
+    throw err;
+  }
 
   return new Response(
     JSON.stringify({
@@ -428,6 +542,7 @@ export async function handleApiMintToken(req: Request, deps: ApiMintTokenDeps): 
       expires_at: minted.expiresAt,
       scope: scopes.join(" "),
       ...(permissionsClaim !== undefined ? { permissions: permissionsClaim } : {}),
+      ...(warnings.length > 0 ? { warnings } : {}),
     }),
     {
       status: 200,

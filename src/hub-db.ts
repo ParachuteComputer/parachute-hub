@@ -9,7 +9,9 @@
  * multi-use public-signup links + email-as-username + the `vault_caps`
  * per-vault storage-cap table), and Nostr-pubkey ↔ user linkage plus the
  * additive `tokens.subject_pubkey` attribution snapshot (v17, hub#833
- * phase 1), and the durable attribution proof archive (v18, hub#860).
+ * phase 1), the durable attribution proof archive (v18, hub#860), and a
+ * live `tokens.user_id` backfill where `subject` already equals a
+ * `users.id` (v19, hub#833 per-account mint).
  *
  * Each open() runs `migrate()` to bring the schema up to date. A
  * `schema_version` table records every applied migration so re-opens are
@@ -691,6 +693,21 @@ const MIGRATIONS: readonly Migration[] = [
         (subject, pubkey, label, proof_event, proof_event_id, linked_at, last_verified_at)
       SELECT user_id, pubkey, label, proof_event, proof_event_id, linked_at, last_verified_at
       FROM user_pubkeys;
+    `,
+  },
+  {
+    version: 19,
+    sql: `
+      -- Backfill tokens.user_id where subject already is a users.id (hub#833).
+      -- Person-mints going forward always set user_id; this recovers live
+      -- rows whose subject was the account id. Leave the rest grandfathered
+      -- (operator/service labels, friend-named strings). Do not rewrite
+      -- already-issued JWTs — they expire / rotate.
+      UPDATE tokens
+         SET user_id = subject
+       WHERE user_id IS NULL
+         AND subject IS NOT NULL
+         AND EXISTS (SELECT 1 FROM users WHERE id = tokens.subject);
     `,
   },
 ];

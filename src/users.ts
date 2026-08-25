@@ -384,6 +384,16 @@ export function getUserById(db: Database, id: string): User | null {
   return row ? rowToUser(row, readVaultsForUser(db, row.id)) : null;
 }
 
+/**
+ * Resolve a hub user by id, else username (case-insensitive). Used by the
+ * mint `--user` / body `user` flags (hub#833) so operators can name an
+ * account either way.
+ */
+export function resolveUser(db: Database, ident: string): User | null {
+  if (ident.length === 0) return null;
+  return getUserById(db, ident) ?? getUserByUsernameCI(db, ident);
+}
+
 export function listUsers(db: Database): User[] {
   const rows = db.query<Row, []>("SELECT * FROM users ORDER BY created_at ASC").all();
   if (rows.length === 0) return [];

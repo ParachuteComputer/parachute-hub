@@ -26,6 +26,18 @@ import {
 } from "../operator-token.ts";
 import { rotateSigningKey } from "../signing-keys.ts";
 
+/** Operator mint is a person-mint (hub#833): the user row must exist. */
+function plantOperatorUsers(db: ReturnType<typeof openHubDb>): void {
+  const stamp = new Date().toISOString();
+  const insert = db.prepare(
+    `INSERT INTO users (id, username, password_hash, created_at, updated_at, password_changed)
+     VALUES (?, ?, 'x', ?, ?, 1)`,
+  );
+  insert.run("user-abc", "owner", stamp, stamp);
+  insert.run("user-xyz", "other", stamp, stamp);
+  insert.run("u", "shortn", stamp, stamp);
+}
+
 interface Harness {
   dir: string;
   cleanup: () => void;
@@ -45,6 +57,7 @@ describe("mintOperatorToken", () => {
       const db = openHubDb(hubDbPath(h.dir));
       try {
         rotateSigningKey(db);
+        plantOperatorUsers(db);
         // Mint at the real clock (no pinned `now`): `validateAccessToken` below
         // enforces `exp` against jose's real clock, which has no override, so a
         // pinned past mint date would eventually push `exp` into the past and
@@ -140,6 +153,7 @@ describe("issueOperatorToken", () => {
       const db = openHubDb(hubDbPath(h.dir));
       try {
         rotateSigningKey(db);
+        plantOperatorUsers(db);
         const issued = await issueOperatorToken(db, "user-xyz", {
           dir: h.dir,
           issuer: TEST_ISSUER,
@@ -176,6 +190,7 @@ describe("mintOperatorToken scope-sets (#213)", () => {
       const db = openHubDb(hubDbPath(h.dir));
       try {
         rotateSigningKey(db);
+        plantOperatorUsers(db);
         const minted = await mintOperatorToken(db, "user-abc", { issuer: TEST_ISSUER });
         expect(minted.scopeSet).toBe("admin");
         const validated = await validateAccessToken(db, minted.token, TEST_ISSUER);
@@ -195,6 +210,7 @@ describe("mintOperatorToken scope-sets (#213)", () => {
       const db = openHubDb(hubDbPath(h.dir));
       try {
         rotateSigningKey(db);
+        plantOperatorUsers(db);
         const minted = await mintOperatorToken(db, "user-abc", {
           issuer: TEST_ISSUER,
           scopeSet: "start",
@@ -217,6 +233,7 @@ describe("mintOperatorToken scope-sets (#213)", () => {
       const db = openHubDb(hubDbPath(h.dir));
       try {
         rotateSigningKey(db);
+        plantOperatorUsers(db);
         const minted = await mintOperatorToken(db, "u", {
           issuer: TEST_ISSUER,
           scopeSet: "install",
@@ -293,6 +310,7 @@ describe("useOperatorTokenWithAutoRotate (#213)", () => {
       const db = openHubDb(hubDbPath(h.dir));
       try {
         rotateSigningKey(db);
+        plantOperatorUsers(db);
         const issued = await issueOperatorToken(db, "user-abc", {
           dir: h.dir,
           issuer: TEST_ISSUER,
@@ -320,6 +338,7 @@ describe("useOperatorTokenWithAutoRotate (#213)", () => {
       const db = openHubDb(hubDbPath(h.dir));
       try {
         rotateSigningKey(db);
+        plantOperatorUsers(db);
         // Mint with a 1-day TTL — well below the 7d threshold.
         const original = await issueOperatorToken(db, "user-abc", {
           dir: h.dir,
@@ -358,6 +377,7 @@ describe("useOperatorTokenWithAutoRotate (#213)", () => {
       const db = openHubDb(hubDbPath(h.dir));
       try {
         rotateSigningKey(db);
+        plantOperatorUsers(db);
         // Hand-sign a narrow JWT with aud=scribe (not "operator") and a
         // 1-hour TTL. Even though it's within the rotation window, the
         // helper must not silently upgrade it to a full operator token.
@@ -403,6 +423,7 @@ describe("useOperatorTokenWithAutoRotate (#213)", () => {
       const db = openHubDb(hubDbPath(h.dir));
       try {
         rotateSigningKey(db);
+        plantOperatorUsers(db);
         // aud=operator + 1h TTL + NO pa_scope_set claim. Pre-#224 this would
         // fall back to OPERATOR_TOKEN_DEFAULT_SCOPE_SET (admin) on rotation
         // — a silent widening of a token of unknown provenance.
@@ -444,6 +465,7 @@ describe("useOperatorTokenWithAutoRotate (#213)", () => {
       const db = openHubDb(hubDbPath(h.dir));
       try {
         rotateSigningKey(db);
+        plantOperatorUsers(db);
         const used = await useOperatorTokenWithAutoRotate(db, {
           configDir: h.dir,
           issuer: TEST_ISSUER,
@@ -463,6 +485,7 @@ describe("useOperatorTokenWithAutoRotate (#213)", () => {
       const db = openHubDb(hubDbPath(h.dir));
       try {
         rotateSigningKey(db);
+        plantOperatorUsers(db);
         // Mint a token that's already expired.
         const expiredAt = new Date("2026-01-01T00:00:00Z");
         const issued = await issueOperatorToken(db, "user-abc", {
@@ -542,6 +565,7 @@ describe("useOperatorTokenWithAutoRotate known-issuer set (hub#516)", () => {
         const db = openHubDb(hubDbPath(h.dir));
         try {
           rotateSigningKey(db);
+          plantOperatorUsers(db);
           // Mint the operator token under the hub's PUBLIC origin — what
           // happens on an exposed box (selfHealOperatorTokenIssuer re-mints to
           // the public iss).
@@ -577,6 +601,7 @@ describe("useOperatorTokenWithAutoRotate known-issuer set (hub#516)", () => {
         const db = openHubDb(hubDbPath(h.dir));
         try {
           rotateSigningKey(db);
+          plantOperatorUsers(db);
           const issued = await issueOperatorToken(db, "user-abc", {
             dir: h.dir,
             issuer: TEST_ISSUER,
@@ -605,6 +630,7 @@ describe("useOperatorTokenWithAutoRotate known-issuer set (hub#516)", () => {
         const db = openHubDb(hubDbPath(h.dir));
         try {
           rotateSigningKey(db);
+          plantOperatorUsers(db);
           // Hub-SIGNED (so the signature gate passes) but stamped with an iss
           // that's neither loopback nor in expose-state nor env. Must reject.
           const issued = await issueOperatorToken(db, "user-abc", {
@@ -640,7 +666,9 @@ describe("useOperatorTokenWithAutoRotate known-issuer set (hub#516)", () => {
         const foreignDb = openHubDb(hubDbPath(foreign.dir));
         try {
           rotateSigningKey(db);
+          plantOperatorUsers(db);
           rotateSigningKey(foreignDb);
+          plantOperatorUsers(foreignDb);
           const foreignToken = await mintOperatorToken(foreignDb, "user-abc", {
             issuer: PUBLIC_ISSUER,
           });
@@ -670,6 +698,7 @@ describe("useOperatorTokenWithAutoRotate known-issuer set (hub#516)", () => {
         const db = openHubDb(hubDbPath(h.dir));
         try {
           rotateSigningKey(db);
+          plantOperatorUsers(db);
           // A loopback-iss token is accepted (loopback alias is always in the set).
           const loopbackTok = await issueOperatorToken(db, "user-abc", {
             dir: h.dir,
@@ -708,6 +737,7 @@ describe("useOperatorTokenWithAutoRotate known-issuer set (hub#516)", () => {
         const db = openHubDb(hubDbPath(h.dir));
         try {
           rotateSigningKey(db);
+          plantOperatorUsers(db);
           // Public-iss + 1-day TTL (below the 7d threshold). Validates via the
           // known set (expose-state public origin), then auto-rotates.
           const original = await issueOperatorToken(db, "user-abc", {
@@ -762,12 +792,13 @@ describe("useOperatorTokenWithAutoRotate known-issuer set (hub#516)", () => {
 // registry so they show up in the revocation list and admin UI alongside
 // OAuth refresh tokens and CLI mints.
 describe("mintOperatorToken registry write (#212)", () => {
-  test("writes a tokens row with created_via='operator_mint', subject='operator', user_id NULL", async () => {
+  test("writes a tokens row with created_via='operator_mint', subject='operator', user_id set", async () => {
     const h = makeHarness();
     try {
       const db = openHubDb(hubDbPath(h.dir));
       try {
         rotateSigningKey(db);
+        plantOperatorUsers(db);
         const minted = await mintOperatorToken(db, "user-abc", {
           issuer: TEST_ISSUER,
           scopeSet: "start",
@@ -788,7 +819,7 @@ describe("mintOperatorToken registry write (#212)", () => {
           )
           .get(minted.jti);
         expect(row).not.toBeNull();
-        expect(row?.user_id).toBeNull();
+        expect(row?.user_id).toBe("user-abc");
         expect(row?.subject).toBe("operator");
         expect(row?.created_via).toBe("operator_mint");
         expect(row?.scopes).toBe("parachute:host:start");
@@ -807,6 +838,7 @@ describe("mintOperatorToken registry write (#212)", () => {
       const db = openHubDb(hubDbPath(h.dir));
       try {
         rotateSigningKey(db);
+        plantOperatorUsers(db);
         const original = await issueOperatorToken(db, "user-abc", {
           dir: h.dir,
           issuer: TEST_ISSUER,
