@@ -123,14 +123,67 @@ describe("GET /api/account/tokens", () => {
 
     const ownerList = await call("GET", "", owner.cookie);
     expect(ownerList.status).toBe(200);
-    const ownerBody = (await ownerList.json()) as { tokens: { user_id: string; jti: string }[] };
+    const ownerBody = (await ownerList.json()) as {
+      tokens: { user_id: string; jti: string }[];
+      next_cursor: string | null;
+    };
     expect(ownerBody.tokens.every((t) => t.user_id === owner.userId)).toBe(true);
     expect(ownerBody.tokens.length).toBeGreaterThan(0);
+    expect(ownerBody.next_cursor).toBeNull();
 
     const friendList = await call("GET", "", friend.cookie);
-    const friendBody = (await friendList.json()) as { tokens: { user_id: string }[] };
+    const friendBody = (await friendList.json()) as {
+      tokens: { user_id: string }[];
+      next_cursor: string | null;
+    };
     expect(friendBody.tokens.every((t) => t.user_id === friend.userId)).toBe(true);
     expect(friendBody.tokens.length).toBe(1);
+    expect(friendBody.next_cursor).toBeNull();
+  });
+
+  test("pages at 50 and returns next_cursor when more rows exist", async () => {
+    const { recordTokenMint } = await import("../jwt-sign.ts");
+    const owner = await userWithSession("owner");
+    const stamp = new Date("2026-08-25T12:00:00.000Z");
+    const user = db
+      .query<{ updated_at: string }, [string]>("SELECT updated_at FROM users WHERE id = ?")
+      .get(owner.userId);
+    if (!user) throw new Error("owner missing");
+    for (let i = 0; i < 51; i++) {
+      recordTokenMint(db, {
+        jti: `acct-page-${String(i).padStart(3, "0")}`,
+        createdVia: "cli_mint",
+        subject: "page",
+        userId: owner.userId,
+        userUpdatedAt: user.updated_at,
+        clientId: "parachute-account",
+        scopes: ["scribe:transcribe"],
+        expiresAt: "2030-01-01T00:00:00.000Z",
+        now: () => new Date(stamp.getTime() + i * 1000),
+      });
+    }
+    const first = await call("GET", "", owner.cookie);
+    expect(first.status).toBe(200);
+    const firstBody = (await first.json()) as {
+      tokens: { jti: string }[];
+      next_cursor: string | null;
+    };
+    expect(firstBody.tokens).toHaveLength(50);
+    expect(firstBody.next_cursor).toBeTruthy();
+    const second = await call(
+      "GET",
+      `?cursor=${encodeURIComponent(firstBody.next_cursor!)}`,
+      owner.cookie,
+    );
+    expect(second.status).toBe(200);
+    const secondBody = (await second.json()) as {
+      tokens: { jti: string }[];
+      next_cursor: string | null;
+    };
+    expect(secondBody.tokens.length).toBeGreaterThanOrEqual(1);
+    expect(secondBody.next_cursor).toBeNull();
+    const firstJtis = new Set(firstBody.tokens.map((t) => t.jti));
+    expect(secondBody.tokens.some((t) => firstJtis.has(t.jti))).toBe(false);
   });
 });
 

@@ -344,11 +344,20 @@ export interface UseOperatorTokenOpts {
  *       `issueOperatorToken`); a token without it is either a hand-crafted
  *       JWT (don't widen) or a pre-#213 legacy token (operator should
  *       explicitly `parachute auth rotate-operator` to recover).
+ *     - `sub-not-user`: `sub` is present but is not a `users` row (the old
+ *       `"operator"` sentinel, or a deleted user). `mintOperatorToken` is a
+ *       person-mint as of hub#833 and throws `TokenMintPrincipalGoneError`
+ *       for those; catching it here keeps auto-rotate fail-closed without
+ *       turning a legacy file into a CLI exception. Recover via explicit
+ *       `parachute auth rotate-operator` against a real users row.
  */
 export type RotationStatus =
   | { kind: "fresh" }
   | { kind: "rotated" }
-  | { kind: "skipped"; reason: "aud-mismatch" | "no-sub" | "no-scope-set" };
+  | {
+      kind: "skipped";
+      reason: "aud-mismatch" | "no-sub" | "no-scope-set" | "sub-not-user";
+    };
 
 export interface UsedOperatorToken {
   /** The operator token plaintext to present as bearer. After auto-rotation, this is the freshly-minted token. */
@@ -550,12 +559,24 @@ export async function useOperatorTokenWithAutoRotate(
     return { token, payload, status: { kind: "skipped", reason: "no-scope-set" } };
   }
   const scopeSet: OperatorScopeSet = claimedSet;
-  const issued = await issueOperatorToken(db, sub, {
-    dir,
-    issuer: opts.issuer,
-    scopeSet,
-    now: opts.now,
-  });
+  let issued: IssueOperatorTokenResult;
+  try {
+    issued = await issueOperatorToken(db, sub, {
+      dir,
+      issuer: opts.issuer,
+      scopeSet,
+      now: opts.now,
+    });
+  } catch (err) {
+    // Person-mint as of hub#833: a legacy `"operator"` sentinel or a
+    // deleted-user `sub` is not a users row. Skip rather than throw so
+    // callers (expose-supervisor, CLI try-wraps) can log `skipped:
+    // sub-not-user` instead of treating this as a crash.
+    if (err instanceof TokenMintPrincipalGoneError) {
+      return { token, payload, status: { kind: "skipped", reason: "sub-not-user" } };
+    }
+    throw err;
+  }
   const reValidated = await validateAccessToken(db, issued.token, opts.issuer);
   return {
     token: issued.token,
@@ -605,6 +626,9 @@ export interface SelfHealOperatorTokenOpts {
  *     - `no-scope-set`: the token lacks (or has an unrecognized) `pa_scope_set`
  *       claim. Falling back to a default would widen scope (hub#224 hardening);
  *       refuse instead. Operator recovers via explicit rotate-operator.
+ *     - `sub-not-user`: `sub` is present but is not a `users` row. Same
+ *       person-mint fail-close as auto-rotate (`mintOperatorToken` throws
+ *       `TokenMintPrincipalGoneError`). The on-disk file is left untouched.
  *     - `issuer-loopback`: the TARGET issuer is loopback. Re-minting to a
  *       loopback `iss` would downgrade a good public token; never do it.
  */
@@ -614,7 +638,13 @@ export type OperatorIssuerHealStatus =
   | { kind: "rotated"; path: string; scopeSet: OperatorScopeSet; expiresAt: string }
   | {
       kind: "skipped";
-      reason: "unverifiable" | "aud-mismatch" | "no-sub" | "no-scope-set" | "issuer-loopback";
+      reason:
+        | "unverifiable"
+        | "aud-mismatch"
+        | "no-sub"
+        | "no-scope-set"
+        | "sub-not-user"
+        | "issuer-loopback";
     };
 
 /**
@@ -701,12 +731,20 @@ export async function selfHealOperatorTokenIssuer(
 
   // Re-mint preserving scope-set + sub. `issueOperatorToken` writes the new
   // token to disk atomically (mint → writeOperatorTokenFile).
-  const issued = await issueOperatorToken(db, sub, {
-    dir,
-    issuer: opts.issuer,
-    scopeSet: claimedSet,
-    ...(opts.now !== undefined ? { now: opts.now } : {}),
-  });
+  let issued: IssueOperatorTokenResult;
+  try {
+    issued = await issueOperatorToken(db, sub, {
+      dir,
+      issuer: opts.issuer,
+      scopeSet: claimedSet,
+      ...(opts.now !== undefined ? { now: opts.now } : {}),
+    });
+  } catch (err) {
+    if (err instanceof TokenMintPrincipalGoneError) {
+      return { kind: "skipped", reason: "sub-not-user" };
+    }
+    throw err;
+  }
   return {
     kind: "rotated",
     path: issued.path,

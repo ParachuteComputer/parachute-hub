@@ -28,6 +28,8 @@ vi.mock("./lib/api.ts", async (orig) => {
     listVaults: vi.fn().mockResolvedValue({ vaults: [], moduleInstalled: false }),
     listGrants: vi.fn().mockResolvedValue([]),
     listTokens: vi.fn().mockResolvedValue({ tokens: [], next_cursor: null }),
+    listAccountTokens: vi.fn().mockResolvedValue({ tokens: [], next_cursor: null }),
+    listAccountPubkeys: vi.fn().mockResolvedValue([]),
     listModules: vi.fn().mockResolvedValue({ modules: [], supervisor_available: false }),
     // App's useEffect hits getMe() on mount. Default mock = signed-out so
     // the AuthIndicator renders the deterministic "Sign in" link rather

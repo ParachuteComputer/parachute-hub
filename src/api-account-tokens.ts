@@ -12,7 +12,8 @@
  * Routes (`subpath` is relative to `/api/account/tokens`):
  *
  *   GET  ""                 → this user's tokens (unrevoked default;
- *                             `?revoked=all|true|false`)
+ *                             `?revoked=all|true|false`; `?cursor=` pages;
+ *                             page size 50, `next_cursor` when more)
  *   POST ""                 → mint as the session user
  *   POST "/:jti/revoke"     → revoke own jti only; 404 if not yours
  *                             (no cross-account existence oracle)
@@ -123,7 +124,11 @@ function handleList(req: Request, user: User, deps: AccountTokensDeps): Response
   if (raw !== "true" && raw !== "false" && raw !== "all") {
     return jsonError(400, "invalid_request", "revoked must be true, false, or all");
   }
-  const page = listTokens(deps.db, { filter: { userId: user.id, revoked: raw } });
+  const cursor = url.searchParams.get("cursor");
+  const page = listTokens(deps.db, {
+    filter: { userId: user.id, revoked: raw },
+    ...(cursor ? { cursor } : {}),
+  });
   return json(200, {
     tokens: page.rows.map((row) => ({
       jti: row.jti,
@@ -137,6 +142,7 @@ function handleList(req: Request, user: User, deps: AccountTokensDeps): Response
       created_via: row.createdVia,
       subject_pubkey: row.subjectPubkey,
     })),
+    next_cursor: page.nextCursor,
   });
 }
 

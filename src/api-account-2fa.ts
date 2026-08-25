@@ -17,7 +17,8 @@
  *                                   → the hub#833 phase-1a linkage ceremony
  *                                     (implementation in
  *                                     `api-account-pubkeys.ts`)
- *   GET  /api/account/tokens       → this user's tokens (unrevoked default)
+ *   GET  /api/account/tokens       → this user's tokens (unrevoked default;
+ *                                     `?cursor=` pages 50; `next_cursor`)
  *   POST /api/account/tokens       → mint as the session user
  *   POST /api/account/tokens/:jti/revoke
  *                                   → revoke own jti only (hub#833)

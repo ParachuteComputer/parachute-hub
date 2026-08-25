@@ -459,6 +459,48 @@ describe("useOperatorTokenWithAutoRotate (#213)", () => {
     }
   });
 
+  test("skips auto-rotate when sub is not a users row (skipped: sub-not-user)", async () => {
+    const h = makeHarness();
+    try {
+      const db = openHubDb(hubDbPath(h.dir));
+      try {
+        rotateSigningKey(db);
+        plantOperatorUsers(db);
+        // Legacy sentinel principal: aud=operator + recognized scope-set +
+        // short TTL, but sub is the old "operator" label, not a users.id.
+        // mintOperatorToken would throw; auto-rotate must skip, not crash.
+        const signed = await signAccessToken(db, {
+          sub: "operator",
+          scopes: [...OPERATOR_TOKEN_SCOPE_SETS.admin],
+          audience: OPERATOR_TOKEN_AUDIENCE,
+          clientId: OPERATOR_TOKEN_CLIENT_ID,
+          issuer: TEST_ISSUER,
+          ttlSeconds: 3600,
+          extraClaims: { [OPERATOR_TOKEN_SCOPE_SET_CLAIM]: "admin" },
+        });
+        await writeOperatorTokenFile(signed.token, h.dir);
+
+        const used = await useOperatorTokenWithAutoRotate(db, {
+          configDir: h.dir,
+          issuer: TEST_ISSUER,
+        });
+        expect(used).not.toBeNull();
+        expect(used?.status.kind).toBe("skipped");
+        if (used?.status.kind === "skipped") {
+          expect(used.status.reason).toBe("sub-not-user");
+        }
+        expect(used?.rotated).toBeUndefined();
+        expect(used?.token).toBe(signed.token);
+        const onDisk = await readOperatorTokenFile(h.dir);
+        expect(onDisk).toBe(signed.token);
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
   test("returns null when no operator token file exists", async () => {
     const h = makeHarness();
     try {

@@ -107,7 +107,7 @@
  *   /api/account/pubkeys/challenge (POST)      → mint a single-use, user-bound linkage challenge + the event template to sign (cookie-gated; CSRF)
  *   /api/account/pubkeys/verify   (POST)       → present a signed NIP-01 (kind 27235) event; verify BIP-340 possession + consume the challenge → link (cookie-gated; CSRF)
  *   /api/account/pubkeys/unlink   (POST)       → drop one of the caller's own links (cookie-gated; CSRF; does NOT rewrite tokens.subject_pubkey history)
- *   /api/account/tokens           (GET)        → this user's tokens (cookie-gated; self-only; unrevoked default, ?revoked=all|true|false) — hub#833
+ *   /api/account/tokens           (GET)        → this user's tokens (cookie-gated; self-only; unrevoked default, ?revoked=all|true|false, ?cursor= pages 50, next_cursor) — hub#833
  *   /api/account/tokens           (POST)       → mint as session user (cookie-gated; CSRF; self-only; cannot mint parachute:host:*) — hub#833
  *   /api/account/tokens/:jti/revoke (POST)     → revoke own jti only (cookie-gated; CSRF; 404 if not yours) — hub#833
  *   /api/hub                      (GET)        → hub version + uptime + install-source (host:admin)
