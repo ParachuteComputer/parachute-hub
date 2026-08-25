@@ -71,7 +71,7 @@ import { renderAdminError } from "./admin-login-ui.ts";
 import { CSRF_FIELD_NAME, ensureCsrfToken, verifyCsrfToken } from "./csrf.ts";
 import { userHasExternalAiGrant } from "./grants.ts";
 import { inferAudience } from "./jwt-audience.ts";
-import { recordTokenMint, signAccessToken } from "./jwt-sign.ts";
+import { TokenMintPrincipalGoneError, recordTokenMint, signAccessToken } from "./jwt-sign.ts";
 import { vaultTokenMintRateLimiter } from "./rate-limit.ts";
 import { findActiveSession } from "./sessions.ts";
 import { isTotpEnrolled } from "./two-factor-store.ts";
@@ -96,6 +96,11 @@ export interface AccountVaultTokenDeps {
   hubOrigin: string;
   /** Test seam for the clock (rate limiter + mint). */
   now?: () => Date;
+  /**
+   * Test seam (hub#873): runs after `signAccessToken` and before
+   * `recordTokenMint`. Production omits it.
+   */
+  afterSign?: (ctx: { token: string; jti: string; userId: string | null }) => void | Promise<void>;
 }
 
 function htmlResponse(body: string, status = 200, extra: Record<string, string> = {}): Response {
@@ -291,20 +296,32 @@ export async function handleAccountVaultTokenPost(
     vaultScope: [vaultName],
     ...(deps.now !== undefined ? { now: deps.now } : {}),
   });
-
-  recordTokenMint(deps.db, {
-    jti: minted.jti,
-    createdVia: "cli_mint",
-    subject: user.id,
-    // Anchor the registry row to the friend's user id so the operator's
-    // token registry + the revocation list attribute it correctly, and a
-    // future per-user revoke surface can find it.
-    userId: user.id,
-    clientId: ACCOUNT_VAULT_TOKEN_CLIENT_ID,
-    scopes: [scope],
-    expiresAt: minted.expiresAt,
-    ...(deps.now !== undefined ? { now: deps.now } : {}),
-  });
+  if (deps.afterSign) {
+    await deps.afterSign({ token: minted.token, jti: minted.jti, userId: user.id });
+  }
+  try {
+    recordTokenMint(deps.db, {
+      jti: minted.jti,
+      createdVia: "cli_mint",
+      subject: user.id,
+      // Anchor the registry row to the friend's user id so the operator's
+      // token registry + the revocation list attribute it correctly, and a
+      // future per-user revoke surface can find it. Pin updated_at so a
+      // resetUserPassword racing the crypto await cannot land a live row
+      // (hub#873).
+      userId: user.id,
+      userUpdatedAt: user.updatedAt,
+      clientId: ACCOUNT_VAULT_TOKEN_CLIENT_ID,
+      scopes: [scope],
+      expiresAt: minted.expiresAt,
+      ...(deps.now !== undefined ? { now: deps.now } : {}),
+    });
+  } catch (err) {
+    if (err instanceof TokenMintPrincipalGoneError) {
+      return renderHome(409, { mintError: err.message });
+    }
+    throw err;
+  }
 
   return renderHome(200, {
     mintedToken: {

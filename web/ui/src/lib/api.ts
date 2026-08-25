@@ -2199,17 +2199,23 @@ export async function verifyPubkeyLink(
   if (opts.password !== undefined) body.password = opts.password;
   const res = await postAccount("/pubkeys/verify", csrf, body);
   if (res.status === 401) {
-    const message = await readError(res);
-    const lower = message.toLowerCase();
-    if (
-      lower.includes("re-enter") ||
-      lower.includes("password") ||
-      lower.includes("signature") ||
-      lower.includes("incorrect")
-    ) {
-      throw new HttpError(401, message);
+    // Session-gone vs first-link step-up / bad proof. Discriminate on the
+    // structured `error` code, not English in `error_description` — a copy
+    // tweak of password_required must not bounce the operator to /login.
+    const text = await res.text();
+    let code: string | undefined;
+    let message = text || "401 Unauthorized";
+    try {
+      const parsed = JSON.parse(text) as { error?: string; error_description?: string };
+      code = parsed.error;
+      message = parsed.error_description || parsed.error || message;
+    } catch {
+      // not JSON
     }
-    return redirectToLoginAndHang<LinkedPubkeyResult>();
+    if (code === "unauthenticated" || code === undefined) {
+      return redirectToLoginAndHang<LinkedPubkeyResult>();
+    }
+    throw new HttpError(401, message);
   }
   if (!res.ok) throw new HttpError(res.status, await readError(res));
   return (await res.json()) as LinkedPubkeyResult;

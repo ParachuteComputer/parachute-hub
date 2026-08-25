@@ -74,12 +74,22 @@ const HUB_SECTIONS: readonly HubSection[] = [
   {
     to: "/connections",
     label: "Connections",
-    desc: "Wire a module event to another module's action.",
+    desc: "Wire a module event to another module's action (IFTTT).",
   },
   { to: "/modules", label: "Modules", desc: "Install, upgrade, and manage modules." },
   { to: "/users", label: "Users", desc: "Manage operators and invite members." },
-  { to: "/tokens", label: "Tokens", desc: "Mint and revoke access tokens." },
-  { to: "/permissions", label: "Permissions", desc: "OAuth consent grants per app." },
+  {
+    to: "/account",
+    label: "My account",
+    desc: "Your password, 2FA, API tokens, and linked Nostr keys.",
+  },
+  {
+    to: "/tokens",
+    label: "Tokens",
+    desc: "Operator registry — every CLI / OAuth / operator-mint on this hub.",
+  },
+  { to: "/grants", label: "Grants", desc: "Agent-connector approvals." },
+  { to: "/permissions", label: "Permissions", desc: "OAuth consent skip-list per app." },
   { to: "/settings", label: "Settings", desc: "Canonical URL, install channel, more." },
 ];
 

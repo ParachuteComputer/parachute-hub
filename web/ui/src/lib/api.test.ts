@@ -537,31 +537,62 @@ describe("listAccountTokens / mintAccountToken", () => {
 });
 
 describe("verifyPubkeyLink", () => {
+  const event = {
+    id: "a",
+    pubkey: "b",
+    created_at: 1,
+    kind: 27235,
+    tags: [] as string[][],
+    content: "x",
+    sig: "c",
+  };
+
   it("surfaces first-link password_required instead of bouncing to login", async () => {
     vi.stubGlobal(
       "fetch",
       vi.fn(async () =>
         jsonResponse(401, {
           error: "password_required",
-          error_description:
-            "Re-enter your current password to link your first key to this account.",
+          error_description: "please confirm",
         }),
       ),
     );
     const api = await import("./api.ts");
-    await expect(
-      api.verifyPubkeyLink("csrf-x", {
-        event: {
-          id: "a",
-          pubkey: "b",
-          created_at: 1,
-          kind: 27235,
-          tags: [],
-          content: "x",
-          sig: "c",
-        },
-      }),
-    ).rejects.toMatchObject({ status: 401, message: expect.stringMatching(/re-enter/i) });
+    await expect(api.verifyPubkeyLink("csrf-x", { event })).rejects.toMatchObject({
+      status: 401,
+      message: "please confirm",
+    });
     expect(auth.redirectToLoginAndHang).not.toHaveBeenCalled();
+  });
+
+  it("surfaces proof_failed / invalid_credentials without bouncing to login", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => jsonResponse(401, { error: "proof_failed", error_description: "nope" })),
+    );
+    const api = await import("./api.ts");
+    await expect(api.verifyPubkeyLink("csrf-x", { event })).rejects.toMatchObject({
+      status: 401,
+      message: "nope",
+    });
+    expect(auth.redirectToLoginAndHang).not.toHaveBeenCalled();
+  });
+
+  it("bounces to login on unauthenticated", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        jsonResponse(401, { error: "unauthenticated", error_description: "no session" }),
+      ),
+    );
+    const api = await import("./api.ts");
+    const pending = api.verifyPubkeyLink("csrf-x", { event });
+    await new Promise((r) => setTimeout(r, 0));
+    expect(auth.redirectToLoginAndHang).toHaveBeenCalledTimes(1);
+    const winner = await Promise.race([
+      pending.then(() => "resolved"),
+      new Promise((r) => setTimeout(() => r("hung"), 10)),
+    ]);
+    expect(winner).toBe("hung");
   });
 });
