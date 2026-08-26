@@ -33,6 +33,19 @@ link.** Three PRs on `next` after 0.7.17-rc.1. Does not include 0.7.17 stable
 
 NIP-98 / key-as-account is not this rc.
 
+## [0.7.17] - 2026-08-26
+
+**Stable promotion of 0.7.17-rc.1.** No new code. Suffix-drop only. npm `@rc`
+is 0.7.17-rc.1; this is the matching `@latest`.
+
+Same contents as rc.1: username chokepoint (#865), duplicate-linkage 4xx
+without leaking the other holder (#866), attribution proofs survive unlink
+(#868), test-home sandbox (#867), unpublished-drift advisory actually runs
+(#857), Bun 1.4 CI floor (#869), rc-before-stable publish gate (#870).
+
+Does **not** include the Account SPA / person-mint work on `next` (#872 /
+#874 / #875). That is 0.7.18-rc.1.
+
 ## [0.7.17-rc.1] - 2026-08-24
 
 **Username chokepoint, attribution that survives unlink, and an rc-before-stable
