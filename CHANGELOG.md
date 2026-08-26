@@ -6,6 +6,19 @@ All notable changes to `@openparachute/hub` are documented here. The format foll
 >
 > This backfill covers the 0.6.x line only. Two pre-existing gaps remain undocumented and are **not** addressed here: the `0.5.13` stable itself (the file's newest entry is `0.5.13-rc.48`, never the stable) and the entire `0.5.14-rc` chain (rc.1–rc.21 on npm), which never promoted to a `0.5.14` stable — its work folded forward into 0.6.0.
 
+## [0.7.17] - 2026-08-26
+
+**Stable promotion of 0.7.17-rc.1.** No new code. Suffix-drop only. npm `@rc`
+is 0.7.17-rc.1; this is the matching `@latest`.
+
+Same contents as rc.1: username chokepoint (#865), duplicate-linkage 4xx
+without leaking the other holder (#866), attribution proofs survive unlink
+(#868), test-home sandbox (#867), unpublished-drift advisory actually runs
+(#857), Bun 1.4 CI floor (#869), rc-before-stable publish gate (#870).
+
+Does **not** include the Account SPA / person-mint work on `next` (#872 /
+#874 / #875). That is 0.7.18-rc.1.
+
 ## [0.7.17-rc.1] - 2026-08-24
 
 **Username chokepoint, attribution that survives unlink, and an rc-before-stable
