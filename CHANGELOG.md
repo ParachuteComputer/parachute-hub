@@ -6,6 +6,33 @@ All notable changes to `@openparachute/hub` are documented here. The format foll
 >
 > This backfill covers the 0.6.x line only. Two pre-existing gaps remain undocumented and are **not** addressed here: the `0.5.13` stable itself (the file's newest entry is `0.5.13-rc.48`, never the stable) and the entire `0.5.14-rc` chain (rc.1–rc.21 on npm), which never promoted to a `0.5.14` stable — its work folded forward into 0.6.0.
 
+## [0.7.18-rc.1] - 2026-08-26
+
+**Person-mint principal is `users.id`; self-service Account tokens and pubkey
+link.** Three PRs on `next` after 0.7.17-rc.1. Does not include 0.7.17 stable
+(that is a suffix-drop of rc.1 on `main`).
+
+- **Person-mint JWT `sub` is `users.id` (#872).** `tokens.subject` is a label.
+  `--sub` / body `subject` are deprecated; `--user` / `--label` / `--service`.
+  Operator mint sets `user_id`. Token insert is CAS against `users.updated_at`
+  (password-reset racing the crypto await). `TokenMintPrincipalGoneError`.
+  Cookie+CSRF `GET/POST /api/account/tokens` and `POST .../:jti/revoke`
+  (self-only). Operator registry stays at `/api/auth/tokens`. `skipped:
+  sub-not-user` when mint would throw for a non-users sub.
+
+- **Account SPA: my-tokens + pubkey-link (#874).** `/admin/account` lists,
+  mints, and revokes the signed-in person's tokens, and links/unlinks a
+  Nostr pubkey. Operator `/admin/tokens` stays the registry. `GET
+  /api/account/tokens` returns `next_cursor` (page size 50).
+
+- **CAS pin leftover + first-link 401 code (#875, closes #873).** Vault-create
+  handoff and cookie vault-token / vault-admin-token doors pin
+  `users.updated_at` before sign. `verifyPubkeyLink` discriminates 401 on the
+  structured `error` code, not English. Home Administer group gains My
+  account + Grants; Tokens copy names the operator registry.
+
+NIP-98 / key-as-account is not this rc.
+
 ## [0.7.17-rc.1] - 2026-08-24
 
 **Username chokepoint, attribution that survives unlink, and an rc-before-stable
