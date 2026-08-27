@@ -4360,6 +4360,8 @@ export function hubFetch(
       // hand the request to handleAccountMcp, the same handler /account/mcp
       // uses. narrowRootMcpScopes and the root-/mcp authorize branch stay
       // vault-only; folding account:vaults into them is a separate decision.
+      // Hub-only until Cloud's twin (parachute-cloud#273) matches this scheme
+      // split — door-contract 0.6.0 already ratifies a unified /mcp gateway.
       if (pathname === "/mcp" || pathname.startsWith("/mcp/")) {
         // Same per-request force-change-password gate as the twins above —
         // a pre-rotation signed-in user can't reach vault data through here

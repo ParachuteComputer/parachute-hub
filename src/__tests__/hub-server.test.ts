@@ -7386,6 +7386,28 @@ describe("hubFetch root /mcp forwarding (vault 0.7.3 canonical root MCP)", () =>
     }
   });
 
+  test("NIP-98 POST /mcp with no getDb is 503 service_unavailable, daemon never reached", async () => {
+    const h = makeHarness();
+    const upstream = startRecordingUpstream();
+    try {
+      writeManifest({ services: [canonicalVaultRow(upstream.port)] }, h.manifestPath);
+      const fetcher = hubFetch(h.dir, { manifestPath: h.manifestPath });
+      const url = "http://hub.example.com/mcp";
+      const secret = hexToBytes("aa".repeat(32));
+      const res = await fetcher(
+        nostrMcpReq(secret, url, { jsonrpc: "2.0", id: 1, method: "initialize" }),
+      );
+      expect(res.status).toBe(503);
+      const body = (await res.json()) as { error?: string; error_description?: string };
+      expect(body.error).toBe("service_unavailable");
+      expect(body.error_description).toBe("hub db not configured");
+      expect(upstream.requests().length).toBe(0);
+    } finally {
+      upstream.stop();
+      h.cleanup();
+    }
+  });
+
   test("Bearer POST /mcp still proxies to the daemon (NIP-98 intercept is scheme-only)", async () => {
     const h = makeHarness();
     const upstream = startRecordingUpstream();
