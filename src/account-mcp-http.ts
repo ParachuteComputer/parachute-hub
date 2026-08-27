@@ -279,7 +279,7 @@ function instructions(): string {
     "The Parachute hub account MCP — one connection across the vaults this key or token can use. " +
     "Use list-vaults to see them, create-vault to add one (hub owner / account write), " +
     "query-notes to search across them (omit `vault` to fan out, pass it to target one), " +
-    "and create-note to write in one vault (`vault` is required). " +
+    "create-note / update-note to write in one vault (`vault` is required). " +
     "grant-access / revoke-access / list-access give a Nostr pubkey a vault (role read|write) " +
     "if you can admin that vault. tools/list hides tools you cannot call."
   );

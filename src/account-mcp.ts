@@ -4,10 +4,11 @@
  *
  * Cloud's twin lives in the identity worker (`account-mcp.ts`). Coverage tools
  * (list-vaults, create-vault, query-notes) plus hub-only grant-access /
- * revoke-access / list-access (pubkey → one `user_vaults` row). create-note is
- * the first cross-vault write tool: `vault` is required, write is checked
- * per call, a 60s `vault:<name>:write` mint fans to REST. Cloud grants are
- * D1-ownership shaped, not `user_vaults`. Coverage is hub-shaped:
+ * revoke-access / list-access (pubkey → one `user_vaults` row). create-note /
+ * update-note write one vault: `vault` is required, write is checked per call,
+ * a 60s `vault:<name>:write` mint fans to REST (POST /api/notes, PATCH
+ * /api/notes/:id). Cloud grants are D1-ownership shaped, not `user_vaults`.
+ * Coverage is hub-shaped:
  *
  *   - Bearer is the cloud-shaped connection grant: `account:self:vaults`
  *     (legacy blanket / narrowed) or composed `account:self:vaults:*:<verb>`,
@@ -447,10 +448,49 @@ function noteWriteBody(args: Record<string, unknown>): Record<string, unknown> {
   return body;
 }
 
-async function postNoteToVault(
+function noteUpdateBody(args: Record<string, unknown>): Record<string, unknown> {
+  const body: Record<string, unknown> = {};
+  if (typeof args.content === "string") body.content = args.content;
+  if (typeof args.append === "string") body.append = args.append;
+  if (typeof args.prepend === "string") body.prepend = args.prepend;
+  if (args.content_edit && typeof args.content_edit === "object") body.content_edit = args.content_edit;
+  if (typeof args.path === "string") body.path = args.path;
+  if (args.tags && typeof args.tags === "object") body.tags = args.tags;
+  if (args.metadata && typeof args.metadata === "object" && args.metadata !== null) {
+    body.metadata = args.metadata;
+  }
+  if (typeof args.if_updated_at === "string") body.if_updated_at = args.if_updated_at;
+  if (args.force === true) body.force = true;
+  if (typeof args.if_missing === "string") body.if_missing = args.if_missing;
+  return body;
+}
+
+function requireWritableVault(ctx: AccountToolContext, rawVault: unknown): AccountVaultMeta {
+  if (typeof rawVault !== "string" || rawVault.length === 0) {
+    throw new AccountToolError("invalid_vault", "vault is required.");
+  }
+  const coverage = resolveCoverage(ctx.db, ctx.principal, installedVaults(ctx));
+  const wanted = rawVault.toLowerCase();
+  const hit = coverage.vaults.find((v) => v.name === wanted);
+  if (!hit) {
+    throw new AccountToolError(
+      "vault_not_covered",
+      `Vault "${rawVault}" is not among the vaults this connection can reach.`,
+    );
+  }
+  if (!canWriteVault(ctx.db, ctx.principal, hit.name)) {
+    throw new AccountToolError(
+      "write_not_granted",
+      `This connection cannot write vault "${hit.name}".`,
+    );
+  }
+  return hit;
+}
+
+async function vaultNoteWrite(
   ctx: AccountToolContext,
   vault: AccountVaultMeta,
-  body: Record<string, unknown>,
+  opts: { method: string; path: string; body: Record<string, unknown> },
 ): Promise<unknown> {
   const sign = ctx.signToken ?? signAccessToken;
   const fetchImpl = ctx.fetchImpl ?? fetch;
@@ -468,15 +508,15 @@ async function postNoteToVault(
     typeof vault.port === "number" && vault.port > 0
       ? `http://127.0.0.1:${vault.port}`
       : vault.url.replace(/\/vault\/[^/]+\/?$/, "");
-  const url = `${origin.replace(/\/$/, "")}/vault/${vault.name}/api/notes`;
+  const url = `${origin.replace(/\/$/, "")}/vault/${vault.name}${opts.path}`;
   const res = await fetchImpl(url, {
-    method: "POST",
+    method: opts.method,
     headers: {
       authorization: `Bearer ${minted.token}`,
       accept: "application/json",
       "content-type": "application/json",
     },
-    body: JSON.stringify(body),
+    body: JSON.stringify(opts.body),
     signal: AbortSignal.timeout(FANOUT_TIMEOUT_MS),
   });
   if (!res.ok) {
@@ -484,6 +524,7 @@ async function postNoteToVault(
     try {
       const errBody = (await res.json()) as Record<string, unknown>;
       if (typeof errBody.error === "string") detail = errBody.error;
+      else if (typeof errBody.error_type === "string") detail = errBody.error_type;
     } catch {
       // Non-JSON error body — keep the status-only detail.
     }
@@ -518,25 +559,72 @@ const createNoteTool: AccountMcpTool = {
     additionalProperties: false,
   },
   async execute(args, ctx) {
-    if (typeof args.vault !== "string" || args.vault.length === 0) {
-      throw new AccountToolError("invalid_vault", "vault is required.");
+    const hit = requireWritableVault(ctx, args.vault);
+    const note = await vaultNoteWrite(ctx, hit, {
+      method: "POST",
+      path: "/api/notes",
+      body: noteWriteBody(args),
+    });
+    return { vault: hit.name, note };
+  },
+};
+
+const updateNoteTool: AccountMcpTool = {
+  name: "update-note",
+  description:
+    "Update a note in one vault this connection can write. `vault` and `id` are required. " +
+    "Same body as vault PATCH /api/notes/:id (content / append / prepend / content_edit / " +
+    "path / tags / metadata / if_updated_at / force). Does not return a vault token.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      vault: {
+        type: "string",
+        description: "Target vault by name. Must be a reachable vault this connection can write.",
+      },
+      id: {
+        type: "string",
+        description: "Note ID or path in that vault.",
+      },
+      content: { type: "string", description: "Full content replace." },
+      append: { type: "string", description: "Append to the end of the note." },
+      prepend: { type: "string", description: "Prepend to the start of the note." },
+      content_edit: {
+        type: "object",
+        properties: {
+          old_text: { type: "string" },
+          new_text: { type: "string" },
+        },
+        required: ["old_text", "new_text"],
+        description: "Find-and-replace one occurrence.",
+      },
+      path: { type: "string", description: "New path." },
+      tags: { type: "object", description: "Tag mutations `{ add, remove }`." },
+      metadata: { type: "object", description: "Metadata merge-patch." },
+      if_updated_at: {
+        type: "string",
+        description: "Optimistic concurrency: reject if the note changed since.",
+      },
+      force: { type: "boolean", description: "Waive if_updated_at requirement." },
+      if_missing: {
+        type: "string",
+        enum: ["fail", "create"],
+        description: "What to do when the note does not exist. Default fail.",
+      },
+    },
+    required: ["vault", "id"],
+    additionalProperties: false,
+  },
+  async execute(args, ctx) {
+    if (typeof args.id !== "string" || args.id.length === 0) {
+      throw new AccountToolError("invalid_id", "id is required.");
     }
-    const coverage = resolveCoverage(ctx.db, ctx.principal, installedVaults(ctx));
-    const wanted = args.vault.toLowerCase();
-    const hit = coverage.vaults.find((v) => v.name === wanted);
-    if (!hit) {
-      throw new AccountToolError(
-        "vault_not_covered",
-        `Vault "${args.vault}" is not among the vaults this connection can reach.`,
-      );
-    }
-    if (!canWriteVault(ctx.db, ctx.principal, hit.name)) {
-      throw new AccountToolError(
-        "write_not_granted",
-        `This connection cannot write vault "${hit.name}".`,
-      );
-    }
-    const note = await postNoteToVault(ctx, hit, noteWriteBody(args));
+    const hit = requireWritableVault(ctx, args.vault);
+    const note = await vaultNoteWrite(ctx, hit, {
+      method: "PATCH",
+      path: `/api/notes/${encodeURIComponent(args.id)}`,
+      body: noteUpdateBody(args),
+    });
     return { vault: hit.name, note };
   },
 };
@@ -646,6 +734,7 @@ export const ACCOUNT_MCP_TOOLS: readonly AccountMcpTool[] = [
   createVaultTool,
   queryNotesTool,
   createNoteTool,
+  updateNoteTool,
   grantAccessTool,
   revokeAccessTool,
   listAccessTool,
@@ -666,7 +755,7 @@ export function toolsForPrincipal(ctx: AccountToolContext): readonly AccountMcpT
   const create = canCreate(ctx.principal);
   return ACCOUNT_MCP_TOOLS.filter((t) => {
     if (t.name === "create-vault") return create;
-    if (t.name === "create-note") return canWrite;
+    if (t.name === "create-note" || t.name === "update-note") return canWrite;
     if (t.name === "grant-access" || t.name === "revoke-access" || t.name === "list-access") {
       return canAdmin;
     }
