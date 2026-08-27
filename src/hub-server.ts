@@ -187,10 +187,13 @@
  *
  *   # Root MCP surface (hub-owned protocol namespace, dispatched BEFORE the
  *   # per-vault proxy and generic service mounts so no module can claim it
- *   # via services.json paths). Vault-agnostic — the TOKEN's audience names
- *   # the target vault, re-validated by the daemon; no "which vault" in the
- *   # URL. Same daemon resolution + loopback-cloak as /vault/admin above.
- *   /mcp, /mcp/*                                → proxy to the vault module's daemon
+ *   # via services.json paths). Vault-audience Bearer / API key still proxy
+ *   # to the vault daemon (token names the vault). NIP-98
+ *   # (`Authorization: Nostr`) is hub-user auth the daemon does not speak,
+ *   # so that scheme routes to handleAccountMcp — same door as /account/mcp.
+ *   # OAuth authorize / narrowRootMcpScopes are untouched.
+ *   /mcp, /mcp/*                                → NIP-98 → account-MCP;
+ *                                                otherwise proxy to the vault daemon
  *
  *   # Per-vault content proxy (user-facing vault data: Notes PWA, MCP, etc.).
  *   /vault/<name>/*                            → proxy to the vault backend
@@ -344,6 +347,7 @@ import {
   type ModuleManifest,
   readModuleManifest as defaultReadModuleManifest,
 } from "./module-manifest.ts";
+import { isNostrAuthorization } from "./nostr-http-auth.ts";
 import { isLegacyNotesPath, logNotesRedirect, maybeRedirectNotes } from "./notes-redirect.ts";
 import {
   authorizationServerMetadata,
@@ -4347,13 +4351,15 @@ export function hubFetch(
       // vault daemon has served since 0.7.3. Hub-owned protocol namespace,
       // dispatched here (BEFORE the /vault/ per-vault proxy and the generic
       // service mounts) so no service can claim it via services.json paths.
-      // There's no "which vault" question at this layer — the TOKEN's
-      // audience names the target vault, re-validated by the daemon itself
-      // — so we forward via `proxyToVaultDaemon` unconditionally, the same
-      // resolution + loopback-cloak as `/vault/admin`. The response is
-      // returned RAW (no `decorateWithChrome`): this is a JSON-RPC protocol
-      // surface, not an HTML page, so chrome injection would be wrong even
-      // when it no-ops on non-HTML bodies.
+      //
+      // Two auth models share this URL; they are NOT merged into one OAuth
+      // resource. Vault-audience Bearer / API key still proxy to the daemon
+      // (the TOKEN names the vault). NIP-98 never goes through OAuth
+      // authorize — it is a signed event per request — and the daemon does
+      // not speak it (401 "API key required"). Intercept that scheme and
+      // hand the request to handleAccountMcp, the same handler /account/mcp
+      // uses. narrowRootMcpScopes and the root-/mcp authorize branch stay
+      // vault-only; folding account:vaults into them is a separate decision.
       if (pathname === "/mcp" || pathname.startsWith("/mcp/")) {
         // Same per-request force-change-password gate as the twins above —
         // a pre-rotation signed-in user can't reach vault data through here
@@ -4361,6 +4367,15 @@ export function hubFetch(
         if (getDb) {
           const gate = forceChangePasswordGate(getDb(), req);
           if (gate) return gate;
+        }
+        if (isNostrAuthorization(req)) {
+          if (!getDb) return dbNotConfigured();
+          return handleAccountMcp(req, {
+            db: getDb(),
+            issuer: oauthDeps(req).issuer,
+            knownIssuers: oauthDeps(req).hubBoundOrigins(),
+            manifestPath,
+          });
         }
         const proxied = await proxyToVaultDaemon(req, manifestPath, deps?.supervisor, peerAddr);
         if (proxied) return proxied;
