@@ -225,15 +225,21 @@ export function canWriteVault(
   principal: AccountMcpPrincipal,
   vaultName: string,
 ): boolean {
-  if (isUnrestricted(db, principal)) return true;
-  if (principal.authKind === "bearer" && principal.grant) {
-    if (principal.grant.wildcard === "admin") return true;
-    if (principal.grant.wildcard === null && !principal.grant.vaults.has(vaultName)) {
-      return false;
-    }
-    const named = principal.grant.vaults.get(vaultName);
+  // Bearer coverage / named-verb BEFORE unrestricted — same order as
+  // callerCanAdminVault. A first-admin token named `…:beta:read` must not
+  // mint `vault:beta:write`. Coverage wildcards (`account:vaults`) are not
+  // a verb cap; first-admin still writes after the named-verb check.
+  if (principal.authKind === "bearer") {
+    const grant = principal.grant;
+    if (!grant) return false;
+    if (grant.wildcard === null && !grant.vaults.has(vaultName)) return false;
+    const named = grant.vaults.get(vaultName);
     if (named !== undefined && !composedVerbSatisfies(named, "write")) return false;
+    if (grant.wildcard === "admin") return true;
+    if (isUnrestricted(db, principal)) return true;
+    return vaultVerbsForUserVault(db, principal.userId, vaultName)?.includes("write") === true;
   }
+  if (isUnrestricted(db, principal)) return true;
   return vaultVerbsForUserVault(db, principal.userId, vaultName)?.includes("write") === true;
 }
 

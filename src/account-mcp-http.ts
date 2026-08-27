@@ -22,7 +22,6 @@ import type { Database } from "bun:sqlite";
 import { ACCOUNT_VAULTS_UNNARROWED } from "@openparachute/door-contract";
 import type { AccountApiDeps } from "./account-api.ts";
 import {
-  ACCOUNT_MCP_TOOLS,
   type AccountMcpPrincipal,
   type AccountToolContext,
   AccountToolError,
@@ -256,7 +255,7 @@ async function handleToolCall(
 ): Promise<JsonRpcMessage> {
   const name = typeof params?.name === "string" ? params.name : "";
   const args = (params?.arguments ?? {}) as Record<string, unknown>;
-  const tool = ACCOUNT_MCP_TOOLS.find((t) => t.name === name);
+  const tool = toolsForPrincipal(ctx).find((t) => t.name === name);
   if (!tool) {
     return result(id, {
       content: [{ type: "text", text: `Unknown tool: ${name}` }],

@@ -596,8 +596,9 @@ describe("account MCP — create-vault", () => {
         ),
         mcpDeps(h),
       );
-      const body = (await res.json()) as { error?: { data?: { error_type?: string } } };
-      expect(body.error?.data?.error_type).toBe("create_not_granted");
+      const body = (await res.json()) as { result?: { isError?: boolean; content?: Array<{ text?: string }> } };
+      expect(body.result?.isError).toBe(true);
+      expect(body.result?.content?.[0]?.text).toMatch(/Unknown tool: create-vault/);
     } finally {
       h.cleanup();
     }
@@ -801,9 +802,96 @@ describe("account MCP — create-note", () => {
           return Response.json({}, { status: 201 });
         } }),
       );
-      const body = (await res.json()) as { error?: { data?: { error_type?: string } } };
-      expect(body.error?.data?.error_type).toBe("write_not_granted");
+      const body = (await res.json()) as { result?: { isError?: boolean; content?: Array<{ text?: string }> } };
+      expect(body.result?.isError).toBe(true);
+      expect(body.result?.content?.[0]?.text).toMatch(/Unknown tool: create-note/);
       expect(fetched).toBe(0);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("first-admin Bearer named beta:read cannot create-note on beta", async () => {
+    const h = await makeHarness();
+    let fetched = 0;
+    try {
+      const token = await bearer(h, ["account:self:vaults:beta:read"], h.ownerId);
+      const res = await handleAccountMcp(
+        bearerReq(
+          token,
+          rpc("tools/call", { name: "create-note", arguments: { vault: "beta", content: "nope" } }),
+        ),
+        mcpDeps(h, { fetchImpl: async () => {
+          fetched += 1;
+          return Response.json({}, { status: 201 });
+        } }),
+      );
+      const body = (await res.json()) as {
+        result?: { isError?: boolean; content?: Array<{ text?: string }> };
+      };
+      expect(body.result?.isError).toBe(true);
+      expect(body.result?.content?.[0]?.text).toMatch(/Unknown tool: create-note/);
+      expect(fetched).toBe(0);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("friend Bearer named beta:read cannot create-note even with write assignment", async () => {
+    const h = await makeHarness();
+    let fetched = 0;
+    try {
+      const token = await bearer(h, ["account:self:vaults:beta:read"], h.friendId);
+      const res = await handleAccountMcp(
+        bearerReq(
+          token,
+          rpc("tools/call", { name: "create-note", arguments: { vault: "beta", content: "nope" } }),
+        ),
+        mcpDeps(h, { fetchImpl: async () => {
+          fetched += 1;
+          return Response.json({}, { status: 201 });
+        } }),
+      );
+      const body = (await res.json()) as {
+        result?: { isError?: boolean; content?: Array<{ text?: string }> };
+      };
+      expect(body.result?.isError).toBe(true);
+      expect(body.result?.content?.[0]?.text).toMatch(/Unknown tool: create-note/);
+      expect(fetched).toBe(0);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("friend NIP-98 write-role can create-note on the assigned vault", async () => {
+    const h = await makeHarness();
+    try {
+      const seen: string[] = [];
+      const fetchImpl = async (input: string | URL | Request, init?: RequestInit) => {
+        const req = input instanceof Request ? input : new Request(String(input), init);
+        const parts = (req.headers.get("authorization") ?? "").replace(/^Bearer\s+/i, "").split(".");
+        const payload = JSON.parse(Buffer.from(parts[1] ?? "", "base64url").toString()) as {
+          scope?: string;
+        };
+        seen.push(payload.scope ?? "");
+        return Response.json({ id: "n-friend" }, { status: 201 });
+      };
+      const res = await handleAccountMcp(
+        nostrReq(
+          FRIEND_SECRET,
+          rpc("tools/call", {
+            name: "create-note",
+            arguments: { vault: "beta", content: "from friend" },
+          }),
+        ),
+        mcpDeps(h, { fetchImpl }),
+      );
+      const out = parseTool(
+        (await res.json()) as { result: { content: Array<{ text: string }> } },
+      ) as { vault: string; note: { id: string } };
+      expect(out.vault).toBe("beta");
+      expect(out.note.id).toBe("n-friend");
+      expect(seen).toEqual(["vault:beta:write"]);
     } finally {
       h.cleanup();
     }
@@ -1256,8 +1344,9 @@ describe("account MCP — grant-access", () => {
         ),
         mcpDeps(h),
       );
-      const body = (await res.json()) as { error?: { data?: { error_type?: string } } };
-      expect(body.error?.data?.error_type).toBe("grant_not_permitted");
+      const body = (await res.json()) as { result?: { isError?: boolean; content?: Array<{ text?: string }> } };
+      expect(body.result?.isError).toBe(true);
+      expect(body.result?.content?.[0]?.text).toMatch(/Unknown tool: grant-access/);
     } finally {
       h.cleanup();
     }
@@ -1504,9 +1593,9 @@ describe("account MCP — grant-access", () => {
         mcpDeps(h),
       );
       expect(
-        ((await personal.json()) as { error?: { data?: { error_type?: string } } }).error?.data
-          ?.error_type,
-      ).toBe("grant_not_permitted");
+        ((await personal.json()) as { result?: { isError?: boolean; content?: Array<{ text?: string }> } })
+          .result?.content?.[0]?.text,
+      ).toMatch(/Unknown tool: grant-access/);
       const beta = await handleAccountMcp(
         bearerReq(
           token,
@@ -1518,9 +1607,9 @@ describe("account MCP — grant-access", () => {
         mcpDeps(h),
       );
       expect(
-        ((await beta.json()) as { error?: { data?: { error_type?: string } } }).error?.data
-          ?.error_type,
-      ).toBe("grant_not_permitted");
+        ((await beta.json()) as { result?: { isError?: boolean; content?: Array<{ text?: string }> } })
+          .result?.content?.[0]?.text,
+      ).toMatch(/Unknown tool: grant-access/);
     } finally {
       h.cleanup();
     }
@@ -1565,9 +1654,9 @@ describe("account MCP — grant-access", () => {
         mcpDeps(h),
       );
       expect(
-        ((await res.json()) as { error?: { data?: { error_type?: string } } }).error?.data
-          ?.error_type,
-      ).toBe("grant_not_permitted");
+        ((await res.json()) as { result?: { isError?: boolean; content?: Array<{ text?: string }> } })
+          .result?.content?.[0]?.text,
+      ).toMatch(/Unknown tool: grant-access/);
     } finally {
       h.cleanup();
     }
