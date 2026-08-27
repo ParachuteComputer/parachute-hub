@@ -87,6 +87,7 @@ import {
   narrowResourceVaultScopes,
   narrowRootMcpScopes,
   resolveResourceVault,
+  resolveRootMcpTokenAudience,
 } from "./resource-binding.ts";
 import {
   ACCOUNT_SELF_ADMIN_SCOPE,
@@ -506,29 +507,32 @@ function advertisedScopes(declared: ReadonlySet<string>, manifest: ServicesManif
  *
  *   - **Hub-level scopes now have an explicit door boundary.** The root PRM
  *     starts from hub's authoritative requestable/module-installed catalog,
- *     then filters to vault scopes because root `/mcp` only accepts
- *     vault-audience tokens. This keeps the root advertisement honest while
- *     the bare PRM continues to describe the full hub resource.
+ *     then keeps vault scopes plus `account:vaults`. `scribe:*` / `agent:send`
+ *     / `hub:admin` stay dropped — advertising a scope this authorize branch
+ *     drops would mislead a spec-following client. `account:self:admin` and
+ *     friends stay out of the catalog (opt-in by intent, not by copy).
  *
- * Both documents start from `advertisedScopes`: one scope registry, filtered
- * by one rule (requestable ∧ module-installed). The root document then applies
- * `narrowRootMcpScopes` because the root door only ever mints vault-audience
- * tokens; advertising a non-vault scope that this authorize branch drops would
- * mislead a spec-following client into requesting something the door cannot
- * accept.
+ * Both documents start from `advertisedScopes`. The root document then applies
+ * `narrowRootMcpScopes` and appends `account:vaults` (stripped from the
+ * generic catalog so a notes client doesn't over-request it, but legitimate
+ * at this door).
  */
 export function rootMcpProtectedResourceMetadata(deps: OAuthDeps): Response {
   const iss = deps.issuer;
   const declared = (deps.loadDeclaredScopes ?? loadDeclaredScopes)();
+  const vaultScopes = narrowRootMcpScopes(
+    advertisedScopes(declared, (deps.loadServicesManifest ?? readServicesManifest)()),
+  );
+  const scopes_supported = vaultScopes.includes(ACCOUNT_VAULTS_UNNARROWED)
+    ? vaultScopes
+    : [...vaultScopes, ACCOUNT_VAULTS_UNNARROWED];
   return jsonResponse({
     // The resource is the root MCP endpoint, not the origin — that's what
     // distinguishes this document from the bare PRM, and what the client
     // matches against the endpoint it got the 401 from.
     resource: `${iss}/mcp`,
     authorization_servers: [iss],
-    scopes_supported: narrowRootMcpScopes(
-      advertisedScopes(declared, (deps.loadServicesManifest ?? readServicesManifest)()),
-    ),
+    scopes_supported,
     bearer_methods_supported: ["header"],
     resource_documentation: "https://parachute.computer",
   });
@@ -641,10 +645,10 @@ function invalidTargetResponse(resource: string): Response {
  *     vault's scope explicitly — and inferAudience's first-scope-wins scan
  *     can't tell which one the CALLER wants THIS token bound to; an explicit
  *     `resource` disambiguates).
- *   - names the vault-agnostic root door → allowed as long as at least one
- *     named vault scope is present (root tokens are vault tokens whose
- *     target the resource server derives from the token itself); audience
- *     stays `fallbackAudience` (unchanged — root doesn't rename anything).
+ *   - names the vault-agnostic root door → vault-named grants stay on
+ *     `fallbackAudience` (`vault.<name>`); an account-vaults-only grant
+ *     (no named vault, `inferAudience` → `"account"`) mints `aud=account`.
+ *     Empty/foreign grants still reject.
  *   - resolves to neither (off-origin, malformed, non-MCP path, or a vault
  *     name not in `grantedVaultNames`) → reject.
  */
@@ -663,10 +667,9 @@ function resolveTokenResourceAudience(
     return { audience: `vault.${boundVault}` };
   }
   if (isRootMcpResource(requestResource, boundOrigins)) {
-    if (grantedVaultNames.size === 0) {
-      return { errorResponse: invalidTargetResponse(requestResource) };
-    }
-    return { audience: fallbackAudience };
+    const audience = resolveRootMcpTokenAudience(grantedVaultNames, fallbackAudience);
+    if (audience === null) return { errorResponse: invalidTargetResponse(requestResource) };
+    return { audience };
   }
   return { errorResponse: invalidTargetResponse(requestResource) };
 }
@@ -1086,12 +1089,11 @@ export function handleAuthorizeGet(db: Database, req: Request, deps: OAuthDeps):
   // the URL) so the two never diverge. Re-entry after login re-narrows
   // idempotently (no foreign scopes left to drop).
   //
-  // The ROOT `/mcp` door takes the same treatment minus the naming. It is a
-  // vault door too (vault derives the target from the token), so foreign
-  // scopes are just as unusable in the token it mints — but the resource
-  // carries no vault name, so there is nothing to narrow the vault scopes TO
-  // and the consent picker still supplies that. Without this branch the root
-  // door was the one place the whole-hub catalog still reached consent.
+  // The ROOT `/mcp` door takes the same treatment minus the naming. Vault
+  // grants still pick a vault at consent; `account:vaults` is the other
+  // legitimate root resource and mints `aud=account` (no picker). Foreign
+  // scopes are unusable in either token. Without this branch the root door
+  // was the one place the whole-hub catalog still reached consent.
   //
   // No resource, or one that isn't an MCP resource we front (off-origin,
   // malformed, non-vault path) → neither branch fires and the flow is

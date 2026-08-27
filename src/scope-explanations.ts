@@ -199,7 +199,7 @@ export const SCOPE_EXPLANATIONS: Record<string, ScopeExplanation> = {
   // not the REST `account:self:read` list/usage surface.
   "account:vaults": {
     label:
-      "Connect across your vaults — list them, search their notes, and create new vaults. Does not delete vaults or mint long-lived access tokens.",
+      "Let this app see which vaults you have and manage access to them — list them, search their notes, create vaults, and grant access by public key. Does not delete vaults or mint long-lived access tokens.",
     level: "write",
     risk: "elevated",
   },
