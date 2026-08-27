@@ -253,6 +253,47 @@ describe("authenticateNostrRequest", () => {
     expect(link?.userId).toBe(principal.userId);
   });
 
+  test("auto-provision refuses when the hub has no owner yet", async () => {
+    const url = "http://127.0.0.1:1939/api/me";
+    const event = signEvent({ tags: [["u", url], ["method", "GET"]] });
+    await expect(
+      authenticateNostrRequest(db, reqFor(url, "GET", event), {
+        autoProvision: true,
+        replay: new NostrReplayCache(),
+      }),
+    ).rejects.toThrow(/existing hub owner/);
+  });
+
+  test("read-role assignment does not get write or admin scopes", async () => {
+    await createUser(db, "owner", "correct-horse-battery-staple", {
+      passwordChanged: true,
+    });
+    const friend = await createUser(db, "reader", "correct-horse-battery-staple", {
+      allowMulti: true,
+      passwordChanged: true,
+      assignedVaults: ["shared"],
+      role: "read",
+    });
+    const now = new Date();
+    const { challenge } = issuePubkeyChallenge(db, friend.id, now);
+    expect(
+      linkPubkey(db, {
+        userId: friend.id,
+        pubkey: PUBKEY,
+        challenge,
+        proofEvent: JSON.stringify({ id: "0".repeat(64), pubkey: PUBKEY, kind: 27235, tags: [] }),
+        now,
+      }).ok,
+    ).toBe(true);
+    const url = "http://127.0.0.1:1939/api/me";
+    const event = signEvent({ tags: [["u", url], ["method", "GET"]] });
+    const principal = await authenticateNostrRequest(db, reqFor(url, "GET", event), {
+      autoProvision: false,
+      replay: new NostrReplayCache(),
+    });
+    expect(principal.scopes).toEqual(["vault:shared:read"]);
+  });
+
   test("requireScope: provisioned key-user cannot take parachute:host:admin", async () => {
     await createUser(db, "owner", "correct-horse-battery-staple", {
       passwordChanged: true,

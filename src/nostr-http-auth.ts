@@ -25,7 +25,13 @@ import {
   verifyNostrEvent,
 } from "./nostr-event.ts";
 import { bindPubkeyFromHttpAuth, findPubkeyLink } from "./pubkey-links.ts";
-import { createUser, getUserById, isFirstAdmin, vaultVerbsForRole } from "./users.ts";
+import {
+  createUser,
+  getFirstAdminId,
+  getUserById,
+  isFirstAdmin,
+  vaultVerbsForUserVault,
+} from "./users.ts";
 
 /** NIP-98 clock skew, seconds. Spec window. */
 export const NIP98_MAX_SKEW_SECONDS = 60;
@@ -34,7 +40,7 @@ export const NIP98_MAX_SKEW_SECONDS = 60;
  * How long a used event id stays rejected. Must be ≥ 2× the skew window so
  * an event still inside ±60s cannot be replayed after eviction.
  */
-export const NIP98_REPLAY_TTL_MS = 2 * NIP98_MAX_SKEW_SECONDS * 1000;
+export const NIP98_REPLAY_TTL_MS = 2 * NIP98_MAX_SKEW_SECONDS * 1000 + 1000;
 
 export type NostrHttpAuthFailure =
   | "missing_authorization"
@@ -250,6 +256,13 @@ export async function resolveNostrPrincipal(
       "Nostr pubkey is not linked to a hub user",
     );
   }
+  if (getFirstAdminId(db) === null) {
+    throw new NostrHttpAuthError(
+      401,
+      "unknown_pubkey",
+      "Nostr auto-provision requires an existing hub owner",
+    );
+  }
 
   const password = randomBytes(32).toString("base64url");
   let username = usernameForPubkey(event.pubkey);
@@ -300,8 +313,8 @@ function principalFromUser(
   const user = getUserById(db, userId);
   const scopes: string[] = [];
   if (!admin && user) {
-    const verbs = vaultVerbsForRole("write");
     for (const name of user.assignedVaults) {
+      const verbs = vaultVerbsForUserVault(db, userId, name) ?? [];
       for (const verb of verbs) scopes.push(`vault:${name}:${verb}`);
     }
   }
