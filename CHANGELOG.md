@@ -6,6 +6,30 @@ All notable changes to `@openparachute/hub` are documented here. The format foll
 >
 > This backfill covers the 0.6.x line only. Two pre-existing gaps remain undocumented and are **not** addressed here: the `0.5.13` stable itself (the file's newest entry is `0.5.13-rc.48`, never the stable) and the entire `0.5.14-rc` chain (rc.1–rc.21 on npm), which never promoted to a `0.5.14` stable — its work folded forward into 0.6.0.
 
+## [0.7.18-rc.4] - 2026-08-27
+
+**Account-MCP at root `/mcp` (OAuth) plus create-note.** Two PRs on
+`next` after 0.7.18-rc.3. Version bump only; no new code in this
+commit. Merging this to `next` does not publish. The following next→main
+PR publishes `@rc`.
+
+- **Root `/mcp` OAuth `account:vaults` (#892).** Explicit
+  `resource=<origin>/mcp` + `scope=account:vaults` mints `aud=account`.
+  Bearer with that audience is answered by account-MCP (NIP-98 twin of
+  #888). Vault-audience Bearer still proxies. Combine-with-other-scopes
+  still refused. Root PRM does **not** advertise `account:vaults`
+  (catalog-copy would mix it with vault scopes); it stays requestable.
+  Cloud follow-up: parachute-cloud#274.
+
+- **Account-MCP `create-note({vault, …})` (#893).** Option B first slice.
+  `vault` is required. Write is checked per call (named Bearer `:read`
+  cannot mint write, including first-admin). 60s `vault:<name>:write`
+  mint POSTs to REST. `tools/list` and `tools/call` share the filtered
+  catalog; hidden tools are `Unknown tool`.
+
+Leaves #880 and #881 open. Auto-provision still defaults off. Do not
+suffix-drop 0.7.18.
+
 ## [0.7.18-rc.3] - 2026-08-27
 
 **NIP-98 at `/mcp` plus grant-by-pubkey.** Two PRs on `next` after

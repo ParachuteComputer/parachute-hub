@@ -7408,7 +7408,7 @@ describe("hubFetch root /mcp forwarding (vault 0.7.3 canonical root MCP)", () =>
     }
   });
 
-  test("Bearer POST /mcp still proxies to the daemon (NIP-98 intercept is scheme-only)", async () => {
+  test("non-JWT Bearer POST /mcp still proxies to the daemon", async () => {
     const h = makeHarness();
     const upstream = startRecordingUpstream();
     try {
@@ -7463,6 +7463,59 @@ describe("hubFetch root /mcp forwarding (vault 0.7.3 canonical root MCP)", () =>
             capabilities: {},
             clientInfo: { name: "t", version: "0" },
           },
+        }),
+      );
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as { result?: { serverInfo?: { name?: string } } };
+      expect(body.result?.serverInfo?.name).toBe("parachute-account");
+      expect(upstream.requests().length).toBe(0);
+    } finally {
+      db.close();
+      upstream.stop();
+      h.cleanup();
+    }
+  });
+
+  test("aud=account Bearer POST /mcp initialize is answered by account-MCP, daemon never reached", async () => {
+    const h = makeHarness();
+    const upstream = startRecordingUpstream();
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      writeManifest({ services: [canonicalVaultRow(upstream.port)] }, h.manifestPath);
+      rotateSigningKey(db);
+      const owner = await createUser(db, "owner", "pw", { passwordChanged: true });
+      const minted = await signAccessToken(db, {
+        sub: owner.id,
+        scopes: ["account:self:vaults"],
+        audience: "account",
+        clientId: "parachute-hub-spa",
+        issuer: "http://hub.example.com",
+        ttlSeconds: 600,
+      });
+      const fetcher = hubFetch(h.dir, {
+        getDb: () => db,
+        manifestPath: h.manifestPath,
+        issuer: "http://hub.example.com",
+      });
+      const res = await fetcher(
+        new Request("http://hub.example.com/mcp", {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${minted.token}`,
+            accept: BOTH_ACCEPT,
+            "content-type": "application/json",
+            host: "hub.example.com",
+          },
+          body: JSON.stringify({
+            jsonrpc: "2.0",
+            id: 1,
+            method: "initialize",
+            params: {
+              protocolVersion: "2025-11-25",
+              capabilities: {},
+              clientInfo: { name: "t", version: "0" },
+            },
+          }),
         }),
       );
       expect(res.status).toBe(200);

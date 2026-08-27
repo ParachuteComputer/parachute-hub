@@ -347,7 +347,8 @@ describe("rootMcpProtectedResourceMetadata (hub#789)", () => {
 
   test("shares the bare PRM's requestable-scope filter, narrowed further to vault-only", async () => {
     // Both documents start from one registry and requestable-scope filter; the
-    // root document applies its additional vault-only door constraint.
+    // root document applies its additional vault-only advertisement. account:vaults
+    // is requestable at this door but not advertised (catalog-copy combine).
     const root = (await call().json()) as Record<string, unknown>;
     const bare = (await protectedResourceMetadata({
       issuer: ISSUER,
@@ -357,6 +358,7 @@ describe("rootMcpProtectedResourceMetadata (hub#789)", () => {
     expect([...(root.scopes_supported as string[])].sort()).toEqual(
       [...(bare.scopes_supported as string[])].sort(),
     );
+    expect(root.scopes_supported as string[]).not.toContain("account:vaults");
   });
 
   test("narrows the bare PRM's requestable catalog to vault scopes at the root door", async () => {
@@ -10114,6 +10116,146 @@ describe("RFC 8707 resource binding — vault-bound MCP (fix #461)", () => {
       expect(html).toContain("vault:jon:read");
       expect(html).not.toContain("scribe:");
       expect(html).not.toContain('name="vault_pick"');
+    });
+
+    test("resource=<origin>/mcp + account:vaults is a legitimate grant, not empty", async () => {
+      const { db, cleanup } = await makeDb();
+      try {
+        const user = await createUser(db, "owner", "pw");
+        const session = createSession(db, { userId: user.id });
+        const reg = registerClient(db, { redirectUris: ["https://app.example/cb"] });
+        const { challenge } = makePkce();
+        const res = handleAuthorizeGet(
+          db,
+          new Request(
+            authorizeUrl({
+              client_id: reg.client.clientId,
+              redirect_uri: "https://app.example/cb",
+              response_type: "code",
+              code_challenge: challenge,
+              code_challenge_method: "S256",
+              scope: "account:vaults",
+              resource: `${ISSUER}/mcp`,
+            }),
+            {
+              headers: {
+                cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000))}`,
+              },
+            },
+          ),
+          RESOURCE_DEPS,
+        );
+        expect(res.status).toBe(200);
+        const html = await res.text();
+        expect(html).toContain("account:vaults");
+        expect(html).toContain("Let this app see which vaults you have");
+        expect(html).not.toContain("Pick a vault");
+        expect(html).not.toContain("scribe:");
+      } finally {
+        cleanup();
+      }
+    });
+
+    test("resource=<origin>/mcp + account:vaults mints aud=account (not invalid_target)", async () => {
+      const { db, cleanup } = await makeDb();
+      try {
+        const user = await createUser(db, "owner", "pw");
+        const session = createSession(db, { userId: user.id });
+        const reg = registerClient(db, { redirectUris: ["https://app.example/cb"] });
+        const { verifier, challenge } = makePkce();
+        const consentRes = await handleAuthorizePost(
+          db,
+          new Request(`${ISSUER}/oauth/authorize`, {
+            method: "POST",
+            body: new URLSearchParams({
+              __action: "consent",
+              __csrf: TEST_CSRF,
+              approve: "yes",
+              client_id: reg.client.clientId,
+              redirect_uri: "https://app.example/cb",
+              response_type: "code",
+              scope: "account:vaults",
+              code_challenge: challenge,
+              code_challenge_method: "S256",
+              resource: `${ISSUER}/mcp`,
+            }),
+            headers: {
+              "content-type": "application/x-www-form-urlencoded",
+              cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000))}`,
+            },
+          }),
+          RESOURCE_DEPS,
+        );
+        expect(consentRes.status).toBe(302);
+        const code = new URL(consentRes.headers.get("location") ?? "").searchParams.get("code");
+        expect(code).toBeTruthy();
+
+        const tokenRes = await handleToken(
+          db,
+          new Request(`${ISSUER}/oauth/token`, {
+            method: "POST",
+            body: new URLSearchParams({
+              grant_type: "authorization_code",
+              code: code ?? "",
+              client_id: reg.client.clientId,
+              redirect_uri: "https://app.example/cb",
+              code_verifier: verifier,
+            }),
+            headers: { "content-type": "application/x-www-form-urlencoded" },
+          }),
+          RESOURCE_DEPS,
+        );
+        expect(tokenRes.status).toBe(200);
+        const tok = (await tokenRes.json()) as { access_token: string; scope: string };
+        expect(tok.scope.split(" ")).toContain("account:self:vaults");
+        expect(tok.scope.split(" ")).not.toContain("account:vaults");
+        const { payload } = await validateAccessToken(db, tok.access_token, ISSUER);
+        expect(payload.aud).toBe("account");
+      } finally {
+        cleanup();
+      }
+    });
+
+    test("catalog-copy of the root PRM still reaches the vault picker (not invalid_scope)", async () => {
+      const prm = (await rootMcpProtectedResourceMetadata(RESOURCE_DEPS).json()) as {
+        scopes_supported: string[];
+      };
+      expect(prm.scopes_supported).not.toContain("account:vaults");
+      const html = await consentFor(`${ISSUER}/mcp`);
+      expect(html).toContain("Pick a vault");
+      expect(html).not.toContain("error=invalid_scope");
+      const { db, cleanup } = await makeDb();
+      try {
+        const user = await createUser(db, "owner", "pw");
+        const session = createSession(db, { userId: user.id });
+        const reg = registerClient(db, { redirectUris: ["https://app.example/cb"] });
+        const { challenge } = makePkce();
+        const res = handleAuthorizeGet(
+          db,
+          new Request(
+            authorizeUrl({
+              client_id: reg.client.clientId,
+              redirect_uri: "https://app.example/cb",
+              response_type: "code",
+              code_challenge: challenge,
+              code_challenge_method: "S256",
+              scope: prm.scopes_supported.join(" "),
+              resource: `${ISSUER}/mcp`,
+            }),
+            {
+              headers: {
+                cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000))}`,
+              },
+            },
+          ),
+          RESOURCE_DEPS,
+        );
+        expect(res.status).toBe(200);
+        const copied = await res.text();
+        expect(copied).toContain("Pick a vault");
+      } finally {
+        cleanup();
+      }
     });
   });
 });
