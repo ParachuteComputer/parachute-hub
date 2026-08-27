@@ -24,11 +24,11 @@
  *
  * ## What a linked key does and does not grant
  *
- * **It grants nothing.** A linked key cannot authenticate a request, mint a
- * token, read a vault, or widen a scope. Nothing in the hub's authorization
- * path reads `user_pubkeys`. Phase 1 makes *who did this* checkable; who may
- * do what is Jon's ACL design (seams S1/S1b in the doc) and is deliberately
- * untouched here.
+ * On the **cookie + password** path a linked key still grants nothing — it is
+ * an attribution label (phase 1). On the **NIP-98 HTTP auth** path
+ * (`nostr-http-auth.ts`, hub#833 (c)) the same table is the principal map:
+ * a request signed by `pubkey` authenticates as `user_id`. Unlink drops
+ * future NIP-98 logins for that key; it does not erase `attribution_proofs`.
  *
  * ## Replay protection
  *
@@ -349,6 +349,105 @@ export function findPubkeyLink(db: Database, pubkey: string): LinkedPubkey | nul
     .query<LinkRow, [string]>("SELECT * FROM user_pubkeys WHERE pubkey = ?")
     .get(pubkey);
   return row ? rowToLink(row) : null;
+}
+
+export type BindPubkeyFromHttpAuthResult =
+  | { ok: true; link: LinkedPubkey; relinked: boolean }
+  | { ok: false; reason: "pubkey_taken" | "too_many_pubkeys" };
+
+/**
+ * Bind `pubkey` to `userId` using a NIP-98 HTTP-auth event as the proof.
+ * No challenge-response: the signed request *is* the possession proof.
+ * The cookie ceremony (`linkPubkey`) stays challenge-gated.
+ *
+ * Caller MUST have verified the event (id + BIP-340 + `u`/`method` bind)
+ * before calling. This function performs no cryptography.
+ */
+export function bindPubkeyFromHttpAuth(
+  db: Database,
+  opts: {
+    userId: string;
+    pubkey: string;
+    proofEvent: string;
+    proofEventId: string;
+    label?: string | null;
+    now?: Date;
+  },
+): BindPubkeyFromHttpAuthResult {
+  const now = opts.now ?? new Date();
+  const stamp = now.toISOString();
+  const label = opts.label ?? null;
+  const run = db.transaction((): BindPubkeyFromHttpAuthResult => {
+    const existing = db
+      .query<LinkRow, [string]>("SELECT * FROM user_pubkeys WHERE pubkey = ?")
+      .get(opts.pubkey);
+    if (existing && existing.user_id !== opts.userId) {
+      return { ok: false, reason: "pubkey_taken" };
+    }
+    if (!existing) {
+      const count = (
+        db
+          .query<{ n: number }, [string]>(
+            "SELECT COUNT(*) AS n FROM user_pubkeys WHERE user_id = ?",
+          )
+          .get(opts.userId) ?? { n: 0 }
+      ).n;
+      if (count >= MAX_PUBKEYS_PER_USER) return { ok: false, reason: "too_many_pubkeys" };
+      db.prepare(
+        `INSERT INTO user_pubkeys
+           (pubkey, user_id, label, proof_event, proof_event_id, linked_at, last_verified_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      ).run(opts.pubkey, opts.userId, label, opts.proofEvent, opts.proofEventId, stamp, stamp);
+      retainAttributionProof(db, {
+        subject: opts.userId,
+        pubkey: opts.pubkey,
+        label,
+        proofEvent: opts.proofEvent,
+        proofEventId: opts.proofEventId,
+        linkedAt: stamp,
+        lastVerifiedAt: stamp,
+      });
+      return {
+        ok: true,
+        relinked: false,
+        link: {
+          pubkey: opts.pubkey,
+          userId: opts.userId,
+          label,
+          proofEventId: opts.proofEventId,
+          linkedAt: stamp,
+          lastVerifiedAt: stamp,
+        },
+      };
+    }
+    db.prepare(
+      `UPDATE user_pubkeys
+         SET label = ?, proof_event = ?, proof_event_id = ?, last_verified_at = ?
+       WHERE pubkey = ? AND user_id = ?`,
+    ).run(label, opts.proofEvent, opts.proofEventId, stamp, opts.pubkey, opts.userId);
+    retainAttributionProof(db, {
+      subject: opts.userId,
+      pubkey: opts.pubkey,
+      label,
+      proofEvent: opts.proofEvent,
+      proofEventId: opts.proofEventId,
+      linkedAt: existing.linked_at,
+      lastVerifiedAt: stamp,
+    });
+    return {
+      ok: true,
+      relinked: true,
+      link: {
+        pubkey: opts.pubkey,
+        userId: opts.userId,
+        label,
+        proofEventId: opts.proofEventId,
+        linkedAt: existing.linked_at,
+        lastVerifiedAt: stamp,
+      },
+    };
+  });
+  return run();
 }
 
 /**
