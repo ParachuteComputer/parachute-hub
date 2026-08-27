@@ -220,7 +220,7 @@ function lookupUsername(db: Database, userId: string): string {
 export async function grantAccess(
   db: Database,
   caller: GrantCaller,
-  args: { pubkey: unknown; vault: unknown; role: unknown },
+  args: Record<string, unknown>,
   installed: ReadonlySet<string>,
   now: () => Date = () => new Date(),
 ): Promise<GrantResult> {
@@ -265,7 +265,7 @@ export async function grantAccess(
 export function revokeAccess(
   db: Database,
   caller: GrantCaller,
-  args: { pubkey: unknown; vault: unknown },
+  args: Record<string, unknown>,
   installed: ReadonlySet<string>,
 ): RevokeResult {
   const pubkey = parseGrantPubkey(args.pubkey);
@@ -293,7 +293,7 @@ export function revokeAccess(
 export function listAccess(
   db: Database,
   caller: GrantCaller,
-  args: { vault?: unknown },
+  args: Record<string, unknown>,
   installed: ReadonlySet<string>,
 ): { access: AccessRow[] } {
   let vaultFilter: string | null = null;
