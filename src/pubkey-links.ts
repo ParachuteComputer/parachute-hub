@@ -363,6 +363,79 @@ export type BindPubkeyFromHttpAuthResult =
   | { ok: false; reason: "pubkey_taken" | "too_many_pubkeys" };
 
 /**
+ * Operator-attested bind: the hub asserts this key belongs to this user.
+ * No NIP-01 event is stored — `proof_event` is empty and nothing is written
+ * to `attribution_proofs`. Possession proofs stay in the ceremony / NIP-98
+ * paths. Same uniqueness + per-user cap as `bindPubkeyFromHttpAuth`.
+ */
+export function bindPubkeyOperatorAttested(
+  db: Database,
+  opts: {
+    userId: string;
+    pubkey: string;
+    label?: string | null;
+    now?: Date;
+  },
+): BindPubkeyFromHttpAuthResult {
+  const now = opts.now ?? new Date();
+  const stamp = now.toISOString();
+  const label = opts.label ?? "operator";
+  const run = db.transaction((): BindPubkeyFromHttpAuthResult => {
+    const existing = db
+      .query<LinkRow, [string]>("SELECT * FROM user_pubkeys WHERE pubkey = ?")
+      .get(opts.pubkey);
+    if (existing && existing.user_id !== opts.userId) {
+      return { ok: false, reason: "pubkey_taken" };
+    }
+    if (!existing) {
+      const count = (
+        db
+          .query<{ n: number }, [string]>(
+            "SELECT COUNT(*) AS n FROM user_pubkeys WHERE user_id = ?",
+          )
+          .get(opts.userId) ?? { n: 0 }
+      ).n;
+      if (count >= MAX_PUBKEYS_PER_USER) return { ok: false, reason: "too_many_pubkeys" };
+      db.prepare(
+        `INSERT INTO user_pubkeys
+           (pubkey, user_id, label, proof_event, proof_event_id, linked_at, last_verified_at)
+         VALUES (?, ?, ?, '', '', ?, ?)`,
+      ).run(opts.pubkey, opts.userId, label, stamp, stamp);
+      return {
+        ok: true,
+        relinked: false,
+        link: {
+          pubkey: opts.pubkey,
+          userId: opts.userId,
+          label,
+          proofEventId: "",
+          linkedAt: stamp,
+          lastVerifiedAt: stamp,
+        },
+      };
+    }
+    db.prepare(
+      `UPDATE user_pubkeys
+         SET label = ?, last_verified_at = ?
+       WHERE pubkey = ? AND user_id = ?`,
+    ).run(label, stamp, opts.pubkey, opts.userId);
+    return {
+      ok: true,
+      relinked: true,
+      link: {
+        pubkey: opts.pubkey,
+        userId: opts.userId,
+        label,
+        proofEventId: existing.proof_event_id,
+        linkedAt: existing.linked_at,
+        lastVerifiedAt: stamp,
+      },
+    };
+  });
+  return run();
+}
+
+/**
  * Bind `pubkey` to `userId` using a NIP-98 HTTP-auth event as the proof.
  * No challenge-response: the signed request *is* the possession proof.
  * The cookie ceremony (`linkPubkey`) stays challenge-gated.

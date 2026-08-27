@@ -6,11 +6,14 @@
  * hub user when the pubkey is unknown. Auto-provision stays off: grant-first
  * is how an unlinked key becomes a user.
  *
- * Grant is an admin verb on the vault. First-admin / host:admin can grant any
- * installed vault. Anyone else needs `vaultVerbsForUserVault` to include
- * `admin` (today: `user_vaults.role = 'write'`). Role on the grant is `read`
- * or `write` and cannot exceed what the stored role model allows the caller
- * to hold — a read-only assignee cannot grant.
+ * Grant is an admin verb on the vault. NIP-98 first-admin and Bearer
+ * `parachute:host:admin` (wildcard `admin`) can grant any installed vault.
+ * A Bearer connection still has to cover the vault: a named subset cannot
+ * grant outside it, and a named composed verb must satisfy `admin`. Legacy
+ * `account:vaults` / `account:self:vaults` are coverage wildcards (verb
+ * `read`) — they do not cap the verb; first-admin or a write assignee does.
+ * Anyone else needs `vaultVerbsForUserVault` to include `admin` (today:
+ * `user_vaults.role = 'write'`). A read-only assignee cannot grant.
  *
  * First-admin is unrestricted by empty `user_vaults`, not by rows. Granting
  * to the owner's pubkey is a no-op success (`unrestricted: true`); we never
@@ -22,11 +25,13 @@
  */
 import type { Database } from "bun:sqlite";
 import { randomBytes } from "node:crypto";
-import { bindPubkeyFromHttpAuth, findPubkeyLink, isPubkeyHex } from "./pubkey-links.ts";
+import { composedVerbSatisfies, isComposedVaultVerb } from "@openparachute/door-contract";
+import { bindPubkeyOperatorAttested, findPubkeyLink, isPubkeyHex } from "./pubkey-links.ts";
 import {
   UsernameTakenError,
   createUser,
-  getUserByUsername,
+  deleteUser,
+  getFirstAdminId,
   isFirstAdmin,
   removeUserVault,
   upsertUserVault,
@@ -50,7 +55,10 @@ export interface GrantCaller {
   userId: string;
   isHubAdmin: boolean;
   authKind: "bearer" | "nostr";
-  grant: { wildcard: string | null; vaults: { has(name: string): boolean } } | null;
+  grant: {
+    wildcard: string | null;
+    vaults: { has(name: string): boolean; get(name: string): string | undefined };
+  } | null;
 }
 
 export interface GrantResult {
@@ -115,25 +123,45 @@ export function parseGrantVault(raw: unknown): string {
   return raw.trim().toLowerCase();
 }
 
+function bearerCoversVaultForGrant(
+  grant: NonNullable<GrantCaller["grant"]>,
+  vaultName: string,
+): boolean {
+  // host:admin synthesizes wildcard admin — unrestricted.
+  if (grant.wildcard === "admin") return true;
+  if (grant.wildcard !== null) {
+    // Legacy/composed coverage wildcard (`account:vaults`, `account:self:vaults`,
+    // `account:self:vaults:*:<verb>`). This is coverage, not a per-vault verb
+    // cap — assignment (or first-admin) still has to allow the grant.
+    return true;
+  }
+  const named = grant.vaults.get(vaultName);
+  if (named === undefined) return false;
+  return isComposedVaultVerb(named) && composedVerbSatisfies(named, "admin");
+}
+
 /**
  * True when the caller may grant/revoke/list this vault.
  *
- * Hub admin (first-admin or host:admin token) is unrestricted across
- * installed vaults. Everyone else needs the `admin` verb on the vault
- * (`role = 'write'` today). A Bearer connection that names a vault subset
- * cannot grant outside that subset.
+ * NIP-98 first-admin is unrestricted across installed vaults. Bearer
+ * `parachute:host:admin` (wildcard `admin`) is too. A Bearer that names a
+ * vault subset cannot grant outside it; a named composed verb must satisfy
+ * `admin`. Everyone else needs the `admin` verb on the vault
+ * (`role = 'write'` today).
  */
 export function callerCanAdminVault(db: Database, caller: GrantCaller, vaultName: string): boolean {
-  if (caller.isHubAdmin || isFirstAdmin(db, caller.userId)) return true;
-  const verbs = vaultVerbsForUserVault(db, caller.userId, vaultName);
-  if (!verbs?.includes("admin")) return false;
   if (caller.authKind === "bearer") {
     const grant = caller.grant;
     if (!grant) return false;
-    if (grant.wildcard !== null) return true;
-    return grant.vaults.has(vaultName);
+    if (!bearerCoversVaultForGrant(grant, vaultName)) return false;
+    if (grant.wildcard === "admin") return true;
+    if (isFirstAdmin(db, caller.userId)) return true;
+    const verbs = vaultVerbsForUserVault(db, caller.userId, vaultName);
+    return verbs?.includes("admin") === true;
   }
-  return true;
+  if (caller.isHubAdmin || isFirstAdmin(db, caller.userId)) return true;
+  const verbs = vaultVerbsForUserVault(db, caller.userId, vaultName);
+  return verbs?.includes("admin") === true;
 }
 
 async function ensureUserForPubkey(
@@ -148,6 +176,13 @@ async function ensureUserForPubkey(
       username: lookupUsername(db, existing.userId),
       created: false,
     };
+  }
+
+  if (getFirstAdminId(db) === null) {
+    throw new GrantError(
+      "no_hub_owner",
+      "Grant-first cannot create the hub owner. Create an owner first.",
+    );
   }
 
   const password = randomBytes(32).toString("base64url");
@@ -180,10 +215,10 @@ async function ensureUserForPubkey(
               created: false,
             };
           }
-          const taken = getUserByUsername(db, usernameForPubkey(pubkey));
-          if (taken) {
-            return { userId: taken.id, username: taken.username, created: false };
-          }
+          throw new GrantError(
+            "username_taken",
+            "Could not allocate a hub username for that pubkey.",
+          );
         }
         throw err2;
       }
@@ -192,16 +227,15 @@ async function ensureUserForPubkey(
     }
   }
 
-  const bound = bindPubkeyFromHttpAuth(db, {
+  const bound = bindPubkeyOperatorAttested(db, {
     userId: user.id,
     pubkey,
-    proofEvent: JSON.stringify({ source: "grant-access" }),
-    proofEventId: "0".repeat(64),
     label: "grant",
     now: now(),
   });
   if (!bound.ok) {
     const raced = findPubkeyLink(db, pubkey);
+    deleteUser(db, user.id);
     if (raced) {
       return { userId: raced.userId, username: lookupUsername(db, raced.userId), created: false };
     }

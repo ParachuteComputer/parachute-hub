@@ -182,7 +182,7 @@ function readVaultsForUser(db: Database, userId: string): string[] {
  *   - `write` (today's default)     → `["read", "write", "admin"]`
  *   - `read` (forward-compat)       → `["read"]` — a *deliberate* read-only
  *     assignment stays read-only even under the any-assigned-user-gets-admin
- *     policy. Not created by any flow today.
+ *     policy. `grant-access` on `/account/mcp` can create these rows.
  *   - anything else (unknown role)  → `[]` — fail closed. An unrecognised
  *     role grants no minting authority rather than silently defaulting to
  *     write. (Defense-in-depth: a hand-edited / future row with a role this

@@ -56,7 +56,7 @@ import {
   issueOperatorToken,
   useOperatorTokenWithAutoRotate,
 } from "../operator-token.ts";
-import { bindPubkeyFromHttpAuth, findPubkeyLink, isPubkeyHex } from "../pubkey-links.ts";
+import { bindPubkeyOperatorAttested, findPubkeyLink, isPubkeyHex } from "../pubkey-links.ts";
 import { isNonRequestableScope } from "../scope-explanations.ts";
 import { rotateSigningKey } from "../signing-keys.ts";
 import { generateTotpSecret, otpauthUrlFor, verifyTotpCode } from "../totp.ts";
@@ -1721,11 +1721,9 @@ function runLinkPubkey(args: readonly string[], deps: AuthDeps): number {
       console.error("parachute auth link-pubkey: that pubkey is already bound to another user");
       return 1;
     }
-    const bound = bindPubkeyFromHttpAuth(db, {
+    const bound = bindPubkeyOperatorAttested(db, {
       userId: target.id,
       pubkey,
-      proofEvent: JSON.stringify({ source: "operator" }),
-      proofEventId: "0".repeat(64),
       label: "operator",
     });
     if (!bound.ok) {
