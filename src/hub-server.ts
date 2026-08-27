@@ -189,11 +189,12 @@
  *   # per-vault proxy and generic service mounts so no module can claim it
  *   # via services.json paths). Vault-audience Bearer / API key still proxy
  *   # to the vault daemon (token names the vault). NIP-98
- *   # (`Authorization: Nostr`) is hub-user auth the daemon does not speak,
- *   # so that scheme routes to handleAccountMcp — same door as /account/mcp.
- *   # OAuth authorize / narrowRootMcpScopes are untouched.
- *   /mcp, /mcp/*                                → NIP-98 → account-MCP;
- *                                                otherwise proxy to the vault daemon
+ *   # (`Authorization: Nostr`) and Bearer `aud=account` are hub-user auth
+ *   # the daemon does not speak, so those route to handleAccountMcp — same
+ *   # door as /account/mcp. Vault-audience Bearer / API key still proxy.
+ *   /mcp, /mcp/*                                → NIP-98 or aud=account →
+ *                                                account-MCP; otherwise proxy
+ *                                                to the vault daemon
  *
  *   # Per-vault content proxy (user-facing vault data: Notes PWA, MCP, etc.).
  *   /vault/<name>/*                            → proxy to the vault backend
@@ -233,6 +234,7 @@ import type { Database } from "bun:sqlite";
 import { existsSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { decodeJwt } from "jose";
 import pkg from "../package.json" with { type: "json" };
 import {
   ACCOUNT_MUTATION_SCOPES,
@@ -1766,6 +1768,24 @@ function dbNotConfigured(): Response {
     { error: "service_unavailable", error_description: "hub db not configured" },
     { status: 503 },
   );
+}
+
+/**
+ * Routing peek only — not auth. A well-formed JWT with `aud=account` is
+ * handed to account-MCP; anything else (malformed, vault audience, API key)
+ * stays on the daemon-proxy path which does its own auth.
+ */
+function peekBearerAudience(req: Request): string | undefined {
+  const header = req.headers.get("authorization");
+  if (!header) return undefined;
+  const match = header.match(/^Bearer\s+(\S+)/i);
+  if (!match?.[1]) return undefined;
+  try {
+    const payload = decodeJwt(match[1]);
+    return typeof payload.aud === "string" ? payload.aud : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 // Canonical 404 body for root `/mcp` + its PRM well-known when
@@ -4356,12 +4376,13 @@ export function hubFetch(
       // resource. Vault-audience Bearer / API key still proxy to the daemon
       // (the TOKEN names the vault). NIP-98 never goes through OAuth
       // authorize — it is a signed event per request — and the daemon does
-      // not speak it (401 "API key required"). Intercept that scheme and
-      // hand the request to handleAccountMcp, the same handler /account/mcp
-      // uses. narrowRootMcpScopes and the root-/mcp authorize branch stay
-      // vault-only; folding account:vaults into them is a separate decision.
-      // Hub-only until Cloud's twin (parachute-cloud#273) matches this scheme
-      // split — door-contract 0.6.0 already ratifies a unified /mcp gateway.
+      // not speak it (401 "API key required"). An `aud=account` Bearer is
+      // the OAuth twin of that path: minting happens at /oauth/token after
+      // narrowRootMcpScopes kept `account:vaults`. Intercept both and hand
+      // the request to handleAccountMcp, the same handler /account/mcp uses.
+      // Hub-only until Cloud's OAuth twin (parachute-cloud#274) matches this
+      // scheme split. #273 is NIP-98 only. door-contract 0.6.0 already
+      // ratifies a unified /mcp gateway.
       if (pathname === "/mcp" || pathname.startsWith("/mcp/")) {
         // Same per-request force-change-password gate as the twins above —
         // a pre-rotation signed-in user can't reach vault data through here
@@ -4370,7 +4391,8 @@ export function hubFetch(
           const gate = forceChangePasswordGate(getDb(), req);
           if (gate) return gate;
         }
-        if (isNostrAuthorization(req)) {
+        const accountMcp = isNostrAuthorization(req) || peekBearerAudience(req) === "account";
+        if (accountMcp) {
           if (!getDb) return dbNotConfigured();
           return handleAccountMcp(req, {
             db: getDb(),

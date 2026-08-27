@@ -4,6 +4,7 @@ import {
   narrowResourceVaultScopes,
   narrowRootMcpScopes,
   resolveResourceVault,
+  resolveRootMcpTokenAudience,
 } from "../resource-binding.ts";
 
 const ORIGIN = "https://hub.example";
@@ -195,6 +196,25 @@ describe("narrowRootMcpScopes", () => {
     ).toEqual(["vault:read", "vault:write", "vault:admin"]);
   });
 
+  test("keeps account:vaults — the other legitimate root-/mcp resource", () => {
+    expect(narrowRootMcpScopes(["account:vaults"])).toEqual(["account:vaults"]);
+    expect(narrowRootMcpScopes(["account:self:vaults"])).toEqual(["account:self:vaults"]);
+    expect(narrowRootMcpScopes(["account:vaults", "scribe:admin", "hub:admin"])).toEqual([
+      "account:vaults",
+    ]);
+  });
+
+  test("keeps vault scopes and account:vaults together (combine check refuses later)", () => {
+    expect(narrowRootMcpScopes(["vault:read", "account:vaults", "scribe:admin"])).toEqual([
+      "vault:read",
+      "account:vaults",
+    ]);
+  });
+
+  test("drops named account:self:vaults:<vault> — not the connection grant", () => {
+    expect(narrowRootMcpScopes(["account:self:vaults:beta:read", "hub:admin"])).toEqual([]);
+  });
+
   test("does NOT name the vault scopes — there is no vault in the resource", () => {
     // The picker supplies the name; `vault:<name>:<verb>` is minted downstream.
     // Naming them here would require inventing a vault the client never asked
@@ -214,5 +234,22 @@ describe("narrowRootMcpScopes", () => {
   test("is idempotent", () => {
     const once = narrowRootMcpScopes(["vault:read", "hub:admin"]);
     expect(narrowRootMcpScopes(once)).toEqual(once);
+    const account = narrowRootMcpScopes(["account:vaults", "hub:admin"]);
+    expect(narrowRootMcpScopes(account)).toEqual(account);
+  });
+});
+
+describe("resolveRootMcpTokenAudience", () => {
+  test("vault-named grants keep fallbackAudience", () => {
+    expect(resolveRootMcpTokenAudience(new Set(["beta"]), "vault.beta")).toBe("vault.beta");
+  });
+
+  test("account-vaults-only grant (no named vault) mints aud=account", () => {
+    expect(resolveRootMcpTokenAudience(new Set(), "account")).toBe("account");
+  });
+
+  test("empty/foreign grant is null — token handler rejects invalid_target", () => {
+    expect(resolveRootMcpTokenAudience(new Set(), "hub")).toBeNull();
+    expect(resolveRootMcpTokenAudience(new Set(), "scribe")).toBeNull();
   });
 });

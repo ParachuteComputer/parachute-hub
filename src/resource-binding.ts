@@ -27,6 +27,7 @@
  *
  * Source of truth for scope shape: `docs/contracts/oauth-scopes.md`.
  */
+import { ACCOUNT_VAULTS_UNNARROWED, accountVaultsScope } from "@openparachute/door-contract";
 
 import { VAULT_VERBS } from "./jwt-audience.ts";
 
@@ -198,40 +199,56 @@ export function narrowResourceVaultScopes(scopes: readonly string[], vaultName: 
 }
 
 /**
- * The root-`/mcp` counterpart of `narrowResourceVaultScopes`: drop every
- * non-vault scope, and change nothing else.
+ * The root-`/mcp` counterpart of `narrowResourceVaultScopes`: keep vault
+ * scopes and the account-MCP connection grant (`account:vaults` /
+ * `account:self:vaults`), drop everything else.
  *
- * Root `/mcp` is a vault door — whichever vault the token names. So the same
- * argument that drops `scribe:*` / `agent:send` / `hub:admin` from a per-vault
- * consent applies verbatim here: the flow ends in a token stamped
- * `aud=vault.<picked>`, in which those scopes are unusable, and carrying them
- * only inflates the consent surface. Before this branch existed a `resource`
- * naming root `/mcp` fell through `resolveResourceVault` to null, the whole
- * binding path no-op'd, and the root door alone kept showing the entire hub
- * scope catalog — the exact "scary consent" this module was written to kill,
- * surviving at one of the two MCP doors.
+ * Root `/mcp` is two token shapes at one URL, branched on what arrives:
+ * vault-audience Bearer still names one vault; `account:vaults` mints
+ * `aud=account` and is answered by account-MCP. The same argument that drops
+ * `scribe:*` / `agent:send` / `hub:admin` from a per-vault consent applies
+ * verbatim: those scopes are unusable in either token this door mints, and
+ * carrying them only inflates the consent surface.
  *
- * What this deliberately does NOT do is name the scopes. Unnamed
- * `vault:<verb>` is left exactly as requested, because there is no vault in
- * the resource to name it after; the consent picker supplies the name and the
- * existing rewrite turns it into `vault:<picked>:<verb>` before the code is
- * issued (`docs/contracts/oauth-scopes.md`, "Parser rules"). That is also why
- * the root PRM advertises the bare `vault:read` / `vault:write` /
- * `vault:admin` shapes: at the root door the bare shape is the correct thing
- * for a client to *request*, even though it is never the shape that ships in
- * the minted token.
+ * `account:vaults` cannot be combined with other scopes (authorize already
+ * refuses that). This filter still keeps both if a client asked for both —
+ * the combine check, not this function, is the refusal. Named
+ * `account:self:vaults:<vault>` forms are NOT the connection grant and are
+ * dropped here.
  *
- * Already-named `vault:<name>:<verb>` rides through untouched, same as the
- * per-vault path — a client that named a vault is not second-guessed here.
+ * What this deliberately does NOT do is name vault scopes. Unnamed
+ * `vault:<verb>` is left exactly as requested; the consent picker supplies
+ * the name. Already-named `vault:<name>:<verb>` rides through untouched.
  *
  * A request that carries ONLY foreign scopes narrows to the empty list. The
- * root authorize handler refuses that case with `invalid_scope` rather than
- * reaching a zero-scope consent screen; the per-vault path deliberately keeps
- * its empty narrowed list and renders consent, because that existing behavior
- * is part of its contract.
+ * root authorize handler refuses that case with `invalid_scope`.
  *
  * Idempotent: a second pass has nothing left to drop.
  */
+export function isAccountVaultsRootScope(scope: string): boolean {
+  return scope === ACCOUNT_VAULTS_UNNARROWED || scope === accountVaultsScope("self");
+}
+
 export function narrowRootMcpScopes(scopes: readonly string[]): string[] {
-  return scopes.filter((s) => s.split(":")[0] === "vault");
+  return scopes.filter((s) => s.split(":")[0] === "vault" || isAccountVaultsRootScope(s));
+}
+
+/**
+ * Audience for a token minted against root `/mcp`.
+ *
+ * Vault-named grants stay on `fallbackAudience` (`inferAudience` →
+ * `vault.<name>`). An account-vaults-only grant has no named vault and
+ * `inferAudience` already returns `"account"` — accept that instead of
+ * rejecting an empty vault-name set.
+ *
+ * Returns `null` when the grant is neither (foreign-only / empty) — the
+ * token handler turns that into `invalid_target`.
+ */
+export function resolveRootMcpTokenAudience(
+  grantedVaultNames: ReadonlySet<string>,
+  fallbackAudience: string,
+): string | null {
+  if (grantedVaultNames.size > 0) return fallbackAudience;
+  if (fallbackAudience === "account") return "account";
+  return null;
 }
