@@ -2,10 +2,11 @@
  * Account-level MCP tools for the self-host hub — the payload behind
  * `/account/mcp`.
  *
- * Cloud's twin lives in the identity worker (`account-mcp.ts`). Same three
- * coverage tools (list-vaults, create-vault, query-notes), same "no vault_token
- * in model context" rule. Hub adds grant-access / revoke-access / list-access
- * (pubkey → one `user_vaults` row). Those three are hub-only: cloud grants are
+ * Cloud's twin lives in the identity worker (`account-mcp.ts`). Coverage tools
+ * (list-vaults, create-vault, query-notes) plus hub-only grant-access /
+ * revoke-access / list-access (pubkey → one `user_vaults` row). create-note is
+ * the first cross-vault write tool: `vault` is required, write is checked
+ * per call, a 60s `vault:<name>:write` mint fans to REST. Cloud grants are
  * D1-ownership shaped, not `user_vaults`. Coverage is hub-shaped:
  *
  *   - Bearer is the cloud-shaped connection grant: `account:self:vaults`
@@ -28,10 +29,11 @@ import {
   type ComposedVaultVerb,
   accountVaultsGrant,
   composedAccountGrant,
+  composedVerbSatisfies,
 } from "@openparachute/door-contract";
 import { type AccountVaultMeta, listVaultsWithMeta } from "./account-api.ts";
 import { HOST_ADMIN_SCOPE, provisionVault } from "./admin-vaults.ts";
-import { GrantError, grantAccess, listAccess, revokeAccess } from "./grant-access.ts";
+import { GrantError, callerCanAdminVault, grantAccess, listAccess, revokeAccess } from "./grant-access.ts";
 import { signAccessToken } from "./jwt-sign.ts";
 import { getUserById, isFirstAdmin, vaultVerbsForUserVault } from "./users.ts";
 
@@ -206,6 +208,33 @@ export function resolveCoverage(
 
 function installedVaults(ctx: AccountToolContext): AccountVaultMeta[] {
   return listVaultsWithMeta(ctx.manifestPath, ctx.issuer);
+}
+
+function isUnrestricted(db: Database, principal: AccountMcpPrincipal): boolean {
+  return principal.isHubAdmin || isFirstAdmin(db, principal.userId);
+}
+
+/**
+ * Per-call write check. Opening the account door (list/query) is not write.
+ * First-admin / host:admin are unrestricted. Everyone else needs the `write`
+ * verb on that vault's `user_vaults` row. A Bearer named subset that does not
+ * include the vault cannot write it even if assignment would allow.
+ */
+export function canWriteVault(
+  db: Database,
+  principal: AccountMcpPrincipal,
+  vaultName: string,
+): boolean {
+  if (isUnrestricted(db, principal)) return true;
+  if (principal.authKind === "bearer" && principal.grant) {
+    if (principal.grant.wildcard === "admin") return true;
+    if (principal.grant.wildcard === null && !principal.grant.vaults.has(vaultName)) {
+      return false;
+    }
+    const named = principal.grant.vaults.get(vaultName);
+    if (named !== undefined && !composedVerbSatisfies(named, "write")) return false;
+  }
+  return vaultVerbsForUserVault(db, principal.userId, vaultName)?.includes("write") === true;
 }
 
 const listVaultsTool: AccountMcpTool = {
@@ -402,6 +431,110 @@ const queryNotesTool: AccountMcpTool = {
   },
 };
 
+function noteWriteBody(args: Record<string, unknown>): Record<string, unknown> {
+  const body: Record<string, unknown> = {};
+  if (typeof args.content === "string") body.content = args.content;
+  if (typeof args.path === "string") body.path = args.path;
+  if (Array.isArray(args.tags)) body.tags = args.tags;
+  if (args.metadata && typeof args.metadata === "object") body.metadata = args.metadata;
+  if (typeof args.if_exists === "string") body.if_exists = args.if_exists;
+  return body;
+}
+
+async function postNoteToVault(
+  ctx: AccountToolContext,
+  vault: AccountVaultMeta,
+  body: Record<string, unknown>,
+): Promise<unknown> {
+  const sign = ctx.signToken ?? signAccessToken;
+  const fetchImpl = ctx.fetchImpl ?? fetch;
+  const minted = await sign(ctx.db, {
+    sub: ctx.principal.userId,
+    scopes: [`vault:${vault.name}:write`],
+    audience: `vault.${vault.name}`,
+    clientId: ACCOUNT_MCP_CLIENT_ID,
+    issuer: ctx.issuer,
+    ttlSeconds: FANOUT_TOKEN_TTL_SECONDS,
+    vaultScope: [vault.name],
+    ...(ctx.now !== undefined ? { now: ctx.now } : {}),
+  });
+  const origin =
+    typeof vault.port === "number" && vault.port > 0
+      ? `http://127.0.0.1:${vault.port}`
+      : vault.url.replace(/\/vault\/[^/]+\/?$/, "");
+  const url = `${origin.replace(/\/$/, "")}/vault/${vault.name}/api/notes`;
+  const res = await fetchImpl(url, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${minted.token}`,
+      accept: "application/json",
+      "content-type": "application/json",
+    },
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(FANOUT_TIMEOUT_MS),
+  });
+  if (!res.ok) {
+    let detail = `vault responded ${res.status}`;
+    try {
+      const errBody = (await res.json()) as Record<string, unknown>;
+      if (typeof errBody.error === "string") detail = errBody.error;
+    } catch {
+      // Non-JSON error body — keep the status-only detail.
+    }
+    throw new AccountToolError("vault_error", detail, { status: res.status, vault: vault.name });
+  }
+  return res.json();
+}
+
+const createNoteTool: AccountMcpTool = {
+  name: "create-note",
+  description:
+    "Create a note in one vault this connection can write. `vault` is required — this " +
+    "door does not invent a target. Does not return a vault token.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      vault: {
+        type: "string",
+        description: "Target vault by name. Must be a reachable vault this connection can write.",
+      },
+      content: { type: "string", description: "Note body (markdown)." },
+      path: { type: "string", description: "Note path (e.g. 'Log/hello')." },
+      tags: { type: "array", items: { type: "string" }, description: "Tags to apply." },
+      metadata: { type: "object", description: "Metadata fields to set." },
+      if_exists: {
+        type: "string",
+        enum: ["error", "ignore", "update", "replace"],
+        description: "What to do when `path` already names a note. Default error.",
+      },
+    },
+    required: ["vault"],
+    additionalProperties: false,
+  },
+  async execute(args, ctx) {
+    if (typeof args.vault !== "string" || args.vault.length === 0) {
+      throw new AccountToolError("invalid_vault", "vault is required.");
+    }
+    const coverage = resolveCoverage(ctx.db, ctx.principal, installedVaults(ctx));
+    const wanted = args.vault.toLowerCase();
+    const hit = coverage.vaults.find((v) => v.name === wanted);
+    if (!hit) {
+      throw new AccountToolError(
+        "vault_not_covered",
+        `Vault "${args.vault}" is not among the vaults this connection can reach.`,
+      );
+    }
+    if (!canWriteVault(ctx.db, ctx.principal, hit.name)) {
+      throw new AccountToolError(
+        "write_not_granted",
+        `This connection cannot write vault "${hit.name}".`,
+      );
+    }
+    const note = await postNoteToVault(ctx, hit, noteWriteBody(args));
+    return { vault: hit.name, note };
+  },
+};
+
 function installedNameSet(ctx: AccountToolContext): Set<string> {
   return new Set(installedVaults(ctx).map((v) => v.name));
 }
@@ -506,7 +639,31 @@ export const ACCOUNT_MCP_TOOLS: readonly AccountMcpTool[] = [
   listVaultsTool,
   createVaultTool,
   queryNotesTool,
+  createNoteTool,
   grantAccessTool,
   revokeAccessTool,
   listAccessTool,
 ];
+
+/**
+ * Catalog filtered by what this principal can actually call. Admin-shaped
+ * tools (grant/revoke/list-access) and write tools are invisible below the
+ * verb, not just refused. Same pattern as the vault door.
+ */
+export function toolsForPrincipal(ctx: AccountToolContext): readonly AccountMcpTool[] {
+  const installed = installedVaults(ctx);
+  const coverage = resolveCoverage(ctx.db, ctx.principal, installed);
+  const canWrite = coverage.vaults.some((v) => canWriteVault(ctx.db, ctx.principal, v.name));
+  const canAdmin = coverage.vaults.some((v) =>
+    callerCanAdminVault(ctx.db, ctx.principal, v.name),
+  );
+  const create = canCreate(ctx.principal);
+  return ACCOUNT_MCP_TOOLS.filter((t) => {
+    if (t.name === "create-vault") return create;
+    if (t.name === "create-note") return canWrite;
+    if (t.name === "grant-access" || t.name === "revoke-access" || t.name === "list-access") {
+      return canAdmin;
+    }
+    return true;
+  });
+}

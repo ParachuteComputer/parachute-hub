@@ -437,6 +437,7 @@ describe("account MCP — initialize + tools", () => {
         "list-vaults",
         "create-vault",
         "query-notes",
+        "create-note",
         "grant-access",
         "revoke-access",
         "list-access",
@@ -722,6 +723,142 @@ describe("account MCP — query-notes", () => {
         vaults_queried: string[];
       };
       expect(payload.vaults_queried).toEqual(["beta"]);
+    } finally {
+      h.cleanup();
+    }
+  });
+});
+
+describe("account MCP — create-note", () => {
+  test("owner posts to the named vault with a write-audience mint", async () => {
+    const h = await makeHarness();
+    try {
+      const seen: Array<{ url: string; method: string; scope: string }> = [];
+      const fetchImpl = async (input: string | URL | Request, init?: RequestInit) => {
+        const req = input instanceof Request ? input : new Request(String(input), init);
+        const auth = req.headers.get("authorization") ?? "";
+        const parts = auth.replace(/^Bearer\s+/i, "").split(".");
+        const payload = JSON.parse(Buffer.from(parts[1] ?? "", "base64url").toString()) as {
+          scope?: string;
+        };
+        seen.push({ url: req.url, method: req.method, scope: payload.scope ?? "" });
+        return Response.json({ id: "n1", path: "Log/hello" }, { status: 201 });
+      };
+      const res = await handleAccountMcp(
+        nostrReq(
+          OWNER_SECRET,
+          rpc("tools/call", {
+            name: "create-note",
+            arguments: { vault: "beta", path: "Log/hello", content: "hi" },
+          }),
+        ),
+        mcpDeps(h, { fetchImpl }),
+      );
+      const out = parseTool(
+        (await res.json()) as { result: { content: Array<{ text: string }> } },
+      ) as { vault: string; note: { id: string } };
+      expect(out.vault).toBe("beta");
+      expect(out.note.id).toBe("n1");
+      expect(seen).toHaveLength(1);
+      expect(seen[0]?.url).toContain("/vault/beta/api/notes");
+      expect(seen[0]?.method).toBe("POST");
+      expect(seen[0]?.scope).toBe("vault:beta:write");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("read-role cannot create-note — write_not_granted, fetch never called", async () => {
+    const h = await makeHarness();
+    const readerSecret = hexToBytes("44".repeat(32));
+    const readerPub = bytesToHex(schnorr.getPublicKey(readerSecret));
+    let fetched = 0;
+    try {
+      const reader = await createUser(h.db, "reader", "correct-horse-battery-staple", {
+        allowMulti: true,
+        passwordChanged: true,
+        assignedVaults: ["beta"],
+        role: "read",
+      });
+      bindPubkeyFromHttpAuth(h.db, {
+        userId: reader.id,
+        pubkey: readerPub,
+        proofEvent: "{}",
+        proofEventId: "d".repeat(64),
+        label: "test",
+        now: new Date(),
+      });
+      const res = await handleAccountMcp(
+        nostrReq(
+          readerSecret,
+          rpc("tools/call", {
+            name: "create-note",
+            arguments: { vault: "beta", content: "nope" },
+          }),
+        ),
+        mcpDeps(h, { fetchImpl: async () => {
+          fetched += 1;
+          return Response.json({}, { status: 201 });
+        } }),
+      );
+      const body = (await res.json()) as { error?: { data?: { error_type?: string } } };
+      expect(body.error?.data?.error_type).toBe("write_not_granted");
+      expect(fetched).toBe(0);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("unassigned vault is vault_not_covered", async () => {
+    const h = await makeHarness();
+    try {
+      const res = await handleAccountMcp(
+        nostrReq(
+          FRIEND_SECRET,
+          rpc("tools/call", {
+            name: "create-note",
+            arguments: { vault: "personal", content: "nope" },
+          }),
+        ),
+        mcpDeps(h),
+      );
+      const body = (await res.json()) as { error?: { data?: { error_type?: string } } };
+      expect(body.error?.data?.error_type).toBe("vault_not_covered");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("tools/list hides create-note and grant tools from a read-role caller", async () => {
+    const h = await makeHarness();
+    const readerSecret = hexToBytes("55".repeat(32));
+    const readerPub = bytesToHex(schnorr.getPublicKey(readerSecret));
+    try {
+      const reader = await createUser(h.db, "reader2", "correct-horse-battery-staple", {
+        allowMulti: true,
+        passwordChanged: true,
+        assignedVaults: ["beta"],
+        role: "read",
+      });
+      bindPubkeyFromHttpAuth(h.db, {
+        userId: reader.id,
+        pubkey: readerPub,
+        proofEvent: "{}",
+        proofEventId: "e".repeat(64),
+        label: "test",
+        now: new Date(),
+      });
+      const listed = await handleAccountMcp(
+        nostrReq(readerSecret, rpc("tools/list")),
+        mcpDeps(h),
+      );
+      const names = (
+        (await listed.json()) as { result: { tools: Array<{ name: string }> } }
+      ).result.tools.map((t) => t.name);
+      expect(names).toEqual(["list-vaults", "query-notes"]);
+      expect(names).not.toContain("create-note");
+      expect(names).not.toContain("grant-access");
+      expect(names).not.toContain("create-vault");
     } finally {
       h.cleanup();
     }
