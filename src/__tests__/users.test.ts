@@ -22,9 +22,11 @@ import {
   isSeedAdminUsername,
   listUnlinkableUsernames,
   listUsers,
+  removeUserVault,
   resetUserPassword,
   setPassword,
   setUserVaults,
+  upsertUserVault,
   userCount,
   validateEmail,
   validatePassword,
@@ -846,6 +848,77 @@ describe("setUserVaults (multi-user Phase 2 PR 2)", () => {
         .query<{ n: number }, [string]>("SELECT COUNT(*) AS n FROM user_vaults WHERE user_id = ?")
         .get(u.id);
       expect(after?.n).toBe(0);
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+describe("upsertUserVault / removeUserVault", () => {
+  test("returns false when user does not exist", () => {
+    const { db, cleanup } = makeDb();
+    try {
+      expect(upsertUserVault(db, "no-such-id", "beta", "write")).toBe(false);
+      expect(removeUserVault(db, "no-such-id", "beta")).toBe(false);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("inserts one vault without wiping others", async () => {
+    const { db, cleanup } = makeDb();
+    try {
+      const u = await createUser(db, "alice", "alice-strong-passphrase", {
+        allowMulti: true,
+        assignedVaults: ["personal"],
+      });
+      expect(upsertUserVault(db, u.id, "beta", "read")).toBe(true);
+      const fresh = getUserById(db, u.id);
+      expect(new Set(fresh?.assignedVaults)).toEqual(new Set(["personal", "beta"]));
+      expect(vaultVerbsForUserVault(db, u.id, "beta")).toEqual(["read"]);
+      expect(vaultVerbsForUserVault(db, u.id, "personal")).toEqual(["read", "write", "admin"]);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("ON CONFLICT updates role and preserves created_at", async () => {
+    const { db, cleanup } = makeDb();
+    try {
+      const u = await createUser(db, "alice", "alice-strong-passphrase", {
+        allowMulti: true,
+        assignedVaults: ["beta"],
+        now: () => new Date(1000),
+      });
+      const before = db
+        .query<{ created_at: string }, [string, string]>(
+          "SELECT created_at FROM user_vaults WHERE user_id = ? AND vault_name = ?",
+        )
+        .get(u.id, "beta");
+      expect(upsertUserVault(db, u.id, "beta", "read", () => new Date(2000))).toBe(true);
+      const after = db
+        .query<{ created_at: string; role: string }, [string, string]>(
+          "SELECT created_at, role FROM user_vaults WHERE user_id = ? AND vault_name = ?",
+        )
+        .get(u.id, "beta");
+      expect(after?.role).toBe("read");
+      expect(after?.created_at).toBe(before?.created_at);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("removeUserVault drops one row and leaves the rest", async () => {
+    const { db, cleanup } = makeDb();
+    try {
+      const u = await createUser(db, "alice", "alice-strong-passphrase", {
+        allowMulti: true,
+        assignedVaults: ["a", "b"],
+      });
+      expect(removeUserVault(db, u.id, "a")).toBe(true);
+      expect(removeUserVault(db, u.id, "a")).toBe(false);
+      const fresh = getUserById(db, u.id);
+      expect(fresh?.assignedVaults).toEqual(["b"]);
     } finally {
       cleanup();
     }

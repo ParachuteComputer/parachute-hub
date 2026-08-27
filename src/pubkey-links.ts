@@ -58,6 +58,13 @@ export const PUBKEY_CHALLENGE_TTL_MS = 5 * 60 * 1000;
  */
 export const MAX_PUBKEYS_PER_USER = 10;
 
+/** 32-byte x-only secp256k1 key, lowercase hex. Reject mixed case — don't normalize. */
+export const PUBKEY_HEX_RE = /^[0-9a-f]{64}$/;
+
+export function isPubkeyHex(value: string): boolean {
+  return PUBKEY_HEX_RE.test(value);
+}
+
 /** A verified pubkey→user link. `proofEvent` is fetched separately (it's bulky). */
 export interface LinkedPubkey {
   pubkey: string;
