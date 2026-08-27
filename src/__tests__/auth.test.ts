@@ -268,6 +268,7 @@ describe("authHelp", () => {
   test("lists every blessed subcommand", () => {
     expect(h).toContain("parachute auth set-password");
     expect(h).toContain("parachute auth list-users");
+    expect(h).toContain("parachute auth link-pubkey");
     expect(h).toContain("parachute auth 2fa");
     expect(h).toContain("parachute auth rotate-key");
     expect(h).toContain("parachute auth reap-clients");
@@ -2442,5 +2443,95 @@ describe("parachute auth revoke-token", () => {
   test("authHelp lists revoke-token alongside mint-token", () => {
     expect(authHelp()).toContain("revoke-token");
     expect(authHelp()).toContain("revoke-token <jti>");
+  });
+});
+
+describe("parachute auth link-pubkey", () => {
+  const OWNER_PUB = "11".repeat(32);
+  const OTHER_PUB = "22".repeat(32);
+
+  test("binds a hex pubkey to --user owner", async () => {
+    const tmp = makeTmp();
+    try {
+      const deps: AuthDeps = { dbPath: tmp.dbPath, isInteractive: () => false };
+      await captureOutput(() =>
+        auth(["set-password", "--username", "owner", "--password", "pw"], deps),
+      );
+      const { code, stdout, stderr } = await captureOutput(() =>
+        auth(["link-pubkey", "--user", "owner", OWNER_PUB], deps),
+      );
+      expect(stderr).toBe("");
+      expect(code).toBe(0);
+      expect(stdout).toContain("Linked pubkey");
+      expect(stdout).toContain(OWNER_PUB);
+      expect(stdout).toContain("owner");
+      const db = openHubDb(tmp.dbPath);
+      try {
+        const { findPubkeyLink } = await import("../pubkey-links.ts");
+        const link = findPubkeyLink(db, OWNER_PUB);
+        expect(link).not.toBeNull();
+        const users = listUsers(db);
+        expect(link?.userId).toBe(users[0]?.id);
+      } finally {
+        db.close();
+      }
+    } finally {
+      tmp.cleanup();
+    }
+  });
+
+  test("refuses npub and mixed-case hex", async () => {
+    const tmp = makeTmp();
+    try {
+      const deps: AuthDeps = { dbPath: tmp.dbPath, isInteractive: () => false };
+      await captureOutput(() =>
+        auth(["set-password", "--username", "owner", "--password", "pw"], deps),
+      );
+      const npub = await captureOutput(() =>
+        auth(["link-pubkey", "--user", "owner", "npub1qqqqqqq"], deps),
+      );
+      expect(npub.code).toBe(1);
+      expect(npub.stderr).toContain("lowercase-hex");
+      const mixed = await captureOutput(() =>
+        auth(["link-pubkey", "--user", "owner", "AA".repeat(32)], deps),
+      );
+      expect(mixed.code).toBe(1);
+    } finally {
+      tmp.cleanup();
+    }
+  });
+
+  test("refuses a pubkey already bound to another user", async () => {
+    const tmp = makeTmp();
+    try {
+      const deps: AuthDeps = { dbPath: tmp.dbPath, isInteractive: () => false };
+      await captureOutput(() =>
+        auth(["set-password", "--username", "owner", "--password", "pw"], deps),
+      );
+      const db = openHubDb(tmp.dbPath);
+      await createUser(db, "alice", "alice-strong-passphrase", { allowMulti: true });
+      db.close();
+      await captureOutput(() => auth(["link-pubkey", "--user", "owner", OTHER_PUB], deps));
+      const taken = await captureOutput(() =>
+        auth(["link-pubkey", "--user", "alice", OTHER_PUB], deps),
+      );
+      expect(taken.code).toBe(1);
+      expect(taken.stderr).toContain("already bound");
+    } finally {
+      tmp.cleanup();
+    }
+  });
+
+  test("requires --user", async () => {
+    const tmp = makeTmp();
+    try {
+      const { code, stderr } = await captureOutput(() =>
+        auth(["link-pubkey", OWNER_PUB], { dbPath: tmp.dbPath }),
+      );
+      expect(code).toBe(1);
+      expect(stderr).toContain("--user is required");
+    } finally {
+      tmp.cleanup();
+    }
   });
 });

@@ -1,8 +1,10 @@
 import { describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { schnorr } from "@noble/curves/secp256k1.js";
 import { _resetBootstrapTokenForTests, generateBootstrapToken } from "../bootstrap-token.ts";
 import { buildCsrfCookie, generateCsrfToken } from "../csrf.ts";
 import { HUB_SVC, hubPortPath } from "../hub-control.ts";
@@ -19,9 +21,11 @@ import {
 } from "../hub-server.ts";
 import { defaultRootModeFor, setNotesRedirectDisabled, setRootMode } from "../hub-settings.ts";
 import { signAccessToken } from "../jwt-sign.ts";
+import { NOSTR_AUTH_KIND, type NostrEvent, nostrEventId } from "../nostr-event.ts";
 import { clearNotesRedirectLogState } from "../notes-redirect.ts";
 import { mintOperatorToken } from "../operator-token.ts";
 import { pidPath } from "../process-state.ts";
+import { bindPubkeyFromHttpAuth } from "../pubkey-links.ts";
 import { type ServiceEntry, writeManifest } from "../services-manifest.ts";
 import { buildSessionCookie, createSession } from "../sessions.ts";
 import { rotateSigningKey } from "../signing-keys.ts";
@@ -7304,6 +7308,170 @@ describe("hubFetch root /mcp forwarding (vault 0.7.3 canonical root MCP)", () =>
       expect(body).not.toContain("PARACHUTE-APP-SHELL");
     } finally {
       db.close();
+      h.cleanup();
+    }
+  });
+
+  // NIP-98 at root /mcp is hub-user auth the vault daemon does not speak.
+  // Intercept that scheme and hand it to handleAccountMcp. Vault-audience
+  // Bearer still proxies. Does not reopen narrowRootMcpScopes.
+  const hexToBytes = (hex: string): Uint8Array => Uint8Array.from(Buffer.from(hex, "hex"));
+  const bytesToHex = (bytes: Uint8Array): string => Buffer.from(bytes).toString("hex");
+  const BOTH_ACCEPT = "application/json, text/event-stream";
+
+  function signNostrEvent(
+    secret: Uint8Array,
+    parts: { created_at?: number; tags?: string[][]; content?: string },
+  ): NostrEvent {
+    const unsigned = {
+      pubkey: bytesToHex(schnorr.getPublicKey(secret)),
+      created_at: parts.created_at ?? Math.floor(Date.now() / 1000),
+      kind: NOSTR_AUTH_KIND,
+      tags: parts.tags ?? [],
+      content: parts.content ?? "",
+    };
+    const id = nostrEventId(unsigned);
+    const sig = bytesToHex(schnorr.sign(hexToBytes(id), secret));
+    return { ...unsigned, id, sig };
+  }
+
+  function nostrMcpReq(secret: Uint8Array, url: string, body: unknown): Request {
+    const encoded = JSON.stringify(body);
+    const bytes = new TextEncoder().encode(encoded);
+    const event = signNostrEvent(secret, {
+      content: `${Date.now()}-${Math.random()}`,
+      tags: [
+        ["u", url],
+        ["method", "POST"],
+        ["payload", createHash("sha256").update(bytes).digest("hex")],
+      ],
+    });
+    return new Request(url, {
+      method: "POST",
+      headers: {
+        authorization: `Nostr ${Buffer.from(JSON.stringify(event), "utf8").toString("base64url")}`,
+        accept: BOTH_ACCEPT,
+        "content-type": "application/json",
+        host: new URL(url).host,
+      },
+      body: encoded,
+    });
+  }
+
+  test("NIP-98 POST /mcp does not reach the daemon — same 401 shape as /account/mcp", async () => {
+    const h = makeHarness();
+    const upstream = startRecordingUpstream();
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      writeManifest({ services: [canonicalVaultRow(upstream.port)] }, h.manifestPath);
+      await createUser(db, "owner", "pw", { passwordChanged: true });
+      const fetcher = hubFetch(h.dir, { getDb: () => db, manifestPath: h.manifestPath });
+      const url = "http://hub.example.com/mcp";
+      const secret = hexToBytes("99".repeat(32));
+      const res = await fetcher(
+        nostrMcpReq(secret, url, { jsonrpc: "2.0", id: 1, method: "initialize" }),
+      );
+      expect(res.status).toBe(401);
+      const body = (await res.json()) as { error?: string; error_description?: string };
+      expect(body.error).toBe("invalid_token");
+      expect(body.error_description).toBe("Nostr pubkey is not linked to a hub user");
+      const challenge = res.headers.get("www-authenticate") ?? "";
+      expect(challenge).toContain("resource_metadata=");
+      expect(challenge).toContain("/.well-known/oauth-protected-resource/account/mcp");
+      expect(upstream.requests().length).toBe(0);
+    } finally {
+      db.close();
+      upstream.stop();
+      h.cleanup();
+    }
+  });
+
+  test("NIP-98 POST /mcp with no getDb is 503 service_unavailable, daemon never reached", async () => {
+    const h = makeHarness();
+    const upstream = startRecordingUpstream();
+    try {
+      writeManifest({ services: [canonicalVaultRow(upstream.port)] }, h.manifestPath);
+      const fetcher = hubFetch(h.dir, { manifestPath: h.manifestPath });
+      const url = "http://hub.example.com/mcp";
+      const secret = hexToBytes("aa".repeat(32));
+      const res = await fetcher(
+        nostrMcpReq(secret, url, { jsonrpc: "2.0", id: 1, method: "initialize" }),
+      );
+      expect(res.status).toBe(503);
+      const body = (await res.json()) as { error?: string; error_description?: string };
+      expect(body.error).toBe("service_unavailable");
+      expect(body.error_description).toBe("hub db not configured");
+      expect(upstream.requests().length).toBe(0);
+    } finally {
+      upstream.stop();
+      h.cleanup();
+    }
+  });
+
+  test("Bearer POST /mcp still proxies to the daemon (NIP-98 intercept is scheme-only)", async () => {
+    const h = makeHarness();
+    const upstream = startRecordingUpstream();
+    try {
+      writeManifest({ services: [canonicalVaultRow(upstream.port)] }, h.manifestPath);
+      const fetcher = hubFetch(h.dir, { manifestPath: h.manifestPath });
+      const res = await fetcher(
+        new Request("http://hub.example.com/mcp", {
+          method: "POST",
+          headers: {
+            authorization: "Bearer not-a-vault-token",
+            "content-type": "application/json",
+            host: "hub.example.com",
+          },
+          body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize" }),
+        }),
+      );
+      expect(res.status).toBe(200);
+      expect(upstream.requests()).toHaveLength(1);
+      expect(upstream.requests()[0]?.pathname).toBe("/mcp");
+    } finally {
+      upstream.stop();
+      h.cleanup();
+    }
+  });
+
+  test("linked NIP-98 POST /mcp initialize is answered by account-MCP, daemon never reached", async () => {
+    const h = makeHarness();
+    const upstream = startRecordingUpstream();
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      writeManifest({ services: [canonicalVaultRow(upstream.port)] }, h.manifestPath);
+      const owner = await createUser(db, "owner", "pw", { passwordChanged: true });
+      const secret = hexToBytes("11".repeat(32));
+      const pubkey = bytesToHex(schnorr.getPublicKey(secret));
+      const bound = bindPubkeyFromHttpAuth(db, {
+        userId: owner.id,
+        pubkey,
+        proofEvent: "{}",
+        proofEventId: "c".repeat(64),
+        label: "test",
+      });
+      expect(bound.ok).toBe(true);
+      const fetcher = hubFetch(h.dir, { getDb: () => db, manifestPath: h.manifestPath });
+      const url = "http://hub.example.com/mcp";
+      const res = await fetcher(
+        nostrMcpReq(secret, url, {
+          jsonrpc: "2.0",
+          id: 1,
+          method: "initialize",
+          params: {
+            protocolVersion: "2025-11-25",
+            capabilities: {},
+            clientInfo: { name: "t", version: "0" },
+          },
+        }),
+      );
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as { result?: { serverInfo?: { name?: string } } };
+      expect(body.result?.serverInfo?.name).toBe("parachute-account");
+      expect(upstream.requests().length).toBe(0);
+    } finally {
+      db.close();
+      upstream.stop();
       h.cleanup();
     }
   });

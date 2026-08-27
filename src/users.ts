@@ -182,7 +182,7 @@ function readVaultsForUser(db: Database, userId: string): string[] {
  *   - `write` (today's default)     → `["read", "write", "admin"]`
  *   - `read` (forward-compat)       → `["read"]` — a *deliberate* read-only
  *     assignment stays read-only even under the any-assigned-user-gets-admin
- *     policy. Not created by any flow today.
+ *     policy. `grant-access` on `/account/mcp` can create these rows.
  *   - anything else (unknown role)  → `[]` — fail closed. An unrecognised
  *     role grants no minting authority rather than silently defaulting to
  *     write. (Defense-in-depth: a hand-edited / future row with a role this
@@ -513,6 +513,61 @@ export function setUserVaults(
     db.prepare("UPDATE users SET updated_at = ? WHERE id = ?").run(stamp, userId);
   })();
   return true;
+}
+
+/**
+ * Upsert one `user_vaults` row. Does not touch the user's other vaults —
+ * unlike `setUserVaults`, which is replace-all. Grant-by-pubkey uses this
+ * so adding access to vault B cannot wipe vault A.
+ *
+ * ON CONFLICT updates `role` and preserves the original `created_at`.
+ * Returns `false` when the user id does not exist.
+ */
+export function upsertUserVault(
+  db: Database,
+  userId: string,
+  vaultName: string,
+  role: string,
+  now: () => Date = () => new Date(),
+): boolean {
+  const exists = db
+    .query<{ id: string }, [string]>("SELECT id FROM users WHERE id = ?")
+    .get(userId);
+  if (!exists) return false;
+  const stamp = now().toISOString();
+  db.transaction(() => {
+    db.prepare(
+      `INSERT INTO user_vaults (user_id, vault_name, role, created_at)
+       VALUES (?, ?, ?, ?)
+       ON CONFLICT(user_id, vault_name) DO UPDATE SET role = excluded.role`,
+    ).run(userId, vaultName, role, stamp);
+    db.prepare("UPDATE users SET updated_at = ? WHERE id = ?").run(stamp, userId);
+  })();
+  return true;
+}
+
+/**
+ * Drop one `user_vaults` row. Leaves the user (and any other vaults) in place.
+ * Returns `true` when a row was deleted.
+ */
+export function removeUserVault(
+  db: Database,
+  userId: string,
+  vaultName: string,
+  now: () => Date = () => new Date(),
+): boolean {
+  const stamp = now().toISOString();
+  let removed = false;
+  db.transaction(() => {
+    const res = db
+      .prepare("DELETE FROM user_vaults WHERE user_id = ? AND vault_name = ?")
+      .run(userId, vaultName);
+    removed = Number(res.changes) > 0;
+    if (removed) {
+      db.prepare("UPDATE users SET updated_at = ? WHERE id = ?").run(stamp, userId);
+    }
+  })();
+  return removed;
 }
 
 /**
