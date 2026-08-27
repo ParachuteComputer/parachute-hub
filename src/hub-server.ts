@@ -189,11 +189,12 @@
  *   # per-vault proxy and generic service mounts so no module can claim it
  *   # via services.json paths). Vault-audience Bearer / API key still proxy
  *   # to the vault daemon (token names the vault). NIP-98
- *   # (`Authorization: Nostr`) is hub-user auth the daemon does not speak,
- *   # so that scheme routes to handleAccountMcp — same door as /account/mcp.
- *   # OAuth authorize / narrowRootMcpScopes are untouched.
- *   /mcp, /mcp/*                                → NIP-98 → account-MCP;
- *                                                otherwise proxy to the vault daemon
+ *   # (`Authorization: Nostr`) and Bearer `aud=account` are hub-user auth
+ *   # the daemon does not speak, so those route to handleAccountMcp — same
+ *   # door as /account/mcp. Vault-audience Bearer / API key still proxy.
+ *   /mcp, /mcp/*                                → NIP-98 or aud=account →
+ *                                                account-MCP; otherwise proxy
+ *                                                to the vault daemon
  *
  *   # Per-vault content proxy (user-facing vault data: Notes PWA, MCP, etc.).
  *   /vault/<name>/*                            → proxy to the vault backend
@@ -4379,8 +4380,9 @@ export function hubFetch(
       // the OAuth twin of that path: minting happens at /oauth/token after
       // narrowRootMcpScopes kept `account:vaults`. Intercept both and hand
       // the request to handleAccountMcp, the same handler /account/mcp uses.
-      // Hub-only until Cloud's twin (parachute-cloud#273) matches this scheme
-      // split — door-contract 0.6.0 already ratifies a unified /mcp gateway.
+      // Hub-only until Cloud's OAuth twin (parachute-cloud#274) matches this
+      // scheme split. #273 is NIP-98 only. door-contract 0.6.0 already
+      // ratifies a unified /mcp gateway.
       if (pathname === "/mcp" || pathname.startsWith("/mcp/")) {
         // Same per-request force-change-password gate as the twins above —
         // a pre-rotation signed-in user can't reach vault data through here

@@ -507,32 +507,29 @@ function advertisedScopes(declared: ReadonlySet<string>, manifest: ServicesManif
  *
  *   - **Hub-level scopes now have an explicit door boundary.** The root PRM
  *     starts from hub's authoritative requestable/module-installed catalog,
- *     then keeps vault scopes plus `account:vaults`. `scribe:*` / `agent:send`
- *     / `hub:admin` stay dropped — advertising a scope this authorize branch
- *     drops would mislead a spec-following client. `account:self:admin` and
- *     friends stay out of the catalog (opt-in by intent, not by copy).
+ *     then filters to vault scopes. `account:vaults` is requestable at this
+ *     door (`narrowRootMcpScopes` keeps it) but is NOT advertised here: a
+ *     spec-following client copies the whole catalog, and combining
+ *     `account:vaults` with vault scopes is refused. Advertise it on
+ *     `/account/mcp`'s PRM; request it explicitly at root `/mcp`.
+ *     `scribe:*` / `agent:send` / `hub:admin` stay dropped.
  *
  * Both documents start from `advertisedScopes`. The root document then applies
- * `narrowRootMcpScopes` and appends `account:vaults` (stripped from the
- * generic catalog so a notes client doesn't over-request it, but legitimate
- * at this door).
+ * `narrowRootMcpScopes`, which still drops `account:vaults` out of this
+ * advertisement because `advertisedScopes` already stripped `account:*`.
  */
 export function rootMcpProtectedResourceMetadata(deps: OAuthDeps): Response {
   const iss = deps.issuer;
   const declared = (deps.loadDeclaredScopes ?? loadDeclaredScopes)();
-  const vaultScopes = narrowRootMcpScopes(
-    advertisedScopes(declared, (deps.loadServicesManifest ?? readServicesManifest)()),
-  );
-  const scopes_supported = vaultScopes.includes(ACCOUNT_VAULTS_UNNARROWED)
-    ? vaultScopes
-    : [...vaultScopes, ACCOUNT_VAULTS_UNNARROWED];
   return jsonResponse({
     // The resource is the root MCP endpoint, not the origin — that's what
     // distinguishes this document from the bare PRM, and what the client
     // matches against the endpoint it got the 401 from.
     resource: `${iss}/mcp`,
     authorization_servers: [iss],
-    scopes_supported,
+    scopes_supported: narrowRootMcpScopes(
+      advertisedScopes(declared, (deps.loadServicesManifest ?? readServicesManifest)()),
+    ),
     bearer_methods_supported: ["header"],
     resource_documentation: "https://parachute.computer",
   });

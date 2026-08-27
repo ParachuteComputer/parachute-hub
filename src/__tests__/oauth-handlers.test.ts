@@ -345,11 +345,10 @@ describe("rootMcpProtectedResourceMetadata (hub#789)", () => {
     expect(body.scopes_supported as string[]).not.toContain("parachute:host:admin");
   });
 
-  test("shares the bare PRM's requestable-scope filter, plus account:vaults at this door", async () => {
+  test("shares the bare PRM's requestable-scope filter, narrowed further to vault-only", async () => {
     // Both documents start from one registry and requestable-scope filter; the
-    // root document keeps vault scopes and adds the account-MCP connection
-    // grant (stripped from the generic catalog so a notes client doesn't
-    // over-request it).
+    // root document applies its additional vault-only advertisement. account:vaults
+    // is requestable at this door but not advertised (catalog-copy combine).
     const root = (await call().json()) as Record<string, unknown>;
     const bare = (await protectedResourceMetadata({
       issuer: ISSUER,
@@ -357,8 +356,9 @@ describe("rootMcpProtectedResourceMetadata (hub#789)", () => {
       loadServicesManifest: fixtureLoadServicesManifest,
     }).json()) as Record<string, unknown>;
     expect([...(root.scopes_supported as string[])].sort()).toEqual(
-      [...(bare.scopes_supported as string[]), "account:vaults"].sort(),
+      [...(bare.scopes_supported as string[])].sort(),
     );
+    expect(root.scopes_supported as string[]).not.toContain("account:vaults");
   });
 
   test("narrows the bare PRM's requestable catalog to vault scopes at the root door", async () => {
@@ -10211,6 +10211,48 @@ describe("RFC 8707 resource binding — vault-bound MCP (fix #461)", () => {
         expect(tok.scope.split(" ")).not.toContain("account:vaults");
         const { payload } = await validateAccessToken(db, tok.access_token, ISSUER);
         expect(payload.aud).toBe("account");
+      } finally {
+        cleanup();
+      }
+    });
+
+    test("catalog-copy of the root PRM still reaches the vault picker (not invalid_scope)", async () => {
+      const prm = (await rootMcpProtectedResourceMetadata(RESOURCE_DEPS).json()) as {
+        scopes_supported: string[];
+      };
+      expect(prm.scopes_supported).not.toContain("account:vaults");
+      const html = await consentFor(`${ISSUER}/mcp`);
+      expect(html).toContain("Pick a vault");
+      expect(html).not.toContain("error=invalid_scope");
+      const { db, cleanup } = await makeDb();
+      try {
+        const user = await createUser(db, "owner", "pw");
+        const session = createSession(db, { userId: user.id });
+        const reg = registerClient(db, { redirectUris: ["https://app.example/cb"] });
+        const { challenge } = makePkce();
+        const res = handleAuthorizeGet(
+          db,
+          new Request(
+            authorizeUrl({
+              client_id: reg.client.clientId,
+              redirect_uri: "https://app.example/cb",
+              response_type: "code",
+              code_challenge: challenge,
+              code_challenge_method: "S256",
+              scope: prm.scopes_supported.join(" "),
+              resource: `${ISSUER}/mcp`,
+            }),
+            {
+              headers: {
+                cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000))}`,
+              },
+            },
+          ),
+          RESOURCE_DEPS,
+        );
+        expect(res.status).toBe(200);
+        const copied = await res.text();
+        expect(copied).toContain("Pick a vault");
       } finally {
         cleanup();
       }

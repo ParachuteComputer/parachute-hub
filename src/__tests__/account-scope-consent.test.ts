@@ -147,8 +147,9 @@ describe("requestable is NOT the same as advertised", () => {
     // The ordinary surface is advertised…
     expect(body.scopes_supported).toContain("vault:read");
     expect(body.scopes_supported).toContain("vault:admin");
-    // The account-MCP connection grant is legitimate at this door.
-    expect(body.scopes_supported).toContain("account:vaults");
+    // account:vaults is requestable at this door but not advertised here —
+    // catalog-copy would combine it with vault scopes, which authorize refuses.
+    expect(body.scopes_supported).not.toContain("account:vaults");
     // …account-wide REST authority (delete-vault / mint credentials) is not.
     expect(body.scopes_supported).not.toContain(ACCOUNT_SELF_ADMIN_SCOPE);
     expect(body.scopes_supported).not.toContain(ACCOUNT_SELF_WRITE_SCOPE);
