@@ -151,6 +151,7 @@ describe("handleAccountCapabilities", () => {
       expect(body.issuer).toBe(ISSUER); // trailing slash trimmed
       expect(body.door).toBe("hub");
       expect(body.account_endpoint).toBe(`${ISSUER}/account`);
+      expect(body.account_mcp_endpoint).toBe(`${ISSUER}/account/mcp`);
       expect(body.auth).toEqual({ methods: ["password"], signin_path: "/login" });
       expect(body.vault_url_template).toContain("{name}");
       expect(body.vault_url_template).toBe(`${ISSUER}/vault/{name}`);

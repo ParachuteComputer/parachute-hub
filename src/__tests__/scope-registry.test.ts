@@ -102,6 +102,8 @@ describe("loadDeclaredScopes", () => {
       expect(declared.has("vault:read")).toBe(true);
       expect(declared.has("scribe:transcribe")).toBe(true);
       expect(declared.has("hub:admin")).toBe(true);
+      expect(declared.has("account:vaults")).toBe(true);
+      expect(isKnownScope("account:self:vaults", declared)).toBe(true);
     } finally {
       cleanup();
     }

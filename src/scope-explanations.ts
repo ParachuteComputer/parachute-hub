@@ -193,6 +193,16 @@ export const SCOPE_EXPLANATIONS: Record<string, ScopeExplanation> = {
     level: "read",
     risk: "low",
   },
+  // Account-MCP connection grant (hub#883). PRM advertises the un-narrowed
+  // `account:vaults`; consent binds it to `account:self:vaults`. Elevated
+  // because the grant includes create-vault plus cross-vault query-notes —
+  // not the REST `account:self:read` list/usage surface.
+  "account:vaults": {
+    label:
+      "Connect across your vaults — list them, search their notes, and create new vaults. Does not delete vaults or mint long-lived access tokens.",
+    level: "write",
+    risk: "elevated",
+  },
 };
 
 /** Account scope strings (Parachute App campaign, Phase 2). Exported so the

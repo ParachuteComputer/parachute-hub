@@ -103,6 +103,51 @@ describe("grants module (#75)", () => {
     }
   });
 
+  test("isCoveredByGrant: account:vaults and account:self:vaults are equivalent", async () => {
+    const h = await harness();
+    try {
+      recordGrant(h.db, h.userId, h.clientId, ["account:self:vaults"]);
+      expect(isCoveredByGrant(h.db, h.userId, h.clientId, ["account:vaults"])).toBe(true);
+      expect(isCoveredByGrant(h.db, h.userId, h.clientId, ["account:self:vaults"])).toBe(true);
+      expect(
+        isCoveredByGrant(h.db, h.userId, h.clientId, ["account:vaults", "vault:work:read"]),
+      ).toBe(false);
+      expect(revokeGrant(h.db, h.userId, h.clientId)).toBe(true);
+      recordGrant(h.db, h.userId, h.clientId, ["account:vaults"]);
+      expect(isCoveredByGrant(h.db, h.userId, h.clientId, ["account:self:vaults"])).toBe(true);
+      expect(isCoveredByGrant(h.db, h.userId, h.clientId, ["account:vaults"])).toBe(true);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("isCoveredByGrantForClientName: same account:vaults equivalence", async () => {
+    const h = await harness();
+    try {
+      const named = registerClient(h.db, {
+        redirectUris: ["https://app.example/cb"],
+        clientName: "mcp-reconnect",
+      });
+      recordGrant(h.db, h.userId, named.client.clientId, ["account:self:vaults"]);
+      expect(isCoveredByGrantForClientName(h.db, h.userId, "mcp-reconnect", ["account:vaults"])).toBe(
+        true,
+      );
+      expect(
+        isCoveredByGrantForClientName(h.db, h.userId, "mcp-reconnect", [
+          "account:vaults",
+          "vault:work:read",
+        ]),
+      ).toBe(false);
+      expect(revokeGrant(h.db, h.userId, named.client.clientId)).toBe(true);
+      recordGrant(h.db, h.userId, named.client.clientId, ["account:vaults"]);
+      expect(
+        isCoveredByGrantForClientName(h.db, h.userId, "mcp-reconnect", ["account:self:vaults"]),
+      ).toBe(true);
+    } finally {
+      h.cleanup();
+    }
+  });
+
   test("isCoveredByGrant: empty request returns false (no auto-approve for empty)", async () => {
     const h = await harness();
     try {

@@ -15,6 +15,10 @@
  */
 import type { Database } from "bun:sqlite";
 import { validateAccessToken } from "./jwt-sign.ts";
+import {
+  authenticateNostrRequest,
+  isNostrAuthorization,
+} from "./nostr-http-auth.ts";
 
 export interface AdminAuthContext {
   /** JWT `sub` — the hub user id. */
@@ -92,12 +96,55 @@ export function extractBearerToken(req: Request): string {
  * hub minted ever reach the `iss` check; never pass a raw request Host, only a
  * `buildHubBoundOrigins`-derived set.
  */
+export function nostrAutoProvisionEnabled(): boolean {
+  const v = process.env.PARACHUTE_NOSTR_AUTO_PROVISION;
+  return v === "1" || v === "true" || v === "yes";
+}
+
 export async function requireScope(
   db: Database,
   req: Request,
   requiredScope: string,
   expectedIssuer: string | readonly string[],
 ): Promise<AdminAuthContext> {
+  if (isNostrAuthorization(req)) {
+    let body = new Uint8Array();
+    if (req.method !== "GET" && req.method !== "HEAD") {
+      body = new Uint8Array(await req.clone().arrayBuffer());
+    }
+    try {
+      const principal = await authenticateNostrRequest(db, req, {
+        autoProvision: nostrAutoProvisionEnabled(),
+        body,
+      });
+      if (principal.isHubAdmin) {
+        return {
+          sub: principal.userId,
+          scopes: [requiredScope],
+          clientId: `nostr:${principal.pubkey}`,
+          audience: undefined,
+        };
+      }
+      if (!principal.scopes.includes(requiredScope)) {
+        throw new AdminAuthError(
+          403,
+          `token missing required scope: ${requiredScope}`,
+          requiredScope,
+        );
+      }
+      return {
+        sub: principal.userId,
+        scopes: principal.scopes,
+        clientId: `nostr:${principal.pubkey}`,
+        audience: undefined,
+      };
+    } catch (err) {
+      if (err instanceof AdminAuthError) throw err;
+      const msg = err instanceof Error ? err.message : String(err);
+      throw new AdminAuthError(401, msg);
+    }
+  }
+
   const token = extractBearerToken(req);
 
   let validated: Awaited<ReturnType<typeof validateAccessToken>>;

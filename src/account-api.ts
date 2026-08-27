@@ -253,14 +253,20 @@ export async function requireAnyScope(
 
 /** Scope set for admin-only `/account/*` mutations (delete / mint). */
 export const ACCOUNT_MUTATION_SCOPES = ADMIN_SCOPES;
+/** Scope set for a `/account/*` WRITE mutation (create, set-caps). */
+export const ACCOUNT_WRITE_SCOPES = WRITE_SCOPES;
 /** Scope set for a `/account/*` read (list / get-caps / bootstrap). */
 export const ACCOUNT_READ_SCOPES = READ_SCOPES;
 
-interface VaultMeta {
+export interface AccountVaultMeta {
   name: string;
   url: string;
   version: string;
+  /** Loopback port from services.json; used by account-MCP fan-out. */
+  port?: number;
 }
+
+type VaultMeta = AccountVaultMeta;
 
 /**
  * Enumerate every servable vault from services.json with its canonical URL +
@@ -269,7 +275,7 @@ interface VaultMeta {
  * name derivation, same `new URL(path, base)` URL build as `buildEntry`) so the
  * account list agrees with the well-known vaults[] fan-out and the create path.
  */
-function listVaultsWithMeta(manifestPath: string, issuer: string): VaultMeta[] {
+export function listVaultsWithMeta(manifestPath: string, issuer: string): VaultMeta[] {
   const base = issuer.replace(/\/$/, "");
   const out: VaultMeta[] = [];
   let manifest: ReturnType<typeof readManifestLenient>;
@@ -284,7 +290,7 @@ function listVaultsWithMeta(manifestPath: string, issuer: string): VaultMeta[] {
     for (const path of svc.paths) {
       const name = vaultInstanceNameFor(svc.name, path);
       const url = new URL(path, `${base}/`).toString();
-      out.push({ name, url, version: svc.version });
+      out.push({ name, url, version: svc.version, port: svc.port });
     }
   }
   return out;
@@ -315,6 +321,10 @@ function servicesBlock(meta: VaultMeta): Record<string, { url: string; version: 
  * public invite exists (`activePublicSignupPath`, invites.ts) — an operator-
  * shared link is otherwise the only way in, so the app must not render a
  * "create account" affordance when there is nowhere for it to go.
+ *
+ * `account_mcp_endpoint` is the hub's account-level MCP door (`/account/mcp`).
+ * Optional in door-contract; set once the surface exists so a client can
+ * discover it from the descriptor instead of guessing the path.
  */
 export function handleAccountCapabilities(
   req: Request,
@@ -337,6 +347,7 @@ export function handleAccountCapabilities(
     issuer,
     door: "hub",
     account_endpoint: `${issuer}/account`,
+    account_mcp_endpoint: `${issuer}/account/mcp`,
     auth: { methods: ["password"], signin_path: "/login" },
     ...(signupPath ? { signup_path: signupPath } : {}),
     vault_url_template: `${issuer}/vault/{name}`,
