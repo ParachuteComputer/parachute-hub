@@ -6,9 +6,10 @@
  * tools (list-vaults, create-vault, query-notes), same "no vault_token in
  * model context" rule. Coverage is hub-shaped, not D1-ownership-shaped:
  *
- *   - Bearer `account:self:*` / `parachute:host:admin` is the box (operator ≡
- *     account ≡ box). Coverage is every services.json vault; create follows
- *     the REST write-scope ladder.
+ *   - Bearer is the cloud-shaped connection grant: `account:self:vaults`
+ *     (legacy blanket / narrowed) or composed `account:self:vaults:*:<verb>`,
+ *     plus `parachute:host:admin` as the operator bypass. REST `account:self:read`
+ *     does NOT open this door — that scope lists vaults and usage, not notes.
  *   - NIP-98 is the Buzz path. First-admin → every vault + create. Anyone
  *     else → `user_vaults` ∩ services.json (fail-closed; read verb required).
  *     Auto-provisioned key-only users have no rows → empty list, no create.
@@ -19,10 +20,19 @@
  * failure.
  */
 import type { Database } from "bun:sqlite";
-import { ACCOUNT_WRITE_SCOPES, type AccountVaultMeta, listVaultsWithMeta } from "./account-api.ts";
-import { provisionVault } from "./admin-vaults.ts";
+import {
+  COMPOSED_VERB_RANK,
+  type ComposedVaultVerb,
+  accountVaultsGrant,
+  composedAccountGrant,
+} from "@openparachute/door-contract";
+import { type AccountVaultMeta, listVaultsWithMeta } from "./account-api.ts";
+import { HOST_ADMIN_SCOPE, provisionVault } from "./admin-vaults.ts";
 import { signAccessToken } from "./jwt-sign.ts";
 import { getUserById, isFirstAdmin, vaultVerbsForUserVault } from "./users.ts";
+
+/** Hub account sentinel — account ≡ box. */
+export const HUB_ACCOUNT_ID = "self";
 
 /** Per-vault timeout for the query-notes fan-out. */
 export const FANOUT_TIMEOUT_MS = 10_000;
@@ -35,6 +45,12 @@ const FANOUT_TOKEN_TTL_SECONDS = 60;
 
 export type AccountMcpAuthKind = "bearer" | "nostr";
 
+export interface AccountConnectionGrant {
+  wildcard: ComposedVaultVerb | null;
+  vaults: Map<string, ComposedVaultVerb>;
+  create: boolean;
+}
+
 export interface AccountMcpPrincipal {
   userId: string;
   scopes: string[];
@@ -42,6 +58,8 @@ export interface AccountMcpPrincipal {
   clientId: string | undefined;
   /** First-admin, or a Bearer that already carries host:admin. */
   isHubAdmin: boolean;
+  /** Present on Bearer (null only for NIP-98). host:admin is a synthetic wildcard. */
+  grant: AccountConnectionGrant | null;
 }
 
 export class AccountToolError extends Error {
@@ -84,41 +102,97 @@ export interface AccountMcpTool {
   execute(args: Record<string, unknown>, ctx: AccountToolContext): Promise<unknown>;
 }
 
-function hasWriteScope(scopes: readonly string[]): boolean {
-  return ACCOUNT_WRITE_SCOPES.some((s) => scopes.includes(s));
+function raiseVaultVerb(
+  map: Map<string, ComposedVaultVerb>,
+  name: string,
+  verb: ComposedVaultVerb,
+): void {
+  const cur = map.get(name);
+  if (!cur || COMPOSED_VERB_RANK[verb] > COMPOSED_VERB_RANK[cur]) map.set(name, verb);
+}
+
+/**
+ * Unify legacy Wave A `account:<id>:vaults` with the composed grammar.
+ * Returns null when the set confers nothing that opens this door.
+ */
+export function buildAccountConnectionGrant(
+  scopes: readonly string[],
+  accountId: string = HUB_ACCOUNT_ID,
+): AccountConnectionGrant | null {
+  const composed = composedAccountGrant(scopes, accountId);
+  let wildcard = composed.wildcard;
+  const vaults = new Map(composed.vaults);
+  let create = composed.create;
+  const legacy = accountVaultsGrant(scopes, accountId);
+  if (legacy !== null) {
+    create = true;
+    if ("blanket" in legacy) {
+      if (wildcard === null) wildcard = "read";
+    } else {
+      for (const name of legacy.vaults) raiseVaultVerb(vaults, name, "read");
+    }
+  }
+  if (scopes.includes(HOST_ADMIN_SCOPE)) {
+    return { wildcard: "admin", vaults, create: true };
+  }
+  const opensDoor = wildcard !== null || vaults.size > 0 || create;
+  return opensDoor ? { wildcard, vaults, create } : null;
 }
 
 function canCreate(principal: AccountMcpPrincipal): boolean {
   if (principal.authKind === "nostr") return principal.isHubAdmin;
-  return hasWriteScope(principal.scopes);
+  return principal.grant?.create === true;
+}
+
+function assignedReadable(
+  db: Database,
+  userId: string,
+  installed: AccountVaultMeta[],
+): AccountVaultMeta[] {
+  const user = getUserById(db, userId);
+  const assigned = new Set(user?.assignedVaults ?? []);
+  return installed.filter((v) => {
+    if (!assigned.has(v.name)) return false;
+    const verbs = vaultVerbsForUserVault(db, userId, v.name);
+    return verbs?.includes("read");
+  });
 }
 
 /**
- * Live coverage for this principal. Bearer account-door tokens see the box
- * (every services.json vault). NIP-98 sees assignment: first-admin is
- * unrestricted; everyone else is `user_vaults` intersected with currently
- * installed vaults. A name for a since-removed vault silently drops.
+ * Live coverage. NIP-98 is assignment. Bearer is the connection grant ∩
+ * currently installed vaults (and ∩ assignment when the subject is not
+ * first-admin). host:admin is unrestricted.
  */
 export function resolveCoverage(
   db: Database,
   principal: AccountMcpPrincipal,
   installed: AccountVaultMeta[],
 ): Coverage {
-  const create = canCreate(principal);
-  if (
-    principal.authKind === "bearer" ||
-    principal.isHubAdmin ||
-    isFirstAdmin(db, principal.userId)
-  ) {
-    return { covered: "all", vaults: installed, names: installed.map((v) => v.name), create };
+  if (principal.authKind === "nostr") {
+    if (principal.isHubAdmin || isFirstAdmin(db, principal.userId)) {
+      return {
+        covered: "all",
+        vaults: installed,
+        names: installed.map((v) => v.name),
+        create: true,
+      };
+    }
+    const vaults = assignedReadable(db, principal.userId, installed);
+    return { covered: "listed", vaults, names: vaults.map((v) => v.name), create: false };
   }
-  const user = getUserById(db, principal.userId);
-  const assigned = new Set(user?.assignedVaults ?? []);
-  const vaults = installed.filter((v) => {
-    if (!assigned.has(v.name)) return false;
-    const verbs = vaultVerbsForUserVault(db, principal.userId, v.name);
-    return verbs?.includes("read");
-  });
+
+  const grant = principal.grant;
+  const create = grant?.create === true;
+  const owned =
+    principal.isHubAdmin || isFirstAdmin(db, principal.userId)
+      ? installed
+      : assignedReadable(db, principal.userId, installed);
+
+  if (!grant || grant.wildcard !== null) {
+    const covered = grant?.wildcard !== null || principal.isHubAdmin ? "all" : "listed";
+    return { covered, vaults: owned, names: owned.map((v) => v.name), create };
+  }
+  const vaults = owned.filter((v) => grant.vaults.has(v.name));
   return { covered: "listed", vaults, names: vaults.map((v) => v.name), create };
 }
 
@@ -228,13 +302,17 @@ async function queryOneVault(
     sub: ctx.principal.userId,
     scopes: [`vault:${vault.name}:read`],
     audience: `vault.${vault.name}`,
-    clientId: ctx.principal.clientId ?? ACCOUNT_MCP_CLIENT_ID,
+    clientId: ACCOUNT_MCP_CLIENT_ID,
     issuer: ctx.issuer,
     ttlSeconds: FANOUT_TOKEN_TTL_SECONDS,
     vaultScope: [vault.name],
     ...(ctx.now !== undefined ? { now: ctx.now } : {}),
   });
-  const url = `${vault.url.replace(/\/$/, "")}/api/notes${qs ? `?${qs}` : ""}`;
+  const origin =
+    typeof vault.port === "number" && vault.port > 0
+      ? `http://127.0.0.1:${vault.port}`
+      : vault.url.replace(/\/vault\/[^/]+\/?$/, "");
+  const url = `${origin.replace(/\/$/, "")}/vault/${vault.name}/api/notes${qs ? `?${qs}` : ""}`;
   const res = await fetchImpl(url, {
     headers: { authorization: `Bearer ${minted.token}`, accept: "application/json" },
     signal: AbortSignal.timeout(FANOUT_TIMEOUT_MS),

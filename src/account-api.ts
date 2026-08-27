@@ -262,6 +262,8 @@ export interface AccountVaultMeta {
   name: string;
   url: string;
   version: string;
+  /** Loopback port from services.json; used by account-MCP fan-out. */
+  port?: number;
 }
 
 type VaultMeta = AccountVaultMeta;
@@ -288,7 +290,7 @@ export function listVaultsWithMeta(manifestPath: string, issuer: string): VaultM
     for (const path of svc.paths) {
       const name = vaultInstanceNameFor(svc.name, path);
       const url = new URL(path, `${base}/`).toString();
-      out.push({ name, url, version: svc.version });
+      out.push({ name, url, version: svc.version, port: svc.port });
     }
   }
   return out;

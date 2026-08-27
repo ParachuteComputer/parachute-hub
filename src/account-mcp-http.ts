@@ -10,20 +10,23 @@
  * Auth runs BEFORE any JSON-RPC:
  *   - `Authorization: Nostr <event>` → NIP-98 (hub#882). Any resolved hub
  *     user opens the door; coverage is assignment, not account:self:*.
- *   - `Authorization: Bearer <jwt>` → `account:self:*` or
- *     `parachute:host:admin` (the REST account-door ladder). The box, not a
- *     friend vault token.
+ *   - `Authorization: Bearer <jwt>` → an account-vaults connection grant
+ *     (`account:self:vaults` / composed forms, `aud=account`) or
+ *     `parachute:host:admin` (operator bypass). REST `account:self:read`
+ *     does not open this door.
  *
  * Cookie sessions never open this door. Wildcard CORS is correct: nothing
  * here is ambient-auth.
  */
 import type { Database } from "bun:sqlite";
-import { ACCOUNT_READ_SCOPES, type AccountApiDeps } from "./account-api.ts";
+import { ACCOUNT_VAULTS_UNNARROWED } from "@openparachute/door-contract";
+import type { AccountApiDeps } from "./account-api.ts";
 import {
   ACCOUNT_MCP_TOOLS,
   type AccountMcpPrincipal,
   type AccountToolContext,
   AccountToolError,
+  buildAccountConnectionGrant,
 } from "./account-mcp.ts";
 import {
   AdminAuthError,
@@ -40,7 +43,6 @@ import {
   authenticateNostrRequest,
   isNostrAuthorization,
 } from "./nostr-http-auth.ts";
-import { ACCOUNT_SELF_READ_SCOPE } from "./scope-explanations.ts";
 import { isFirstAdmin } from "./users.ts";
 
 const LATEST_PROTOCOL_VERSION = "2025-11-25";
@@ -134,7 +136,7 @@ export function accountMcpProtectedResource(issuer: string): Response {
       JSON.stringify({
         resource: `${origin}/account/mcp`,
         authorization_servers: [origin],
-        scopes_supported: [ACCOUNT_SELF_READ_SCOPE],
+        scopes_supported: [ACCOUNT_VAULTS_UNNARROWED],
         bearer_methods_supported: ["header"],
         resource_documentation: "https://parachute.computer",
       }),
@@ -194,12 +196,20 @@ async function authenticateBearer(
   const scopeClaim = (validated.payload as { scope?: unknown }).scope;
   const scopes =
     typeof scopeClaim === "string" ? scopeClaim.split(/\s+/).filter((s) => s.length > 0) : [];
-  if (!ACCOUNT_READ_SCOPES.some((s) => scopes.includes(s))) {
+  const grant = buildAccountConnectionGrant(scopes);
+  if (grant === null) {
     throw new AdminAuthError(
       403,
-      `token missing one of required scopes: ${ACCOUNT_READ_SCOPES.join(", ")}`,
-      ACCOUNT_SELF_READ_SCOPE,
+      "the account MCP requires an account-vaults connection scope (account:vaults) or parachute:host:admin",
+      ACCOUNT_VAULTS_UNNARROWED,
     );
+  }
+  const hostAdmin = scopes.includes(HOST_ADMIN_SCOPE);
+  if (!hostAdmin) {
+    const aud = typeof validated.payload.aud === "string" ? validated.payload.aud : undefined;
+    if (aud !== "account") {
+      throw new AdminAuthError(401, "token audience must be `account`");
+    }
   }
   const clientIdRaw = (validated.payload as { client_id?: unknown }).client_id;
   const clientId = typeof clientIdRaw === "string" ? clientIdRaw : undefined;
@@ -208,7 +218,8 @@ async function authenticateBearer(
     scopes,
     authKind: "bearer",
     clientId,
-    isHubAdmin: isFirstAdmin(db, sub) || scopes.includes(HOST_ADMIN_SCOPE),
+    isHubAdmin: isFirstAdmin(db, sub) || hostAdmin,
+    grant,
   };
 }
 
@@ -231,6 +242,7 @@ async function authenticate(
       authKind: "nostr",
       clientId: `nostr:${principal.pubkey}`,
       isHubAdmin: principal.isHubAdmin,
+      grant: null,
     };
   }
   return authenticateBearer(db, req, deps.knownIssuers ?? [deps.issuer]);

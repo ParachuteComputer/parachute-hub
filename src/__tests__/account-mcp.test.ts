@@ -35,9 +35,10 @@ const ISSUER = "http://127.0.0.1:1939";
 const MCP_URL = `${ISSUER}/account/mcp`;
 const BOTH_ACCEPT = "application/json, text/event-stream";
 const HOST_ADMIN_SCOPE = "parachute:host:admin";
-const ACCOUNT_ADMIN_SCOPE = "account:self:admin";
 const ACCOUNT_WRITE_SCOPE = "account:self:write";
 const ACCOUNT_READ_SCOPE = "account:self:read";
+const ACCOUNT_VAULTS_SCOPE = "account:self:vaults";
+const ACCOUNT_VAULTS_UNNARROWED = "account:vaults";
 
 const hexToBytes = (hex: string): Uint8Array => Uint8Array.from(Buffer.from(hex, "hex"));
 const bytesToHex = (bytes: Uint8Array): string => Buffer.from(bytes).toString("hex");
@@ -232,6 +233,7 @@ function bearerReq(token: string | null, body: unknown, init: RequestInit = {}):
 function parseTool(rpcBody: { result?: { content?: Array<{ text?: string }> } }): unknown {
   const text = rpcBody.result?.content?.[0]?.text;
   if (typeof text !== "string") throw new Error("missing tool text");
+  expect(text).not.toMatch(/vault_token|"token":|eyJ/);
   return JSON.parse(text);
 }
 
@@ -253,7 +255,7 @@ describe("account MCP — descriptor + PRM", () => {
     }
   });
 
-  test("PRM names the account-MCP resource and account:self:read", async () => {
+  test("PRM names the account-MCP resource and account:vaults", async () => {
     const res = accountMcpProtectedResource(ISSUER);
     expect(res.status).toBe(200);
     const body = (await res.json()) as {
@@ -263,7 +265,7 @@ describe("account MCP — descriptor + PRM", () => {
     };
     expect(body.resource).toBe(MCP_URL);
     expect(body.authorization_servers).toEqual([ISSUER]);
-    expect(body.scopes_supported).toEqual([ACCOUNT_READ_SCOPE]);
+    expect(body.scopes_supported).toEqual([ACCOUNT_VAULTS_UNNARROWED]);
   });
 });
 
@@ -282,7 +284,7 @@ describe("account MCP — transport", () => {
     }
   });
 
-  test("403 Bearer without account:self:* or host:admin", async () => {
+  test("403 Bearer without account-vaults or host:admin", async () => {
     const h = await makeHarness();
     try {
       const token = await bearer(h, ["vault:beta:read"]);
@@ -291,7 +293,38 @@ describe("account MCP — transport", () => {
       const body = (await res.json()) as { error: string };
       expect(body.error).toBe("insufficient_scope");
       const challenge = res.headers.get("www-authenticate") ?? "";
-      expect(challenge).toContain(`scope="${ACCOUNT_READ_SCOPE}"`);
+      expect(challenge).toContain(`scope="${ACCOUNT_VAULTS_UNNARROWED}"`);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("403 Bearer account:self:read — REST read is not an MCP credential", async () => {
+    const h = await makeHarness();
+    try {
+      const token = await bearer(h, [ACCOUNT_READ_SCOPE]);
+      const res = await handleAccountMcp(bearerReq(token, rpc("initialize")), mcpDeps(h));
+      expect(res.status).toBe(403);
+      const challenge = res.headers.get("www-authenticate") ?? "";
+      expect(challenge).toContain(`scope="${ACCOUNT_VAULTS_UNNARROWED}"`);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("401 Bearer account-vaults with a vault audience", async () => {
+    const h = await makeHarness();
+    try {
+      const minted = await signAccessToken(h.db, {
+        sub: h.ownerId,
+        scopes: [ACCOUNT_VAULTS_SCOPE],
+        audience: "vault.beta",
+        clientId: "parachute-hub-spa",
+        issuer: ISSUER,
+        ttlSeconds: 600,
+      });
+      const res = await handleAccountMcp(bearerReq(minted.token, rpc("initialize")), mcpDeps(h));
+      expect(res.status).toBe(401);
     } finally {
       h.cleanup();
     }
@@ -300,7 +333,7 @@ describe("account MCP — transport", () => {
   test("406 unless Accept lists both json and event-stream", async () => {
     const h = await makeHarness();
     try {
-      const token = await bearer(h, [ACCOUNT_READ_SCOPE]);
+      const token = await bearer(h, [ACCOUNT_VAULTS_SCOPE]);
       const res = await handleAccountMcp(
         bearerReq(token, rpc("ping"), { headers: { accept: "application/json" } }),
         mcpDeps(h),
@@ -314,7 +347,7 @@ describe("account MCP — transport", () => {
   test("415 unless Content-Type is json", async () => {
     const h = await makeHarness();
     try {
-      const token = await bearer(h, [ACCOUNT_READ_SCOPE]);
+      const token = await bearer(h, [ACCOUNT_VAULTS_SCOPE]);
       const res = await handleAccountMcp(
         bearerReq(token, rpc("ping"), { headers: { "content-type": "text/plain" } }),
         mcpDeps(h),
@@ -328,7 +361,7 @@ describe("account MCP — transport", () => {
   test("GET is 405 after auth; DELETE is 200", async () => {
     const h = await makeHarness();
     try {
-      const token = await bearer(h, [ACCOUNT_READ_SCOPE]);
+      const token = await bearer(h, [ACCOUNT_VAULTS_SCOPE]);
       const get = await handleAccountMcp(
         new Request(MCP_URL, {
           method: "GET",
@@ -353,7 +386,7 @@ describe("account MCP — transport", () => {
   test("notification-only POST is 202", async () => {
     const h = await makeHarness();
     try {
-      const token = await bearer(h, [ACCOUNT_READ_SCOPE]);
+      const token = await bearer(h, [ACCOUNT_VAULTS_SCOPE]);
       const res = await handleAccountMcp(
         bearerReq(token, { jsonrpc: "2.0", method: "notifications/initialized" }),
         mcpDeps(h),
@@ -377,10 +410,10 @@ describe("account MCP — transport", () => {
 });
 
 describe("account MCP — initialize + tools", () => {
-  test("Bearer account:self:read initializes and lists the three tools", async () => {
+  test("Bearer account:self:vaults initializes and lists the three tools", async () => {
     const h = await makeHarness();
     try {
-      const token = await bearer(h, [ACCOUNT_READ_SCOPE]);
+      const token = await bearer(h, [ACCOUNT_VAULTS_SCOPE]);
       const init = await handleAccountMcp(
         bearerReq(token, rpc("initialize", { protocolVersion: "2025-11-25" })),
         mcpDeps(h),
@@ -563,10 +596,10 @@ describe("account MCP — create-vault", () => {
     }
   });
 
-  test("Bearer account:self:write can create; still no token in the tool result", async () => {
+  test("Bearer account:self:vaults can create; still no token in the tool result", async () => {
     const h = await makeHarness(["default"]);
     try {
-      const token = await bearer(h, [ACCOUNT_WRITE_SCOPE]);
+      const token = await bearer(h, [ACCOUNT_VAULTS_SCOPE]);
       const runCommand = async () => {
         upsertService(
           {
@@ -597,7 +630,7 @@ describe("account MCP — create-vault", () => {
   test("existing name is vault_taken", async () => {
     const h = await makeHarness(["work"]);
     try {
-      const token = await bearer(h, [ACCOUNT_ADMIN_SCOPE]);
+      const token = await bearer(h, [ACCOUNT_VAULTS_SCOPE]);
       const res = await handleAccountMcp(
         bearerReq(token, rpc("tools/call", { name: "create-vault", arguments: { name: "work" } })),
         mcpDeps(h),
@@ -715,6 +748,164 @@ describe("account MCP — NIP-98 bind", () => {
         mcpDeps(h),
       );
       expect(res.status).toBe(401);
+    } finally {
+      h.cleanup();
+    }
+  });
+});
+
+describe("account MCP — extra pins", () => {
+  test("ping returns {}", async () => {
+    const h = await makeHarness();
+    try {
+      const token = await bearer(h, [ACCOUNT_VAULTS_SCOPE]);
+      const res = await handleAccountMcp(bearerReq(token, rpc("ping")), mcpDeps(h));
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as { result: unknown };
+      expect(body.result).toEqual({});
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("invalid JSON is 400 parse error", async () => {
+    const h = await makeHarness();
+    try {
+      const token = await bearer(h, [ACCOUNT_VAULTS_SCOPE]);
+      const res = await handleAccountMcp(
+        new Request(MCP_URL, {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${token}`,
+            accept: BOTH_ACCEPT,
+            "content-type": "application/json",
+          },
+          body: "{not json",
+        }),
+        mcpDeps(h),
+      );
+      expect(res.status).toBe(400);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("Bearer account:self:write cannot open the door", async () => {
+    const h = await makeHarness();
+    try {
+      const token = await bearer(h, [ACCOUNT_WRITE_SCOPE]);
+      const res = await handleAccountMcp(bearerReq(token, rpc("initialize")), mcpDeps(h));
+      expect(res.status).toBe(403);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("Bearer narrowed account:self:vaults:beta lists only beta", async () => {
+    const h = await makeHarness();
+    try {
+      const token = await bearer(h, ["account:self:vaults:beta"]);
+      const res = await handleAccountMcp(
+        bearerReq(token, rpc("tools/call", { name: "list-vaults", arguments: {} })),
+        mcpDeps(h),
+      );
+      const payload = parseTool(
+        (await res.json()) as { result: { content: Array<{ text: string }> } },
+      ) as { covered: string; vaults: Array<{ name: string }> };
+      expect(payload.covered).toBe("listed");
+      expect(payload.vaults.map((v) => v.name)).toEqual(["beta"]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("NIP-98 read-role still lists and queries the assigned vault", async () => {
+    const h = await makeHarness();
+    const readerSecret = hexToBytes("44".repeat(32));
+    const readerPub = bytesToHex(schnorr.getPublicKey(readerSecret));
+    try {
+      const reader = await createUser(h.db, "reader", "correct-horse-battery-staple", {
+        allowMulti: true,
+        passwordChanged: true,
+        assignedVaults: ["beta"],
+        role: "read",
+      });
+      bindPubkeyFromHttpAuth(h.db, {
+        userId: reader.id,
+        pubkey: readerPub,
+        proofEvent: "{}",
+        proofEventId: "c".repeat(64),
+        label: "test",
+        now: new Date(),
+      });
+      const listed = await handleAccountMcp(
+        nostrReq(readerSecret, rpc("tools/call", { name: "list-vaults", arguments: {} })),
+        mcpDeps(h),
+      );
+      const payload = parseTool(
+        (await listed.json()) as { result: { content: Array<{ text: string }> } },
+      ) as { vaults: Array<{ name: string }> };
+      expect(payload.vaults.map((v) => v.name)).toEqual(["beta"]);
+      const fetchImpl = async () => Response.json([{ id: "n-beta" }], { status: 200 });
+      const queried = await handleAccountMcp(
+        nostrReq(
+          readerSecret,
+          rpc("tools/call", { name: "query-notes", arguments: { vault: "beta" } }),
+        ),
+        mcpDeps(h, { fetchImpl }),
+      );
+      expect(queried.status).toBe(200);
+    } finally {
+      h.cleanup();
+    }
+  });
+});
+
+describe("account MCP — hubFetch wiring", () => {
+  test("unauthed POST is 401 JSON with PRM challenge, not HTML", async () => {
+    const h = await makeHarness();
+    try {
+      const { hubFetch } = await import("../hub-server.ts");
+      const handler = hubFetch(h.dir, {
+        getDb: () => h.db,
+        manifestPath: h.manifestPath,
+        issuer: ISSUER,
+      });
+      const res = await handler(
+        new Request(MCP_URL, {
+          method: "POST",
+          headers: { accept: BOTH_ACCEPT, "content-type": "application/json" },
+          body: JSON.stringify(rpc("initialize")),
+        }),
+      );
+      expect(res.status).toBe(401);
+      expect(res.headers.get("content-type") ?? "").toContain("json");
+      expect(res.headers.get("www-authenticate") ?? "").toContain(
+        "/.well-known/oauth-protected-resource/account/mcp",
+      );
+      const text = await res.text();
+      expect(text.toLowerCase()).not.toContain("<html");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("GET PRM is public and advertises account:vaults", async () => {
+    const h = await makeHarness();
+    try {
+      const { hubFetch } = await import("../hub-server.ts");
+      const handler = hubFetch(h.dir, {
+        getDb: () => h.db,
+        manifestPath: h.manifestPath,
+        issuer: ISSUER,
+      });
+      const res = await handler(
+        new Request(`${ISSUER}/.well-known/oauth-protected-resource/account/mcp`),
+      );
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as { scopes_supported: string[]; resource: string };
+      expect(body.resource).toBe(MCP_URL);
+      expect(body.scopes_supported).toEqual([ACCOUNT_VAULTS_UNNARROWED]);
     } finally {
       h.cleanup();
     }
