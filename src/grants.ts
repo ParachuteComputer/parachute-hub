@@ -26,7 +26,32 @@
  */
 
 import type { Database } from "bun:sqlite";
+import { ACCOUNT_VAULTS_UNNARROWED, accountVaultsScope } from "@openparachute/door-contract";
 import { vaultScopeName } from "./scope-explanations.ts";
+
+const HUB_ACCOUNT_VAULTS_BOUND = accountVaultsScope("self");
+
+/**
+ * `account:vaults` (PRM request form) and `account:self:vaults` (consent-bound
+ * mint form) are the same grant. Skip-consent used to exact-match, so an MCP
+ * client that re-requests the advertised un-narrowed string after a bound
+ * mint would re-consent every time (hub#883 review nit).
+ */
+function accountVaultsEquivalents(scope: string): readonly string[] {
+  if (scope === ACCOUNT_VAULTS_UNNARROWED) return [scope, HUB_ACCOUNT_VAULTS_BOUND];
+  if (scope === HUB_ACCOUNT_VAULTS_BOUND) return [scope, ACCOUNT_VAULTS_UNNARROWED];
+  return [scope];
+}
+
+function requestedCoveredByGranted(
+  granted: ReadonlySet<string>,
+  requested: readonly string[],
+): boolean {
+  for (const s of requested) {
+    if (!accountVaultsEquivalents(s).some((eq) => granted.has(eq))) return false;
+  }
+  return true;
+}
 
 export interface Grant {
   userId: string;
@@ -112,10 +137,7 @@ export function isCoveredByGrant(
   const grant = findGrant(db, userId, clientId);
   if (!grant) return false;
   const granted = new Set(grant.scopes);
-  for (const s of requestedScopes) {
-    if (!granted.has(s)) return false;
-  }
-  return true;
+  return requestedCoveredByGranted(granted, requestedScopes);
 }
 
 /**
@@ -183,10 +205,7 @@ export function isCoveredByGrantForClientName(
   const grant = findGrantByClientName(db, userId, clientName);
   if (!grant) return false;
   const granted = new Set(grant.scopes);
-  for (const s of requestedScopes) {
-    if (!granted.has(s)) return false;
-  }
-  return true;
+  return requestedCoveredByGranted(granted, requestedScopes);
 }
 
 const VAULT_SCOPE_PREFIX_RE = /^vault:([^:]+):/;
