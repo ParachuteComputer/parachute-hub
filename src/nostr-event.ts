@@ -52,9 +52,11 @@ import { schnorr } from "@noble/curves/secp256k1.js";
  * tags rather than inventing a hub-private kind, so a generic NIP-98 signer
  * can produce our event with one extra tag.
  *
- * We do NOT implement NIP-98 as a request-authentication scheme: NIP-98's own
- * replay defense is a ±60s `created_at` window, which is weak. The hub issues
- * a single-use challenge instead and requires it in a `challenge` tag.
+ * Linkage (cookie ceremony) still uses a single-use `challenge` tag because
+ * NIP-98's ±60s `created_at` window is too weak to bind a durable proof.
+ * Request authentication is a separate path: `nostr-http-auth.ts` verifies
+ * kind 27235 against this request's `u`/`method`/`payload` and rejects a
+ * replayed event id for twice the clock-skew window.
  */
 export const NOSTR_AUTH_KIND = 27235;
 
