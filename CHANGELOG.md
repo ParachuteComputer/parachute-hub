@@ -6,6 +6,29 @@ All notable changes to `@openparachute/hub` are documented here. The format foll
 >
 > This backfill covers the 0.6.x line only. Two pre-existing gaps remain undocumented and are **not** addressed here: the `0.5.13` stable itself (the file's newest entry is `0.5.13-rc.48`, never the stable) and the entire `0.5.14-rc` chain (rc.1–rc.21 on npm), which never promoted to a `0.5.14` stable — its work folded forward into 0.6.0.
 
+## [0.7.18-rc.2] - 2026-08-27
+
+**Key-as-account: NIP-98 request auth and the account-MCP door.** Two PRs
+on `next` after 0.7.18-rc.1. Version bump only; no new code in this
+commit. Merging this to `next` does not publish. The following next→main
+PR publishes `@rc`.
+
+- **NIP-98 request auth (#882).** `Authorization: Nostr <base64url event>`
+  (kind 27235) authenticates as a hub user. Linked pubkey maps to that
+  user. Opt-in auto-provision (`PARACHUTE_NOSTR_AUTO_PROVISION`, default
+  off) creates a key-only user that cannot become first-admin. Cookie
+  first-link is unchanged.
+
+- **Account-MCP door (#883).** `POST /account/mcp` is list-vaults /
+  create-vault / query-notes for that principal. NIP-98 coverage is
+  assignment. Bearer is the `account:vaults` connection grant (consent
+  binds to `account:self:vaults`, `aud=account`) or
+  `parachute:host:admin`. REST `account:self:read` does not open this
+  door. Descriptor advertises `account_mcp_endpoint`. No `vault_token` in
+  tool results.
+
+Leaves #880 and #881 open.
+
 ## [0.7.18-rc.1] - 2026-08-26
 
 **Person-mint principal is `users.id`; self-service Account tokens and pubkey
