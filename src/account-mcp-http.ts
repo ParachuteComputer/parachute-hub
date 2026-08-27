@@ -22,11 +22,11 @@ import type { Database } from "bun:sqlite";
 import { ACCOUNT_VAULTS_UNNARROWED } from "@openparachute/door-contract";
 import type { AccountApiDeps } from "./account-api.ts";
 import {
-  ACCOUNT_MCP_TOOLS,
   type AccountMcpPrincipal,
   type AccountToolContext,
   AccountToolError,
   buildAccountConnectionGrant,
+  toolsForPrincipal,
 } from "./account-mcp.ts";
 import {
   AdminAuthError,
@@ -255,7 +255,7 @@ async function handleToolCall(
 ): Promise<JsonRpcMessage> {
   const name = typeof params?.name === "string" ? params.name : "";
   const args = (params?.arguments ?? {}) as Record<string, unknown>;
-  const tool = ACCOUNT_MCP_TOOLS.find((t) => t.name === name);
+  const tool = toolsForPrincipal(ctx).find((t) => t.name === name);
   if (!tool) {
     return result(id, {
       content: [{ type: "text", text: `Unknown tool: ${name}` }],
@@ -278,9 +278,10 @@ function instructions(): string {
   return (
     "The Parachute hub account MCP — one connection across the vaults this key or token can use. " +
     "Use list-vaults to see them, create-vault to add one (hub owner / account write), " +
-    "and query-notes to search across them (omit `vault` to fan out, pass it to target one). " +
+    "query-notes to search across them (omit `vault` to fan out, pass it to target one), " +
+    "and create-note to write in one vault (`vault` is required). " +
     "grant-access / revoke-access / list-access give a Nostr pubkey a vault (role read|write) " +
-    "if you can admin that vault."
+    "if you can admin that vault. tools/list hides tools you cannot call."
   );
 }
 
@@ -302,7 +303,7 @@ async function handleOne(m: JsonRpcMessage, ctx: AccountToolContext): Promise<Js
       }
       case "tools/list":
         return result(id, {
-          tools: ACCOUNT_MCP_TOOLS.map((t) => ({
+          tools: toolsForPrincipal(ctx).map((t) => ({
             name: t.name,
             description: t.description,
             inputSchema: t.inputSchema,
