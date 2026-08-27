@@ -2041,3 +2041,191 @@ export async function changeAccountPassword(
   }
   if (!res.ok) throw new HttpError(res.status, await readError(res));
 }
+
+// ---------------------------------------------------------------------------
+// Self-service account tokens + pubkey linkage (hub#833 (b))
+//
+// Same cookie + CSRF posture as password/2FA above. Operator `/admin/tokens`
+// stays the registry; these helpers are "my tokens" and "my keys" for the
+// signed-in user. Identity is always `session.userId`.
+// ---------------------------------------------------------------------------
+
+export interface AccountTokenListing {
+  jti: string;
+  user_id: string;
+  subject: string | null;
+  client_id: string;
+  scopes: string[];
+  expires_at: string;
+  revoked_at: string | null;
+  created_at: string;
+  created_via: string;
+  subject_pubkey: string | null;
+}
+
+export interface AccountTokensPage {
+  tokens: AccountTokenListing[];
+  next_cursor: string | null;
+}
+
+export interface MintAccountTokenInput {
+  scope: string;
+  expires_in?: number;
+  label?: string;
+}
+
+export interface MintedAccountToken {
+  jti: string;
+  token: string;
+  expires_at: string;
+  scope: string;
+}
+
+export interface AccountPubkey {
+  pubkey: string;
+  label: string | null;
+  proof_event_id: string;
+  linked_at: string;
+  last_verified_at: string;
+}
+
+export interface PubkeyChallenge {
+  challenge: string;
+  expires_at: string;
+  event_template: {
+    kind: number;
+    content: string;
+    tags: string[][];
+  };
+}
+
+export interface SignedNostrEvent {
+  id: string;
+  pubkey: string;
+  created_at: number;
+  kind: number;
+  tags: string[][];
+  content: string;
+  sig: string;
+}
+
+export interface LinkedPubkeyResult extends AccountPubkey {
+  linked: true;
+  relinked: boolean;
+}
+
+async function getAccount(subpath: string): Promise<Response> {
+  return await fetch(`/api/account${subpath}`, {
+    method: "GET",
+    headers: { accept: "application/json" },
+    credentials: "same-origin",
+  });
+}
+
+/**
+ * GET /api/account/tokens — this user's tokens. Default is unrevoked.
+ * Cursor pagination: pass `cursor` from the previous page's `next_cursor`.
+ */
+export async function listAccountTokens(
+  opts: { revoked?: "true" | "false" | "all"; cursor?: string } = {},
+): Promise<AccountTokensPage> {
+  const params = new URLSearchParams();
+  if (opts.revoked) params.set("revoked", opts.revoked);
+  if (opts.cursor) params.set("cursor", opts.cursor);
+  const query = params.toString();
+  const res = await getAccount(query ? `/tokens?${query}` : "/tokens");
+  if (res.status === 401) return redirectToLoginAndHang<AccountTokensPage>();
+  if (!res.ok) throw new HttpError(res.status, await readError(res));
+  return (await res.json()) as AccountTokensPage;
+}
+
+/**
+ * POST /api/account/tokens — mint as the session user. JWT is shown once.
+ * Cannot mint `parachute:host:*` (that stays on the operator registry).
+ */
+export async function mintAccountToken(
+  csrf: string,
+  input: MintAccountTokenInput,
+): Promise<MintedAccountToken> {
+  const body: Record<string, unknown> = { scope: input.scope };
+  if (input.expires_in !== undefined) body.expires_in = input.expires_in;
+  if (input.label !== undefined) body.label = input.label;
+  const res = await postAccount("/tokens", csrf, body);
+  if (res.status === 401) return redirectToLoginAndHang<MintedAccountToken>();
+  if (!res.ok) throw new HttpError(res.status, await readError(res));
+  return (await res.json()) as MintedAccountToken;
+}
+
+/** POST /api/account/tokens/:jti/revoke — revoke own jti only. */
+export async function revokeAccountToken(csrf: string, jti: string): Promise<void> {
+  const res = await postAccount(`/tokens/${encodeURIComponent(jti)}/revoke`, csrf);
+  if (res.status === 401) {
+    await redirectToLoginAndHang<void>();
+    return;
+  }
+  if (!res.ok) throw new HttpError(res.status, await readError(res));
+}
+
+/** GET /api/account/pubkeys — the caller's linked Nostr keys. */
+export async function listAccountPubkeys(): Promise<AccountPubkey[]> {
+  const res = await getAccount("/pubkeys");
+  if (res.status === 401) return redirectToLoginAndHang<AccountPubkey[]>();
+  if (!res.ok) throw new HttpError(res.status, await readError(res));
+  const body = (await res.json()) as { pubkeys: AccountPubkey[] };
+  return body.pubkeys ?? [];
+}
+
+/** POST /api/account/pubkeys/challenge — mint a single-use event template. */
+export async function startPubkeyChallenge(csrf: string): Promise<PubkeyChallenge> {
+  const res = await postAccount("/pubkeys/challenge", csrf);
+  if (res.status === 401) return redirectToLoginAndHang<PubkeyChallenge>();
+  if (!res.ok) throw new HttpError(res.status, await readError(res));
+  return (await res.json()) as PubkeyChallenge;
+}
+
+/**
+ * POST /api/account/pubkeys/verify — present a signed NIP-01 event.
+ *
+ * First-link requires `password` (401 `password_required` if omitted). That
+ * 401 is NOT a gone session — surface it; only a message that isn't a
+ * step-up / proof failure bounces to login.
+ */
+export async function verifyPubkeyLink(
+  csrf: string,
+  opts: { event: SignedNostrEvent; label?: string; password?: string },
+): Promise<LinkedPubkeyResult> {
+  const body: Record<string, unknown> = { event: opts.event };
+  if (opts.label !== undefined) body.label = opts.label;
+  if (opts.password !== undefined) body.password = opts.password;
+  const res = await postAccount("/pubkeys/verify", csrf, body);
+  if (res.status === 401) {
+    // Session-gone vs first-link step-up / bad proof. Discriminate on the
+    // structured `error` code, not English in `error_description` — a copy
+    // tweak of password_required must not bounce the operator to /login.
+    const text = await res.text();
+    let code: string | undefined;
+    let message = text || "401 Unauthorized";
+    try {
+      const parsed = JSON.parse(text) as { error?: string; error_description?: string };
+      code = parsed.error;
+      message = parsed.error_description || parsed.error || message;
+    } catch {
+      // not JSON
+    }
+    if (code === "unauthenticated" || code === undefined) {
+      return redirectToLoginAndHang<LinkedPubkeyResult>();
+    }
+    throw new HttpError(401, message);
+  }
+  if (!res.ok) throw new HttpError(res.status, await readError(res));
+  return (await res.json()) as LinkedPubkeyResult;
+}
+
+/** POST /api/account/pubkeys/unlink — drop one of the caller's own links. */
+export async function unlinkAccountPubkey(csrf: string, pubkey: string): Promise<boolean> {
+  const res = await postAccount("/pubkeys/unlink", csrf, { pubkey });
+  if (res.status === 401) return redirectToLoginAndHang<boolean>();
+  if (!res.ok) throw new HttpError(res.status, await readError(res));
+  const body = (await res.json()) as { unlinked: boolean };
+  return body.unlinked;
+}

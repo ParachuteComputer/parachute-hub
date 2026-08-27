@@ -31,7 +31,7 @@ import {
 } from "../jwt-sign.ts";
 import { upsertService } from "../services-manifest.ts";
 import { rotateSigningKey } from "../signing-keys.ts";
-import { createUser } from "../users.ts";
+import { createUser, resetUserPassword } from "../users.ts";
 import { getVaultCap } from "../vault-caps.ts";
 
 const ISSUER = "http://127.0.0.1:1939";
@@ -95,7 +95,10 @@ function makeHarness(vaultNames: string[] = ["beta", "personal"]): Harness {
 
 function deps(
   h: Harness,
-  extra: Partial<{ runCommand: (cmd: readonly string[]) => Promise<RunResult> }> = {},
+  extra: Partial<{
+    runCommand: (cmd: readonly string[]) => Promise<RunResult>;
+    afterSign: (ctx: { token: string; jti: string; userId: string | null }) => void | Promise<void>;
+  }> = {},
 ) {
   return { db: h.db, issuer: ISSUER, manifestPath: h.manifestPath, ...extra };
 }
@@ -741,6 +744,47 @@ describe("handleAccountCreateVault", () => {
     }
   });
 
+  test("resetUserPassword during afterSign → vault exists, no JWT returned, no live unrevoked row (hub#873)", async () => {
+    const h = makeHarness(["default"]);
+    try {
+      const user = await createUser(h.db, "owner", "owner-password-123");
+      const token = await bearer(h, [ACCOUNT_WRITE_SCOPE], user.id);
+      let signedJti: string | undefined;
+      const runCommand = async (_cmd: readonly string[]): Promise<RunResult> => {
+        upsertService(
+          {
+            name: "parachute-vault",
+            port: 4101,
+            paths: ["/vault/default", "/vault/work"],
+            health: "/health",
+            version: "0.4.2",
+          },
+          h.manifestPath,
+        );
+        return { exitCode: 0, stdout: vaultCreateJson("work", "hubjwt.work.access"), stderr: "" };
+      };
+      const res = await handleAccountCreateVault(
+        jsonReq("/account/vaults", token, "POST", { name: "work" }),
+        deps(h, {
+          runCommand,
+          afterSign: async ({ jti }) => {
+            signedJti = jti;
+            await resetUserPassword(h.db, user.id, "new-password-after-reset");
+          },
+        }),
+      );
+      expect(res.status).toBe(500);
+      const body = (await res.json()) as { error: string; vault_token?: string };
+      expect(body.error).toBe("vault_created_token_mint_failed");
+      expect(body.vault_token).toBeUndefined();
+      expect(signedJti).toBeDefined();
+      const row = findTokenRowByJti(h.db, signedJti!);
+      expect(row === null || row.revokedAt !== null).toBe(true);
+    } finally {
+      h.cleanup();
+    }
+  });
+
   // The empty-token path (no reachable hub origin for the CLI to mint against)
   // used to return a 201 shaped exactly like a working handoff: empty
   // credential, plus the CLI's `token_guidance` pointing at
@@ -1009,7 +1053,8 @@ describe("handleAccountMintVaultToken", () => {
   test("mints a vault token with aud=vault.<name> and default read+write scope", async () => {
     const h = makeHarness(["field-notes"]);
     try {
-      const token = await bearer(h, [ACCOUNT_ADMIN_SCOPE]);
+      const u = await createUser(h.db, "owner", "pw");
+      const token = await bearer(h, [ACCOUNT_ADMIN_SCOPE], u.id);
       const res = await handleAccountMintVaultToken(
         withBearer("/account/vaults/field-notes/token", token, { method: "POST" }),
         "field-notes",
@@ -1038,7 +1083,8 @@ describe("handleAccountMintVaultToken", () => {
   test("honors an explicit scopes list", async () => {
     const h = makeHarness(["field-notes"]);
     try {
-      const token = await bearer(h, [ACCOUNT_ADMIN_SCOPE]);
+      const u = await createUser(h.db, "owner", "pw");
+      const token = await bearer(h, [ACCOUNT_ADMIN_SCOPE], u.id);
       const res = await handleAccountMintVaultToken(
         jsonReq("/account/vaults/field-notes/token", token, "POST", {
           scopes: ["vault:field-notes:read"],
@@ -1050,6 +1096,30 @@ describe("handleAccountMintVaultToken", () => {
       const body = (await res.json()) as { vault_token: string };
       const validated = await validateAccessToken(h.db, body.vault_token, ISSUER);
       expect(validated.payload.scope).toBe("vault:field-notes:read");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("non-user bearer sub fails closed instead of minting with user_id NULL", async () => {
+    const h = makeHarness(["field-notes"]);
+    try {
+      const token = await bearer(h, [ACCOUNT_ADMIN_SCOPE], "not-a-user");
+      const res = await handleAccountMintVaultToken(
+        withBearer("/account/vaults/field-notes/token", token, { method: "POST" }),
+        "field-notes",
+        deps(h),
+      );
+      expect(res.status).toBe(403);
+      const body = (await res.json()) as { error: string };
+      expect(body.error).toBe("invalid_subject");
+      const n =
+        h.db
+          .query<{ n: number }, []>(
+            "SELECT COUNT(*) AS n FROM tokens WHERE created_via = 'cli_mint'",
+          )
+          .get()?.n ?? 0;
+      expect(n).toBe(0);
     } finally {
       h.cleanup();
     }

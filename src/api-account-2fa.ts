@@ -17,6 +17,11 @@
  *                                   → the hub#833 phase-1a linkage ceremony
  *                                     (implementation in
  *                                     `api-account-pubkeys.ts`)
+ *   GET  /api/account/tokens       → this user's tokens (unrevoked default;
+ *                                     `?cursor=` pages 50; `next_cursor`)
+ *   POST /api/account/tokens       → mint as the session user
+ *   POST /api/account/tokens/:jti/revoke
+ *                                   → revoke own jti only (hub#833)
  *
  * Auth posture: every endpoint is **self-service** — it acts on the
  * SIGNED-IN user's OWN account (`session.userId`), never a client-supplied
@@ -45,6 +50,7 @@ import type { Database } from "bun:sqlite";
 import { hash as argonHash } from "@node-rs/argon2";
 import QRCode from "qrcode";
 import { handleAccountPubkeys } from "./api-account-pubkeys.ts";
+import { handleAccountTokens } from "./api-account-tokens.ts";
 import { verifyCsrfToken } from "./csrf.ts";
 import { changePasswordRateLimiter, totpEnrollConfirmRateLimiter } from "./rate-limit.ts";
 import { findActiveSession } from "./sessions.ts";
@@ -72,6 +78,11 @@ export interface ApiAccount2faDeps {
    * event's `u` tag to one of them. See `AccountPubkeysDeps.hubBoundOrigins`.
    */
   hubBoundOrigins?: readonly string[];
+  /**
+   * Hub origin — `iss` of tokens minted on `POST /api/account/tokens`.
+   * Production always passes it; tests that don't mint may omit it.
+   */
+  issuer?: string;
   /** Test seam — defaults to the real clock. */
   now?: () => Date;
 }
@@ -154,10 +165,10 @@ function passwordRateLimit(userId: string, now: () => Date): Response | null {
  *
  * The 2FA + password routes are POST-only (all state-changing); the read-side
  * 2FA status the SPA renders comes from `/api/me`'s `two_factor_enabled`
- * field. The `/pubkeys` sub-surface (hub#833) is the one exception — it has a
- * read route — so it is dispatched BEFORE the POST-only gate and owns its own
- * method handling. The gate is left in place verbatim for the pre-existing
- * routes so their "405 before the session check" behavior is unchanged.
+ * field. `/pubkeys` and `/tokens` (hub#833) have GET routes, so they are
+ * dispatched BEFORE the POST-only gate and own their own method handling.
+ * The gate is left in place verbatim for the pre-existing routes so their
+ * "405 before the session check" behavior is unchanged.
  */
 export async function handleApiAccount(
   req: Request,
@@ -181,6 +192,24 @@ export async function handleApiAccount(
       subpath.slice("/pubkeys".length),
       { id: pubkeyGate.user.id, username: pubkeyGate.user.username },
       pubkeyBody,
+      deps,
+    );
+  }
+
+  // Self-service tokens (hub#833). Same session + CSRF posture as /pubkeys;
+  // GET is the list, so this is dispatched BEFORE the POST-only gate.
+  if (subpath === "/tokens" || subpath.startsWith("/tokens/")) {
+    const tokensGate = requireUser(deps.db, req);
+    if (!tokensGate.ok) return tokensGate.res;
+    const tokensBody = req.method === "GET" ? {} : await readJsonBody(req);
+    if (req.method !== "GET" && !checkCsrf(req, tokensBody)) {
+      return jsonError(403, "csrf_failed", "missing or invalid CSRF token");
+    }
+    return handleAccountTokens(
+      req,
+      subpath.slice("/tokens".length),
+      tokensGate.user,
+      tokensBody,
       deps,
     );
   }

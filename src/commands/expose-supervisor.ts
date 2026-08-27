@@ -237,6 +237,11 @@ export async function restartHubDependentViaSupervisor(args: {
       });
       if (status.kind === "rotated") {
         log(`  refreshed operator.token issuer → ${hubOrigin} (was stale after exposure)`);
+      } else if (status.kind === "skipped") {
+        // Name the cause so a legacy `"operator"` sentinel / deleted-user
+        // sub is visible (`skipped: sub-not-user`) rather than a catch-all
+        // try-wrap. Other skip reasons (aud-mismatch, no-sub, …) too.
+        log(`  note: operator.token issuer self-heal skipped: ${status.reason}`);
       }
     } catch (err) {
       // A self-heal failure must never block the restart — degrade to a note.

@@ -488,3 +488,111 @@ describe("resolveManagementUrl", () => {
     ).toBe("https://elsewhere.example/manage");
   });
 });
+
+describe("listAccountTokens / mintAccountToken", () => {
+  it("GETs /api/account/tokens with same-origin credentials and parses next_cursor", async () => {
+    const fetchMock = vi.fn(async () => jsonResponse(200, { tokens: [], next_cursor: "abc" }));
+    vi.stubGlobal("fetch", fetchMock);
+    const api = await import("./api.ts");
+    const page = await api.listAccountTokens({ cursor: "prev" });
+    expect(page.next_cursor).toBe("abc");
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/account/tokens?cursor=prev",
+      expect.objectContaining({
+        method: "GET",
+        credentials: "same-origin",
+      }),
+    );
+  });
+
+  it("POSTs mint with CSRF + scope + label", async () => {
+    const fetchMock = vi.fn(async () =>
+      jsonResponse(200, {
+        jti: "j1",
+        token: "eyJ",
+        expires_at: "2030-01-01T00:00:00.000Z",
+        scope: "vault:work:read",
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const api = await import("./api.ts");
+    const minted = await api.mintAccountToken("csrf-x", {
+      scope: "vault:work:read",
+      label: "laptop",
+    });
+    expect(minted.jti).toBe("j1");
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/account/tokens",
+      expect.objectContaining({
+        method: "POST",
+        credentials: "same-origin",
+        body: JSON.stringify({
+          __csrf: "csrf-x",
+          scope: "vault:work:read",
+          label: "laptop",
+        }),
+      }),
+    );
+  });
+});
+
+describe("verifyPubkeyLink", () => {
+  const event = {
+    id: "a",
+    pubkey: "b",
+    created_at: 1,
+    kind: 27235,
+    tags: [] as string[][],
+    content: "x",
+    sig: "c",
+  };
+
+  it("surfaces first-link password_required instead of bouncing to login", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        jsonResponse(401, {
+          error: "password_required",
+          error_description: "please confirm",
+        }),
+      ),
+    );
+    const api = await import("./api.ts");
+    await expect(api.verifyPubkeyLink("csrf-x", { event })).rejects.toMatchObject({
+      status: 401,
+      message: "please confirm",
+    });
+    expect(auth.redirectToLoginAndHang).not.toHaveBeenCalled();
+  });
+
+  it("surfaces proof_failed / invalid_credentials without bouncing to login", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => jsonResponse(401, { error: "proof_failed", error_description: "nope" })),
+    );
+    const api = await import("./api.ts");
+    await expect(api.verifyPubkeyLink("csrf-x", { event })).rejects.toMatchObject({
+      status: 401,
+      message: "nope",
+    });
+    expect(auth.redirectToLoginAndHang).not.toHaveBeenCalled();
+  });
+
+  it("bounces to login on unauthenticated", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        jsonResponse(401, { error: "unauthenticated", error_description: "no session" }),
+      ),
+    );
+    const api = await import("./api.ts");
+    const pending = api.verifyPubkeyLink("csrf-x", { event });
+    await new Promise((r) => setTimeout(r, 0));
+    expect(auth.redirectToLoginAndHang).toHaveBeenCalledTimes(1);
+    const winner = await Promise.race([
+      pending.then(() => "resolved"),
+      new Promise((r) => setTimeout(() => r("hung"), 10)),
+    ]);
+    expect(winner).toBe("hung");
+  });
+});

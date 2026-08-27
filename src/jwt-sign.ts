@@ -227,6 +227,17 @@ export class RefreshTokenInsertError extends Error {
   }
 }
 
+/**
+ * Person-mint CAS miss (hub#833): `INSERT ... SELECT ... FROM users WHERE id = ?`
+ * matched zero rows, so the target account was deleted (or password-reset,
+ * when `userUpdatedAt` is pinned) during the crypto await. The mint handler
+ * must NOT return the signed JWT — a signed-but-unregistered token leaks
+ * because `validateAccessToken` still treats a missing registry row as valid.
+ */
+export class TokenMintPrincipalGoneError extends Error {
+  override name = "TokenMintPrincipalGoneError";
+}
+
 export function signRefreshToken(db: Database, opts: SignRefreshTokenOpts): SignedRefreshToken {
   const token = randomBytes(32).toString("base64url");
   const refreshTokenHash = createHash("sha256").update(token).digest("hex");
@@ -293,6 +304,15 @@ export interface RecordTokenMintOpts {
    */
   subjectPubkey?: string | null;
   now?: () => Date;
+  /**
+   * Person-mint CAS pin (hub#833). When set with `userId`, the insert is
+   * `INSERT ... SELECT ... FROM users WHERE id = ? AND updated_at = ?`.
+   * Zero rows — account deleted, or `resetUserPassword` racing the crypto
+   * await (it bumps `updated_at`) — throws `TokenMintPrincipalGoneError`.
+   * Omit on service mints (`userId` unset) and on callers that only need
+   * the existence check.
+   */
+  userUpdatedAt?: string;
 }
 
 /**
@@ -318,7 +338,48 @@ export function recordTokenMint(db: Database, opts: RecordTokenMintOpts): void {
     opts.subjectPubkey !== undefined
       ? opts.subjectPubkey
       : attributionPubkey(db, { userId: opts.userId, subject: opts.subject });
+  const createdAt = now.toISOString();
+  const scopes = opts.scopes.join(" ");
   try {
+    if (opts.userId) {
+      // Person-mint CAS (hub#833): the user row must still exist at INSERT.
+      // Pin `updated_at` when the caller snapshotted it before `signAccessToken`
+      // so a password-reset racing the crypto await also misses.
+      const pinUpdatedAt = opts.userUpdatedAt !== undefined;
+      const sql = pinUpdatedAt
+        ? `INSERT INTO tokens (
+             jti, user_id, client_id, scopes, expires_at, created_at,
+             permissions, created_via, subject, subject_pubkey
+           )
+           SELECT ?, u.id, ?, ?, ?, ?, ?, ?, ?, ?
+           FROM users u WHERE u.id = ? AND u.updated_at = ?`
+        : `INSERT INTO tokens (
+             jti, user_id, client_id, scopes, expires_at, created_at,
+             permissions, created_via, subject, subject_pubkey
+           )
+           SELECT ?, u.id, ?, ?, ?, ?, ?, ?, ?, ?
+           FROM users u WHERE u.id = ?`;
+      const args: (string | null)[] = [
+        opts.jti,
+        opts.clientId,
+        scopes,
+        opts.expiresAt,
+        createdAt,
+        opts.permissions ?? null,
+        opts.createdVia,
+        opts.subject,
+        subjectPubkey,
+        opts.userId,
+      ];
+      if (pinUpdatedAt) args.push(opts.userUpdatedAt ?? null);
+      const result = db.prepare(sql).run(...args);
+      if (Number(result.changes) === 0) {
+        throw new TokenMintPrincipalGoneError(
+          `account ${opts.userId} no longer exists (or was reset) at mint insert; refusing to register jti=${opts.jti}`,
+        );
+      }
+      return;
+    }
     db.prepare(
       `INSERT INTO tokens (
         jti, user_id, client_id, scopes, expires_at, created_at,
@@ -326,17 +387,18 @@ export function recordTokenMint(db: Database, opts: RecordTokenMintOpts): void {
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).run(
       opts.jti,
-      opts.userId ?? null,
+      null,
       opts.clientId,
-      opts.scopes.join(" "),
+      scopes,
       opts.expiresAt,
-      now.toISOString(),
+      createdAt,
       opts.permissions ?? null,
       opts.createdVia,
       opts.subject,
       subjectPubkey,
     );
   } catch (err) {
+    if (err instanceof TokenMintPrincipalGoneError) throw err;
     throw new RefreshTokenInsertError(
       `failed to insert token registry row (jti=${opts.jti}, created_via=${opts.createdVia}): ${err instanceof Error ? err.message : String(err)}`,
       err,
@@ -415,6 +477,8 @@ export interface ListTokensFilter {
   revoked?: "true" | "false" | "all";
   subject?: string;
   createdVia?: TokenCreatedVia;
+  /** Exact match on `tokens.user_id`. Self-service account list uses this. */
+  userId?: string;
 }
 
 /**
@@ -483,6 +547,10 @@ export function listTokens(
   if (typeof filter.subject === "string" && filter.subject.length > 0) {
     wheres.push("(user_id = ? OR subject = ?)");
     params.push(filter.subject, filter.subject);
+  }
+  if (typeof filter.userId === "string" && filter.userId.length > 0) {
+    wheres.push("user_id = ?");
+    params.push(filter.userId);
   }
   if (filter.createdVia) {
     wheres.push("created_via = ?");

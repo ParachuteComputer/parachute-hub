@@ -40,6 +40,7 @@ import { openHubDb } from "../hub-db.ts";
 import { resolveHubIssuer } from "../hub-issuer.ts";
 import { inferAudience } from "../jwt-audience.ts";
 import {
+  TokenMintPrincipalGoneError,
   findTokenRowByJti,
   recordTokenMint,
   revokeTokenByJti,
@@ -69,8 +70,10 @@ import {
   SingleUserModeError,
   UsernameTakenError,
   createUser,
+  getUserById,
   getUserByUsername,
   listUsers,
+  resolveUser,
   setPassword,
   userCount,
 } from "../users.ts";
@@ -131,13 +134,19 @@ Usage:
                                        default admin)
   parachute auth mint-token --scope <scope> [--aud <aud>]
                                             [--ephemeral | --expires-in <seconds>]
-                                            [--sub <sub>] [--permissions <json>]
-                                       Mint a scope-narrow JWT against the
-                                       operator's identity (stdout = JWT).
-                                       --ephemeral = short-lived (1h), ideal for
-                                       scripting; default lifetime is 90d.
-                                       --ttl <duration> is the deprecated
-                                       alias (use --expires-in seconds).
+                                            [--label <label>] [--user <username|id>]
+                                            [--service <name>] [--permissions <json>]
+                                       Mint a scope-narrow JWT. Person-mint
+                                       JWT sub is the hub account id (stdout =
+                                       JWT). --label is the display label
+                                       (tokens.subject). --user (operator)
+                                       mints as that account. --service mints
+                                       a non-account principal. --sub is the
+                                       deprecated alias of --label (or --user
+                                       when the value matches an account).
+                                       --ephemeral = short-lived (1h); default
+                                       lifetime is 90d. --ttl is the deprecated
+                                       lifetime alias.
   parachute auth revoke-token <jti>    Mark a registry-row token revoked
                                        by jti. Idempotent: a re-revoke
                                        prints the existing revoked_at and
@@ -302,6 +311,11 @@ export interface AuthDeps {
    * for `PARACHUTE_HUB_ORIGIN` so the token's iss matches what services see.
    */
   hubOrigin?: string;
+  /**
+   * Test seam (hub#833): runs after `signAccessToken` and before
+   * `recordTokenMint` on `mint-token`. Production omits it.
+   */
+  afterSign?: (ctx: { token: string; jti: string; userId: string | null }) => void | Promise<void>;
 }
 
 function defaultRotateKey(): { kid: string; createdAt: string } {
@@ -978,7 +992,11 @@ interface MintTokenFlags {
   aud?: string;
   ttl?: string;
   expiresIn?: string;
+  /** @deprecated Use --label or --user. */
   sub?: string;
+  label?: string;
+  user?: string;
+  service?: string;
   permissions?: string;
   /** True when --ttl was used (deprecated alias). Triggers a one-line stderr warning. */
   ttlDeprecationSeen?: boolean;
@@ -993,6 +1011,9 @@ function parseMintTokenFlags(args: readonly string[]): MintTokenFlags {
   let ttl: string | undefined;
   let expiresIn: string | undefined;
   let sub: string | undefined;
+  let label: string | undefined;
+  let user: string | undefined;
+  let service: string | undefined;
   let permissions: string | undefined;
   let ttlDeprecationSeen = false;
   let ephemeral = false;
@@ -1035,6 +1056,27 @@ function parseMintTokenFlags(args: readonly string[]): MintTokenFlags {
     } else if (a?.startsWith("--sub=")) {
       sub = a.slice("--sub=".length);
       if (!sub) return { error: "--sub requires a value" };
+    } else if (a === "--label") {
+      const v = args[++i];
+      if (!v) return { error: "--label requires a value" };
+      label = v;
+    } else if (a?.startsWith("--label=")) {
+      label = a.slice("--label=".length);
+      if (!label) return { error: "--label requires a value" };
+    } else if (a === "--user") {
+      const v = args[++i];
+      if (!v) return { error: "--user requires a value" };
+      user = v;
+    } else if (a?.startsWith("--user=")) {
+      user = a.slice("--user=".length);
+      if (!user) return { error: "--user requires a value" };
+    } else if (a === "--service") {
+      const v = args[++i];
+      if (!v) return { error: "--service requires a value" };
+      service = v;
+    } else if (a?.startsWith("--service=")) {
+      service = a.slice("--service=".length);
+      if (!service) return { error: "--service requires a value" };
     } else if (a === "--permissions") {
       const v = args[++i];
       if (!v) return { error: "--permissions requires a value" };
@@ -1056,7 +1098,28 @@ function parseMintTokenFlags(args: readonly string[]): MintTokenFlags {
       error: "pass --ephemeral OR an explicit lifetime (--expires-in/--ttl), not both",
     };
   }
-  return { scope, aud, ttl, expiresIn, sub, permissions, ttlDeprecationSeen, ephemeral };
+  if (user !== undefined && service !== undefined) {
+    return { error: "pass --user OR --service, not both" };
+  }
+  if (sub !== undefined && (label !== undefined || user !== undefined || service !== undefined)) {
+    return {
+      error:
+        "--sub is deprecated; pass --user, --label, or --service instead (not together with --sub)",
+    };
+  }
+  return {
+    scope,
+    aud,
+    ttl,
+    expiresIn,
+    sub,
+    label,
+    user,
+    service,
+    permissions,
+    ttlDeprecationSeen,
+    ephemeral,
+  };
 }
 
 const MINT_TOKEN_TTL_DEFAULT_SECONDS = 90 * 24 * 60 * 60;
@@ -1119,7 +1182,7 @@ async function runMintToken(args: readonly string[], deps: AuthDeps): Promise<nu
   if (!flags.scope) {
     console.error("parachute auth mint-token: --scope is required");
     console.error(
-      "usage: parachute auth mint-token --scope <scope> [--aud <aud>] [--ephemeral | --expires-in <seconds>] [--sub <sub>] [--permissions <json>]",
+      "usage: parachute auth mint-token --scope <scope> [--aud <aud>] [--ephemeral | --expires-in <seconds>] [--label <label>] [--user <username|id>] [--service <name>] [--permissions <json>]",
     );
     return 1;
   }
@@ -1257,11 +1320,59 @@ async function runMintToken(args: readonly string[], deps: AuthDeps): Promise<nu
     }
 
     const audience = flags.aud ?? inferAudience(scopes);
-    const subjectForMint = flags.sub ?? operatorSub;
     const permissionsClaim = permissions !== undefined ? JSON.parse(permissions) : undefined;
 
+    let asUser = flags.user;
+    const asService = flags.service;
+    let asLabel = flags.label;
+    if (flags.sub) {
+      const matched = resolveUser(db, flags.sub);
+      if (matched) {
+        console.error(
+          "parachute auth mint-token: --sub is deprecated; treating as --user because it matches a hub account. JWT sub is the account id.",
+        );
+        asUser = matched.id;
+      } else {
+        console.error(
+          "parachute auth mint-token: --sub is deprecated; treating as --label. JWT sub stays the bearer account id.",
+        );
+        asLabel = flags.sub;
+      }
+    }
+
+    let jwtSub: string;
+    let mintUserId: string | null = null;
+    let mintUserUpdatedAt: string | undefined;
+    let subjectLabel: string;
+    if (asService) {
+      jwtSub = asService;
+      subjectLabel = asLabel ?? asService;
+    } else if (asUser) {
+      const target = resolveUser(db, asUser);
+      if (!target) {
+        console.error(`parachute auth mint-token: no hub account matching --user "${asUser}"`);
+        return 1;
+      }
+      jwtSub = target.id;
+      mintUserId = target.id;
+      mintUserUpdatedAt = target.updatedAt;
+      subjectLabel = asLabel ?? target.id;
+    } else {
+      const bearerUser = getUserById(db, operatorSub);
+      if (!bearerUser) {
+        console.error(
+          "parachute auth mint-token: operator token sub is not a hub user; person-mint requires a users.id principal",
+        );
+        return 1;
+      }
+      jwtSub = bearerUser.id;
+      mintUserId = bearerUser.id;
+      mintUserUpdatedAt = bearerUser.updatedAt;
+      subjectLabel = asLabel ?? bearerUser.id;
+    }
+
     const minted = await signAccessToken(db, {
-      sub: subjectForMint,
+      sub: jwtSub,
       scopes,
       audience,
       clientId: OPERATOR_TOKEN_CLIENT_ID,
@@ -1271,20 +1382,37 @@ async function runMintToken(args: readonly string[], deps: AuthDeps): Promise<nu
       ...(permissionsClaim !== undefined ? { extraClaims: { permissions: permissionsClaim } } : {}),
     });
 
-    // Write a registry row (hub#212 Phase 1). Powers the revocation list
-    // endpoint and admin UI introspection. Per design: CLI-mint rows have
-    // user_id NULL; the subject column carries the chosen mint subject
-    // (--sub overrides operator-sub). The JWT is its own access token,
-    // not a refresh token, so refresh_token_hash + family_id stay NULL.
-    recordTokenMint(db, {
-      jti: minted.jti,
-      createdVia: "cli_mint",
-      subject: subjectForMint,
-      clientId: OPERATOR_TOKEN_CLIENT_ID,
-      scopes,
-      expiresAt: minted.expiresAt,
-      ...(permissions !== undefined ? { permissions } : {}),
-    });
+    if (deps.afterSign) {
+      await deps.afterSign({ token: minted.token, jti: minted.jti, userId: mintUserId });
+    }
+
+    // Write a registry row (hub#212 Phase 1 / hub#833). Person-mint JWT
+    // sub is users.id and user_id is set; tokens.subject is the display
+    // label. Service mints leave user_id NULL. The JWT is its own access
+    // token, so refresh_token_hash + family_id stay NULL.
+    try {
+      recordTokenMint(db, {
+        jti: minted.jti,
+        createdVia: "cli_mint",
+        subject: subjectLabel,
+        ...(mintUserId
+          ? {
+              userId: mintUserId,
+              ...(mintUserUpdatedAt ? { userUpdatedAt: mintUserUpdatedAt } : {}),
+            }
+          : {}),
+        clientId: OPERATOR_TOKEN_CLIENT_ID,
+        scopes,
+        expiresAt: minted.expiresAt,
+        ...(permissions !== undefined ? { permissions } : {}),
+      });
+    } catch (err) {
+      if (err instanceof TokenMintPrincipalGoneError) {
+        console.error(`parachute auth mint-token: ${err.message}`);
+        return 1;
+      }
+      throw err;
+    }
 
     console.log(minted.token);
     return 0;

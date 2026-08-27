@@ -28,10 +28,11 @@ import { ACCOUNT_VAULT_TOKEN_TTL_SECONDS } from "../account-home-ui.ts";
 import { handleAccountVaultTokenPost } from "../account-vault-token.ts";
 import { CSRF_FIELD_NAME, buildCsrfCookie, generateCsrfToken } from "../csrf.ts";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
-import { validateAccessToken } from "../jwt-sign.ts";
+import { findTokenRowByJti, validateAccessToken } from "../jwt-sign.ts";
 import { __resetForTests } from "../rate-limit.ts";
 import { SESSION_TTL_MS, buildSessionCookie, createSession } from "../sessions.ts";
-import { createUser } from "../users.ts";
+import { rotateSigningKey } from "../signing-keys.ts";
+import { createUser, resetUserPassword } from "../users.ts";
 
 const ISSUER = "https://hub.test";
 
@@ -406,5 +407,30 @@ describe("handleAccountVaultTokenPost — CSRF + method + rate limit", () => {
       deps(),
     );
     expect(ok.status).toBe(200);
+  });
+});
+
+describe("handleAccountVaultTokenPost — CAS after crypto await (hub#873)", () => {
+  test("resetUserPassword during afterSign → 409, no minted banner, no live unrevoked row", async () => {
+    rotateSigningKey(harness.db);
+    const { friendId, cookie, csrfToken } = await seedFriend(["work"]);
+    let signedJti: string | undefined;
+    const res = await handleAccountVaultTokenPost(
+      mintReq("work", { cookie, csrfToken, verb: "read" }),
+      "work",
+      {
+        ...deps(),
+        afterSign: async ({ jti }) => {
+          signedJti = jti;
+          await resetUserPassword(harness.db, friendId, "new-password-after-reset");
+        },
+      },
+    );
+    expect(res.status).toBe(409);
+    const html = await res.text();
+    expect(html).not.toContain('data-testid="minted-token-banner"');
+    expect(signedJti).toBeDefined();
+    const row = findTokenRowByJti(harness.db, signedJti!);
+    expect(row === null || row.revokedAt !== null).toBe(true);
   });
 });

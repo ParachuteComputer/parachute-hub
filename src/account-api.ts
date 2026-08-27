@@ -59,6 +59,7 @@ import { activePublicSignupPath } from "./invites.ts";
 import { inferAudience } from "./jwt-audience.ts";
 import {
   ACCESS_TOKEN_TTL_SECONDS,
+  TokenMintPrincipalGoneError,
   recordTokenMint,
   signAccessToken,
   validateAccessToken,
@@ -166,6 +167,11 @@ export interface AccountApiDeps {
   manifestPath?: string;
   /** Test seam for the clock (mint + registry row). */
   now?: () => Date;
+  /**
+   * Test seam (hub#873): runs after `signAccessToken` and before
+   * `recordTokenMint` on the create-vault handoff. Production omits it.
+   */
+  afterSign?: (ctx: { token: string; jti: string; userId: string | null }) => void | Promise<void>;
   /** Test seam threaded into `provisionVault` so create can be exercised
    * without spawning the real `parachute-vault create` binary. */
   runCommand?: (cmd: readonly string[]) => Promise<{
@@ -590,6 +596,10 @@ export async function handleAccountCreateVault(
     // below tells caller and operator exactly what state the box is in: the
     // vault EXISTS, only the handoff failed.
     try {
+      // Snapshot the users row BEFORE the crypto await (hub#873). A
+      // reset/delete racing sign used to re-fetch after sign and mint with
+      // user_id NULL — a live JWT the account-delete revoke set misses.
+      const subjectUser = getUserById(deps.db, auth.sub);
       const minted = await signAccessToken(deps.db, {
         sub: auth.sub,
         scopes,
@@ -600,7 +610,13 @@ export async function handleAccountCreateVault(
         vaultScope: [entry.name],
         ...(deps.now !== undefined ? { now: deps.now } : {}),
       });
-      const subjectIsUser = getUserById(deps.db, auth.sub) !== null;
+      if (deps.afterSign) {
+        await deps.afterSign({
+          token: minted.token,
+          jti: minted.jti,
+          userId: subjectUser?.id ?? null,
+        });
+      }
       recordTokenMint(deps.db, {
         jti: minted.jti,
         // hub#848: distinct from `cli_mint` — this row is a hub-signed
@@ -608,7 +624,7 @@ export async function handleAccountCreateVault(
         // door stamps, so registry forensics can find both.
         createdVia: "vault_create_handoff",
         subject: auth.sub,
-        ...(subjectIsUser ? { userId: auth.sub } : {}),
+        ...(subjectUser ? { userId: subjectUser.id, userUpdatedAt: subjectUser.updatedAt } : {}),
         clientId,
         scopes,
         expiresAt: minted.expiresAt,
@@ -738,8 +754,19 @@ export async function handleAccountMintVaultToken(
 
   const scopes = parsed.scopes;
   const audience = inferAudience(scopes); // → vault.<name>
+  // Person-mint (hub#833): JWT sub must resolve to a users row. Operator
+  // tokens now carry user_id, so a missing user is fail-closed rather than
+  // minting with user_id NULL. Check before signing so a signed JWT is
+  // never minted for a non-user principal.
+  const subjectUser = getUserById(deps.db, ctx.sub);
+  if (!subjectUser) {
+    return json(403, {
+      error: "invalid_subject",
+      message: "bearer subject is not a hub user",
+    });
+  }
   const minted = await signAccessToken(deps.db, {
-    sub: ctx.sub,
+    sub: subjectUser.id,
     scopes,
     audience,
     clientId: ACCOUNT_API_CLIENT_ID,
@@ -748,21 +775,24 @@ export async function handleAccountMintVaultToken(
     vaultScope: [vaultName],
     ...(deps.now !== undefined ? { now: deps.now } : {}),
   });
-  // Registry row so the operator token registry + revocation list attribute it.
-  // Anchor to the subject's user_id only when it names a real user row (an
-  // operator token's `sub` may be the "operator" sentinel, which is not a
-  // `users` row — pass it as `subject` but omit `user_id` to avoid a dangling FK).
-  const subjectIsUser = getUserById(deps.db, ctx.sub) !== null;
-  recordTokenMint(deps.db, {
-    jti: minted.jti,
-    createdVia: "cli_mint",
-    subject: ctx.sub,
-    ...(subjectIsUser ? { userId: ctx.sub } : {}),
-    clientId: ACCOUNT_API_CLIENT_ID,
-    scopes,
-    expiresAt: minted.expiresAt,
-    ...(deps.now !== undefined ? { now: deps.now } : {}),
-  });
+  try {
+    recordTokenMint(deps.db, {
+      jti: minted.jti,
+      createdVia: "cli_mint",
+      subject: subjectUser.id,
+      userId: subjectUser.id,
+      userUpdatedAt: subjectUser.updatedAt,
+      clientId: ACCOUNT_API_CLIENT_ID,
+      scopes,
+      expiresAt: minted.expiresAt,
+      ...(deps.now !== undefined ? { now: deps.now } : {}),
+    });
+  } catch (err) {
+    if (err instanceof TokenMintPrincipalGoneError) {
+      return json(409, { error: "conflict", message: err.message });
+    }
+    throw err;
+  }
 
   return json(200, {
     vault_token: minted.token,

@@ -22,6 +22,7 @@ import {
   OPERATOR_TOKEN_AUDIENCE,
   OPERATOR_TOKEN_CLIENT_ID,
   OPERATOR_TOKEN_FILENAME,
+  OPERATOR_TOKEN_SCOPE_SETS,
   OPERATOR_TOKEN_SCOPE_SET_CLAIM,
   issueOperatorToken,
   operatorTokenPath,
@@ -30,6 +31,16 @@ import {
   writeOperatorTokenFile,
 } from "../operator-token.ts";
 import { rotateSigningKey } from "../signing-keys.ts";
+
+function plantOperatorUsers(db: ReturnType<typeof openHubDb>): void {
+  const stamp = new Date().toISOString();
+  const insert = db.prepare(
+    `INSERT INTO users (id, username, password_hash, created_at, updated_at, password_changed)
+     VALUES (?, ?, 'x', ?, ?, 1)`,
+  );
+  insert.run("user-abc", "owner", stamp, stamp);
+  insert.run("user-xyz", "other", stamp, stamp);
+}
 
 interface Harness {
   dir: string;
@@ -51,6 +62,7 @@ describe("selfHealOperatorTokenIssuer", () => {
       const db = openHubDb(hubDbPath(h.dir));
       try {
         rotateSigningKey(db);
+        plantOperatorUsers(db);
         // Mint at loopback issuer with a non-default scope-set ("start").
         await issueOperatorToken(db, "user-abc", {
           dir: h.dir,
@@ -90,6 +102,7 @@ describe("selfHealOperatorTokenIssuer", () => {
       const db = openHubDb(hubDbPath(h.dir));
       try {
         rotateSigningKey(db);
+        plantOperatorUsers(db);
         await issueOperatorToken(db, "user-abc", {
           dir: h.dir,
           issuer: PUBLIC_ISSUER,
@@ -119,6 +132,7 @@ describe("selfHealOperatorTokenIssuer", () => {
       const db = openHubDb(hubDbPath(h.dir));
       try {
         rotateSigningKey(db);
+        plantOperatorUsers(db);
         const status = await selfHealOperatorTokenIssuer(db, {
           issuer: PUBLIC_ISSUER,
           configDir: h.dir,
@@ -138,6 +152,7 @@ describe("selfHealOperatorTokenIssuer", () => {
       const db = openHubDb(hubDbPath(h.dir));
       try {
         rotateSigningKey(db);
+        plantOperatorUsers(db);
         // Mint a real token at loopback, then corrupt its signature segment so
         // it no longer verifies against the hub's keys.
         const issued = await issueOperatorToken(db, "user-abc", {
@@ -184,6 +199,7 @@ describe("selfHealOperatorTokenIssuer", () => {
       const db = openHubDb(hubDbPath(h.dir));
       try {
         rotateSigningKey(db);
+        plantOperatorUsers(db);
         // Mint a token that expired in the past — jose's exp check throws on
         // validate, so the self-heal must classify it unverifiable.
         const issued = await issueOperatorToken(db, "user-abc", {
@@ -217,6 +233,7 @@ describe("selfHealOperatorTokenIssuer", () => {
       const db = openHubDb(hubDbPath(h.dir));
       try {
         rotateSigningKey(db);
+        plantOperatorUsers(db);
         // A hub-signed token with the WRONG audience must not be re-minted as
         // an operator token (privilege guard).
         const signed = await signAccessToken(db, {
@@ -252,6 +269,7 @@ describe("selfHealOperatorTokenIssuer", () => {
       const db = openHubDb(hubDbPath(h.dir));
       try {
         rotateSigningKey(db);
+        plantOperatorUsers(db);
         // aud=operator + stale iss + NO pa_scope_set claim. Falling back to a
         // default scope-set would silently widen to admin (hub#224); refuse.
         const signed = await signAccessToken(db, {
@@ -287,6 +305,7 @@ describe("selfHealOperatorTokenIssuer", () => {
       const db = openHubDb(hubDbPath(h.dir));
       try {
         rotateSigningKey(db);
+        plantOperatorUsers(db);
         // aud=operator + recognized scope-set + stale iss but NO sub — we can't
         // re-mint a token we can't attribute.
         const signed = await signAccessToken(db, {
@@ -316,12 +335,47 @@ describe("selfHealOperatorTokenIssuer", () => {
     }
   });
 
+  test("sub is not a users row (stale iss, aud=operator, valid scope-set) → skipped:sub-not-user, untouched", async () => {
+    const h = makeHarness();
+    try {
+      const db = openHubDb(hubDbPath(h.dir));
+      try {
+        rotateSigningKey(db);
+        plantOperatorUsers(db);
+        const signed = await signAccessToken(db, {
+          sub: "operator",
+          scopes: [...OPERATOR_TOKEN_SCOPE_SETS.admin],
+          audience: OPERATOR_TOKEN_AUDIENCE,
+          clientId: OPERATOR_TOKEN_CLIENT_ID,
+          issuer: LOOPBACK_ISSUER,
+          extraClaims: { [OPERATOR_TOKEN_SCOPE_SET_CLAIM]: "admin" },
+        });
+        await writeOperatorTokenFile(signed.token, h.dir);
+
+        const status = await selfHealOperatorTokenIssuer(db, {
+          issuer: PUBLIC_ISSUER,
+          configDir: h.dir,
+        });
+        expect(status.kind).toBe("skipped");
+        if (status.kind === "skipped") expect(status.reason).toBe("sub-not-user");
+
+        const onDisk = await readOperatorTokenFile(h.dir);
+        expect(onDisk).toBe(signed.token);
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
   test("target issuer loopback (public token on disk) → skipped:issuer-loopback, public token preserved", async () => {
     const h = makeHarness();
     try {
       const db = openHubDb(hubDbPath(h.dir));
       try {
         rotateSigningKey(db);
+        plantOperatorUsers(db);
         // A good PUBLIC-issuer token; calling self-heal with a loopback target
         // must never downgrade it.
         const issued = await issueOperatorToken(db, "user-abc", {
@@ -356,6 +410,7 @@ describe("selfHealOperatorTokenIssuer", () => {
       const db = openHubDb(hubDbPath(h.dir));
       try {
         rotateSigningKey(db);
+        plantOperatorUsers(db);
         await issueOperatorToken(db, "user-xyz", {
           dir: h.dir,
           issuer: LOOPBACK_ISSUER,
@@ -388,6 +443,7 @@ describe("selfHealOperatorTokenIssuer", () => {
       const db = openHubDb(hubDbPath(h.dir));
       try {
         rotateSigningKey(db);
+        plantOperatorUsers(db);
         await issueOperatorToken(db, "user-abc", {
           dir: h.dir,
           issuer: LOOPBACK_ISSUER,

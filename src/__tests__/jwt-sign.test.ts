@@ -8,6 +8,7 @@ import {
   ACCESS_TOKEN_TTL_SECONDS,
   REFRESH_TOKEN_TTL_MS,
   RefreshTokenInsertError,
+  TokenMintPrincipalGoneError,
   findRefreshToken,
   findTokenRowByJti,
   linkRotation,
@@ -480,6 +481,52 @@ describe("token registry (hub#212 Phase 1)", () => {
       expect(byName.has("subject")).toBe(true);
       // created_via has the back-compat default for pre-v6 rows.
       expect(byName.get("created_via")?.dflt_value).toMatch(/oauth_refresh/);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("person-mint CAS misses when the user is gone", async () => {
+    const { db, cleanup } = makeDb();
+    try {
+      const u = await createUser(db, "owner", "pw");
+      const expiresAt = new Date(Date.now() + 86400_000).toISOString();
+      db.prepare("DELETE FROM users WHERE id = ?").run(u.id);
+      expect(() =>
+        recordTokenMint(db, {
+          jti: "jti-cas-gone",
+          createdVia: "cli_mint",
+          subject: u.id,
+          userId: u.id,
+          clientId: "parachute-hub",
+          scopes: ["vault:read"],
+          expiresAt,
+        }),
+      ).toThrow(TokenMintPrincipalGoneError);
+      expect(findTokenRowByJti(db, "jti-cas-gone")).toBeNull();
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("person-mint CAS misses when updated_at no longer matches (reset pin)", async () => {
+    const { db, cleanup } = makeDb();
+    try {
+      const u = await createUser(db, "owner", "pw");
+      const expiresAt = new Date(Date.now() + 86400_000).toISOString();
+      expect(() =>
+        recordTokenMint(db, {
+          jti: "jti-cas-reset",
+          createdVia: "cli_mint",
+          subject: u.id,
+          userId: u.id,
+          userUpdatedAt: "1999-01-01T00:00:00.000Z",
+          clientId: "parachute-hub",
+          scopes: ["vault:read"],
+          expiresAt,
+        }),
+      ).toThrow(TokenMintPrincipalGoneError);
+      expect(findTokenRowByJti(db, "jti-cas-reset")).toBeNull();
     } finally {
       cleanup();
     }
