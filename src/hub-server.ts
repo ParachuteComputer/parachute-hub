@@ -53,9 +53,9 @@
  *   /.well-known/parachute-account             → account-door capabilities descriptor (public, H2)
  *   /.well-known/oauth-authorization-server    → RFC 8414 metadata (issuer, endpoints)
  *   /.well-known/oauth-protected-resource/mcp  → RFC 9728 PRM for root /mcp,
- *                                                FORWARDED from the vault daemon
- *                                                (not built locally like the
- *                                                hub-issued PRM)
+ *                                                built locally (hub#789)
+ *   /.well-known/oauth-protected-resource/account/mcp → RFC 9728 PRM for
+ *                                                the account-MCP door
  *   /.well-known/oauth-protected-resource/vault/<name>[/mcp] → RFC 9728 per-vault PRM, forwarded from vault daemon
  *
  *   # OAuth issuer.
@@ -76,6 +76,9 @@
  *   # account:self:write (create/configure), account:self:admin (delete/mint),
  *   # or parachute:host:admin (all mutations); +:read (reads).
  *   /account                      (GET)        → account bootstrap {id,email,door} (Bearer only)
+ *   /account/mcp                  (POST/DELETE/OPTIONS) → account-level MCP
+ *                                                (NIP-98 or account:self:* /
+ *                                                host:admin Bearer)
  *   /account/vaults               (GET/POST)   → list / create vault (create returns vault_token)
  *   /account/vaults/<name>        (DELETE)     → teardown (wraps /vaults/<name> cascade)
  *   /account/vaults/<name>/token  (POST)       → per-vault scoped token mint
@@ -240,6 +243,7 @@ import {
   handleAccountSetVaultCaps,
   requireAnyScope,
 } from "./account-api.ts";
+import { accountMcpProtectedResource, handleAccountMcp } from "./account-mcp-http.ts";
 import { type AccountSessionDeps, handleAccountSession } from "./account-session.ts";
 import { handleAccountSetupGet, handleAccountSetupPost } from "./account-setup.ts";
 import { handleAccountToken } from "./account-token.ts";
@@ -3033,6 +3037,27 @@ export function hubFetch(
         return new Response(res.body, { status: res.status, headers: merged });
       }
 
+      // /.well-known/oauth-protected-resource/account/mcp — RFC 9728 PRM
+      // for the account-MCP door. Hub-authored (the resource is a hub
+      // path). Public + wildcard CORS so a spec-following client can walk
+      // a 401 challenge here without a cookie.
+      if (pathname === "/.well-known/oauth-protected-resource/account/mcp") {
+        const corsHeaders = {
+          "access-control-allow-origin": "*",
+          "access-control-allow-methods": "GET, OPTIONS",
+        };
+        if (req.method === "OPTIONS") {
+          return new Response(null, { status: 204, headers: corsHeaders });
+        }
+        if (req.method !== "GET") {
+          return new Response("method not allowed", {
+            status: 405,
+            headers: { allow: "GET, OPTIONS", ...corsHeaders },
+          });
+        }
+        return accountMcpProtectedResource(oauthDeps(req).issuer);
+      }
+
       // /.well-known/oauth-protected-resource/vault/<name>[/mcp] — the
       // path-insertion PRM for a per-vault resource. The vault daemon owns this
       // document because it authors the vault-specific resource URL and scopes;
@@ -4128,6 +4153,15 @@ export function hubFetch(
       // account:self:write (or its stronger admin scope); delete/mint remain
       // admin-only; reads also accept account:self:read. See `account-api.ts`.
       // ====================================================================
+      if (pathname === "/account/mcp") {
+        if (!getDb) return dbNotConfigured();
+        return handleAccountMcp(req, {
+          db: getDb(),
+          issuer: oauthDeps(req).issuer,
+          knownIssuers: oauthDeps(req).hubBoundOrigins(),
+          manifestPath,
+        });
+      }
       if (pathname === "/account/vaults") {
         if (!getDb) return dbNotConfigured();
         const accountDeps: AccountApiDeps = {
