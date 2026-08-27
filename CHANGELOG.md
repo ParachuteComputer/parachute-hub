@@ -23,9 +23,9 @@ PR publishes `@rc`.
   create-vault / query-notes for that principal. NIP-98 coverage is
   assignment. Bearer is the `account:vaults` connection grant (consent
   binds to `account:self:vaults`, `aud=account`) or
-  `parachute:host:admin`. REST `account:self:read` does not open this
-  door. Descriptor advertises `account_mcp_endpoint`. No `vault_token` in
-  tool results.
+  `parachute:host:admin`. REST `account:self:read` / `:write` / `:admin`
+  do not open this door. Descriptor advertises `account_mcp_endpoint`.
+  No `vault_token` in tool results.
 
 Leaves #880 and #881 open.
 
