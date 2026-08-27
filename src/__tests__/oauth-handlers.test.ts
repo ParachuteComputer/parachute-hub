@@ -10517,6 +10517,60 @@ describe("single OAuth consent + grantable vault admin + delegate-only cap (2026
     }
   });
 
+  test("owner requesting account:vaults is bound to account:self:vaults with aud=account", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const owner = await createUser(db, "owner", "pw");
+      const session = createSession(db, { userId: owner.id });
+      const reg = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        status: "approved",
+      });
+      const { verifier, challenge } = makePkce();
+      const consentRes = await submitConsent(
+        db,
+        session.id,
+        reg.client.clientId,
+        "account:vaults",
+        challenge,
+      );
+      expect(consentRes.status).toBe(302);
+      const code = new URL(consentRes.headers.get("location") ?? "").searchParams.get("code");
+      const { scope, aud } = await redeemToScopeAud(db, code ?? "", reg.client.clientId, verifier);
+      expect(scope.split(" ")).toContain("account:self:vaults");
+      expect(scope.split(" ")).not.toContain("account:vaults");
+      expect(aud).toBe("account");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("account:vaults cannot be combined with other scopes", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const owner = await createUser(db, "owner", "pw");
+      const session = createSession(db, { userId: owner.id });
+      const reg = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        status: "approved",
+      });
+      const { challenge } = makePkce();
+      const consentRes = await submitConsent(
+        db,
+        session.id,
+        reg.client.clientId,
+        "account:vaults vault:work:read",
+        challenge,
+      );
+      expect(consentRes.status).toBe(302);
+      const loc = consentRes.headers.get("location") ?? "";
+      expect(loc).toContain("error=invalid_scope");
+      expect(loc).not.toContain("code=");
+    } finally {
+      cleanup();
+    }
+  });
+
   test("[9d] non-admin requesting account:self:write → also DROPPED", async () => {
     // Write is more capable than read, but it is still account-wide on a
     // self-host hub, so the same account-prefix cap must drop it.

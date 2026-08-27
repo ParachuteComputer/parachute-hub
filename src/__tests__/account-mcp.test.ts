@@ -655,7 +655,7 @@ describe("account MCP — query-notes", () => {
             : input instanceof URL
               ? input.href
               : (input as Request).url;
-        if (href.includes("/vault/beta/")) {
+        if (href.includes("127.0.0.1:4101/vault/beta/")) {
           return Response.json([{ id: "n-beta" }], { status: 200 });
         }
         throw new Error("personal is down");
@@ -785,6 +785,42 @@ describe("account MCP — extra pins", () => {
         mcpDeps(h),
       );
       expect(res.status).toBe(400);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("Bearer host:admin with aud=hub (operator SPA mint) still opens", async () => {
+    const h = await makeHarness();
+    try {
+      const minted = await signAccessToken(h.db, {
+        sub: h.ownerId,
+        scopes: [HOST_ADMIN_SCOPE],
+        audience: "hub",
+        clientId: "parachute-hub-spa",
+        issuer: ISSUER,
+        ttlSeconds: 600,
+      });
+      const res = await handleAccountMcp(bearerReq(minted.token, rpc("initialize")), mcpDeps(h));
+      expect(res.status).toBe(200);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("Bearer leftover un-narrowed account:vaults still opens as a blanket grant", async () => {
+    const h = await makeHarness();
+    try {
+      const token = await bearer(h, [ACCOUNT_VAULTS_UNNARROWED]);
+      const res = await handleAccountMcp(
+        bearerReq(token, rpc("tools/call", { name: "list-vaults", arguments: {} })),
+        mcpDeps(h),
+      );
+      expect(res.status).toBe(200);
+      const payload = parseTool(
+        (await res.json()) as { result: { content: Array<{ text: string }> } },
+      ) as { covered: string };
+      expect(payload.covered).toBe("all");
     } finally {
       h.cleanup();
     }

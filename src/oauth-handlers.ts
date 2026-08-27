@@ -22,6 +22,7 @@
  * on presentation.
  */
 import type { Database } from "bun:sqlite";
+import { ACCOUNT_VAULTS_UNNARROWED, accountVaultsScope } from "@openparachute/door-contract";
 import { AdminAuthError, adminAuthErrorResponse, requireScope } from "./admin-auth.ts";
 import { recordLoginUnlock } from "./admin-lock.ts";
 import { renderTotpChallenge } from "./admin-login-ui.ts";
@@ -1237,6 +1238,14 @@ export function handleAuthorizeGet(db: Database, req: Request, deps: OAuthDeps):
   // Per RFC 6749 §4.1.2.1, errors that aren't redirect-uri-related are
   // delivered by redirect with `error=invalid_scope`.
   const requestedScopes = parsed.scope.split(" ").filter((s) => s.length > 0);
+  if (accountVaultsCombinedWithOtherScopes(requestedScopes)) {
+    return oauthErrorRedirect(
+      parsed.redirectUri,
+      "invalid_scope",
+      "account:vaults cannot be combined with other scopes",
+      parsed.state,
+    );
+  }
   const blocked = findNonRequestableScopes(requestedScopes);
   if (blocked.length > 0) {
     return oauthErrorRedirect(
@@ -1494,6 +1503,20 @@ export function handleAuthorizeGet(db: Database, req: Request, deps: OAuthDeps):
  *     skip-consent flow can never replay an un-held admin verb because it was
  *     never recorded.
  */
+function bindAccountVaultsScopes(scopes: readonly string[]): string[] {
+  return scopes.map((s) => (s === ACCOUNT_VAULTS_UNNARROWED ? accountVaultsScope("self") : s));
+}
+
+function isAccountVaultsConnectionScope(scope: string): boolean {
+  return scope === ACCOUNT_VAULTS_UNNARROWED || scope === accountVaultsScope("self");
+}
+
+function accountVaultsCombinedWithOtherScopes(scopes: readonly string[]): boolean {
+  const has = scopes.some(isAccountVaultsConnectionScope);
+  if (!has) return false;
+  return scopes.some((s) => !isAccountVaultsConnectionScope(s));
+}
+
 function capScopesToUserAuthority(
   db: Database,
   userId: string,
@@ -1574,6 +1597,7 @@ export function grantableExtraScopes(
     ACCOUNT_SELF_READ_SCOPE,
     ACCOUNT_SELF_WRITE_SCOPE,
     ACCOUNT_SELF_ADMIN_SCOPE,
+    ACCOUNT_VAULTS_UNNARROWED,
   ];
 
   // Compare both naming shapes in one canonical key space. When an admin's
@@ -1643,7 +1667,19 @@ function issueAuthCodeRedirect(
   // the final named shapes. Owner (isFirstAdmin) bypasses — holds admin
   // everywhere by construction.
   const userIsAdmin = isFirstAdmin(db, userId);
-  const cappedScopes = capScopesToUserAuthority(db, userId, scopes, { userIsAdmin });
+  // RFC 9728 walk: PRM advertises un-narrowed `account:vaults`; the token
+  // must carry the id-bound blanket `account:self:vaults`. Bind here at the
+  // single mint choke-point so skip-consent and form-consent cannot diverge.
+  const boundScopes = bindAccountVaultsScopes(scopes);
+  if (accountVaultsCombinedWithOtherScopes(boundScopes)) {
+    return oauthErrorRedirect(
+      params.redirectUri,
+      "invalid_scope",
+      "account:vaults cannot be combined with other scopes",
+      params.state,
+    );
+  }
+  const cappedScopes = capScopesToUserAuthority(db, userId, boundScopes, { userIsAdmin });
   // Dedup HERE, after the cap, at the single mint choke-point every path funnels
   // through — so the auth-code row, the JWT `scope` claim, the refresh row, the
   // token response, and the recorded grant all carry the same set.

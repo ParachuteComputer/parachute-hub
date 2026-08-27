@@ -21,6 +21,7 @@
  */
 import type { Database } from "bun:sqlite";
 import {
+  ACCOUNT_VAULTS_UNNARROWED,
   COMPOSED_VERB_RANK,
   type ComposedVaultVerb,
   accountVaultsGrant,
@@ -123,6 +124,10 @@ export function buildAccountConnectionGrant(
   let wildcard = composed.wildcard;
   const vaults = new Map(composed.vaults);
   let create = composed.create;
+  if (scopes.includes(ACCOUNT_VAULTS_UNNARROWED)) {
+    create = true;
+    if (wildcard === null) wildcard = "read";
+  }
   const legacy = accountVaultsGrant(scopes, accountId);
   if (legacy !== null) {
     create = true;
