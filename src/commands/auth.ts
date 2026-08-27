@@ -56,6 +56,7 @@ import {
   issueOperatorToken,
   useOperatorTokenWithAutoRotate,
 } from "../operator-token.ts";
+import { bindPubkeyOperatorAttested, findPubkeyLink, isPubkeyHex } from "../pubkey-links.ts";
 import { isNonRequestableScope } from "../scope-explanations.ts";
 import { rotateSigningKey } from "../signing-keys.ts";
 import { generateTotpSecret, otpauthUrlFor, verifyTotpCode } from "../totp.ts";
@@ -101,6 +102,7 @@ const HUB_LOCAL_SUBCOMMANDS = new Set([
   "2fa",
   "set-password",
   "list-users",
+  "link-pubkey",
   "rotate-operator",
   "mint-token",
   "revoke-token",
@@ -119,6 +121,10 @@ Usage:
   parachute auth set-password [--username <name>] [--password <pw>] [--allow-multi]
                                        Create or update the hub user's password
   parachute auth list-users            Show registered hub accounts
+  parachute auth link-pubkey --user <name> <pubkey>
+                                       Bind a Nostr pubkey to an existing hub
+                                       user (operator-attested; no SPA ceremony).
+                                       pubkey is 64-char lowercase hex.
   parachute auth 2fa [status]          Show hub-login 2FA (TOTP) status
   parachute auth 2fa enroll [--username <name>]
                                        Enroll TOTP for hub login (prints the
@@ -1643,6 +1649,104 @@ async function run2fa(args: readonly string[], deps: AuthDeps): Promise<number> 
   }
 }
 
+interface LinkPubkeyFlags {
+  user?: string;
+  pubkey?: string;
+  error?: string;
+}
+
+function parseLinkPubkeyFlags(args: readonly string[]): LinkPubkeyFlags {
+  let user: string | undefined;
+  const rest: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === "--user") {
+      const v = args[++i];
+      if (!v) return { error: "--user requires a value" };
+      user = v;
+    } else if (a?.startsWith("--user=")) {
+      user = a.slice("--user=".length);
+      if (!user) return { error: "--user requires a value" };
+    } else if (a === "--username") {
+      const v = args[++i];
+      if (!v) return { error: "--username requires a value" };
+      user = v;
+    } else if (a?.startsWith("--username=")) {
+      user = a.slice("--username=".length);
+      if (!user) return { error: "--username requires a value" };
+    } else if (a !== undefined) {
+      rest.push(a);
+    }
+  }
+  if (rest.length === 0) return { user, error: "missing pubkey argument" };
+  if (rest.length > 1) return { user, error: `unexpected argument "${rest[1]}"` };
+  return { user, pubkey: rest[0] };
+}
+
+/**
+ * `parachute auth link-pubkey --user owner <hex>` — operator bind.
+ *
+ * On-box privilege: the operator asserts this key belongs to this hub user.
+ * No NIP-07 ceremony, no possession proof. That is the point — agents cannot
+ * click the Account SPA, and the 5-minute challenge expires unconsumed.
+ */
+function runLinkPubkey(args: readonly string[], deps: AuthDeps): number {
+  const flags = parseLinkPubkeyFlags(args);
+  if (flags.error) {
+    console.error(`parachute auth link-pubkey: ${flags.error}`);
+    console.error("usage: parachute auth link-pubkey --user <username|id> <pubkey-hex>");
+    return 1;
+  }
+  if (!flags.user) {
+    console.error("parachute auth link-pubkey: --user is required");
+    console.error("usage: parachute auth link-pubkey --user <username|id> <pubkey-hex>");
+    return 1;
+  }
+  const pubkey = flags.pubkey ?? "";
+  if (pubkey.startsWith("npub") || !isPubkeyHex(pubkey)) {
+    console.error(
+      "parachute auth link-pubkey: pubkey must be a 64-character lowercase-hex x-only key (not npub)",
+    );
+    return 1;
+  }
+  const db = deps.dbPath ? openHubDb(deps.dbPath) : openHubDb();
+  try {
+    const target = resolveUser(db, flags.user);
+    if (!target) {
+      console.error(`parachute auth link-pubkey: no hub user "${flags.user}"`);
+      return 1;
+    }
+    const existing = findPubkeyLink(db, pubkey);
+    if (existing && existing.userId !== target.id) {
+      console.error("parachute auth link-pubkey: that pubkey is already bound to another user");
+      return 1;
+    }
+    const bound = bindPubkeyOperatorAttested(db, {
+      userId: target.id,
+      pubkey,
+      label: "operator",
+    });
+    if (!bound.ok) {
+      if (bound.reason === "too_many_pubkeys") {
+        console.error(
+          "parachute auth link-pubkey: this user already has the maximum number of linked keys",
+        );
+        return 1;
+      }
+      console.error("parachute auth link-pubkey: that pubkey is already bound to another user");
+      return 1;
+    }
+    console.log(
+      bound.relinked
+        ? `Relinked pubkey ${pubkey} to "${target.username}" (${target.id}).`
+        : `Linked pubkey ${pubkey} to "${target.username}" (${target.id}).`,
+    );
+    return 0;
+  } finally {
+    db.close();
+  }
+}
+
 function runListUsers(deps: AuthDeps): number {
   const db = deps.dbPath ? openHubDb(deps.dbPath) : openHubDb();
   try {
@@ -1712,6 +1816,15 @@ export async function auth(args: readonly string[], deps: AuthDeps | Runner = {}
     }
     if (sub === "list-users") {
       return runListUsers(normalized);
+    }
+    if (sub === "link-pubkey") {
+      try {
+        return runLinkPubkey(args.slice(1), normalized);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(`parachute auth link-pubkey: ${msg}`);
+        return 1;
+      }
     }
     if (sub === "rotate-operator") {
       try {

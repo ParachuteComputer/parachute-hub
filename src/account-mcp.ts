@@ -3,8 +3,10 @@
  * `/account/mcp`.
  *
  * Cloud's twin lives in the identity worker (`account-mcp.ts`). Same three
- * tools (list-vaults, create-vault, query-notes), same "no vault_token in
- * model context" rule. Coverage is hub-shaped, not D1-ownership-shaped:
+ * coverage tools (list-vaults, create-vault, query-notes), same "no vault_token
+ * in model context" rule. Hub adds grant-access / revoke-access / list-access
+ * (pubkey → one `user_vaults` row). Those three are hub-only: cloud grants are
+ * D1-ownership shaped, not `user_vaults`. Coverage is hub-shaped:
  *
  *   - Bearer is the cloud-shaped connection grant: `account:self:vaults`
  *     (legacy blanket / narrowed) or composed `account:self:vaults:*:<verb>`,
@@ -29,6 +31,7 @@ import {
 } from "@openparachute/door-contract";
 import { type AccountVaultMeta, listVaultsWithMeta } from "./account-api.ts";
 import { HOST_ADMIN_SCOPE, provisionVault } from "./admin-vaults.ts";
+import { GrantError, grantAccess, listAccess, revokeAccess } from "./grant-access.ts";
 import { signAccessToken } from "./jwt-sign.ts";
 import { getUserById, isFirstAdmin, vaultVerbsForUserVault } from "./users.ts";
 
@@ -399,9 +402,111 @@ const queryNotesTool: AccountMcpTool = {
   },
 };
 
+function installedNameSet(ctx: AccountToolContext): Set<string> {
+  return new Set(installedVaults(ctx).map((v) => v.name));
+}
+
+function throwGrant(err: unknown): never {
+  if (err instanceof GrantError) throw new AccountToolError(err.errorType, err.message);
+  throw err;
+}
+
+const grantAccessTool: AccountMcpTool = {
+  name: "grant-access",
+  description:
+    "Give a Nostr pubkey access to one vault. Creates a key-only hub user if the " +
+    "pubkey is not yet linked. Writes one user_vaults row — does not replace the " +
+    "target's other vaults. Role is read or write and cannot be granted unless you " +
+    "can admin that vault.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      pubkey: {
+        type: "string",
+        description: "64-character lowercase-hex x-only Nostr public key.",
+      },
+      vault: { type: "string", description: "Installed vault name." },
+      role: {
+        type: "string",
+        enum: ["read", "write"],
+        description: 'Access role. "write" is full vault authority (read/write/admin).',
+      },
+    },
+    required: ["pubkey", "vault", "role"],
+    additionalProperties: false,
+  },
+  async execute(args, ctx) {
+    try {
+      return await grantAccess(
+        ctx.db,
+        ctx.principal,
+        args,
+        installedNameSet(ctx),
+        ctx.now ?? (() => new Date()),
+      );
+    } catch (err) {
+      throwGrant(err);
+    }
+  },
+};
+
+const revokeAccessTool: AccountMcpTool = {
+  name: "revoke-access",
+  description:
+    "Remove one vault grant from a Nostr pubkey. Leaves the hub user and any other " +
+    "vaults in place. Refuses the hub owner (unrestricted by construction).",
+  inputSchema: {
+    type: "object",
+    properties: {
+      pubkey: {
+        type: "string",
+        description: "64-character lowercase-hex x-only Nostr public key.",
+      },
+      vault: { type: "string", description: "Installed vault name." },
+    },
+    required: ["pubkey", "vault"],
+    additionalProperties: false,
+  },
+  async execute(args, ctx) {
+    try {
+      return revokeAccess(ctx.db, ctx.principal, args, installedNameSet(ctx));
+    } catch (err) {
+      throwGrant(err);
+    }
+  },
+};
+
+const listAccessTool: AccountMcpTool = {
+  name: "list-access",
+  description:
+    "List pubkey → vault grants this connection can admin. Omit `vault` for every " +
+    "such grant; pass it to filter to one vault. Password-only users without a " +
+    "linked key are not included.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      vault: {
+        type: "string",
+        description: "Restrict to one installed vault. Omit to list every vault you can admin.",
+      },
+    },
+    additionalProperties: false,
+  },
+  async execute(args, ctx) {
+    try {
+      return listAccess(ctx.db, ctx.principal, args, installedNameSet(ctx));
+    } catch (err) {
+      throwGrant(err);
+    }
+  },
+};
+
 /** Order is stable so `tools/list` is deterministic. */
 export const ACCOUNT_MCP_TOOLS: readonly AccountMcpTool[] = [
   listVaultsTool,
   createVaultTool,
   queryNotesTool,
+  grantAccessTool,
+  revokeAccessTool,
+  listAccessTool,
 ];

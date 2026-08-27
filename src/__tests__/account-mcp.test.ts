@@ -11,6 +11,9 @@ import type { Database } from "bun:sqlite";
  *   - create-vault: owner yes, friend no, no token in the tool result;
  *   - query-notes: fan-out attribution + one-vault failure isolation +
  *     vault_not_covered fail-closed;
+ *   - grant-access: grant-first creates a key-only user; one-row upsert;
+ *     friend write can grant their vault, read cannot; owner unrestricted
+ *     is a no-op; revoke leaves the user; list-access is pubkey-shaped;
  *   - descriptor advertises account_mcp_endpoint (see account-api.test).
  */
 import { describe, expect, test } from "bun:test";
@@ -26,10 +29,10 @@ import { hubDbPath, openHubDb } from "../hub-db.ts";
 import { signAccessToken } from "../jwt-sign.ts";
 import { NOSTR_AUTH_KIND, type NostrEvent, nostrEventId } from "../nostr-event.ts";
 import { NostrReplayCache } from "../nostr-http-auth.ts";
-import { bindPubkeyFromHttpAuth } from "../pubkey-links.ts";
+import { bindPubkeyFromHttpAuth, findPubkeyLink } from "../pubkey-links.ts";
 import { upsertService } from "../services-manifest.ts";
 import { rotateSigningKey } from "../signing-keys.ts";
-import { createUser } from "../users.ts";
+import { createUser, getUserById, vaultVerbsForUserVault } from "../users.ts";
 
 const ISSUER = "http://127.0.0.1:1939";
 const MCP_URL = `${ISSUER}/account/mcp`;
@@ -410,7 +413,7 @@ describe("account MCP — transport", () => {
 });
 
 describe("account MCP — initialize + tools", () => {
-  test("Bearer account:self:vaults initializes and lists the three tools", async () => {
+  test("Bearer account:self:vaults initializes and lists the account-MCP tools", async () => {
     const h = await makeHarness();
     try {
       const token = await bearer(h, [ACCOUNT_VAULTS_SCOPE]);
@@ -434,6 +437,9 @@ describe("account MCP — initialize + tools", () => {
         "list-vaults",
         "create-vault",
         "query-notes",
+        "grant-access",
+        "revoke-access",
+        "list-access",
       ]);
     } finally {
       h.cleanup();
@@ -942,6 +948,520 @@ describe("account MCP — hubFetch wiring", () => {
       const body = (await res.json()) as { scopes_supported: string[]; resource: string };
       expect(body.resource).toBe(MCP_URL);
       expect(body.scopes_supported).toEqual([ACCOUNT_VAULTS_UNNARROWED]);
+    } finally {
+      h.cleanup();
+    }
+  });
+});
+
+describe("account MCP — grant-access", () => {
+  test("NIP-98 owner grant-first: unknown pubkey becomes a key-only user and can list the vault", async () => {
+    const h = await makeHarness();
+    try {
+      const granted = await handleAccountMcp(
+        nostrReq(
+          OWNER_SECRET,
+          rpc("tools/call", {
+            name: "grant-access",
+            arguments: { pubkey: OTHER_PUBKEY, vault: "beta", role: "write" },
+          }),
+        ),
+        mcpDeps(h),
+      );
+      const payload = parseTool(
+        (await granted.json()) as { result: { content: Array<{ text: string }> } },
+      ) as {
+        pubkey: string;
+        vault: string;
+        role: string;
+        created_user: boolean;
+        unrestricted: boolean;
+        user_id: string;
+      };
+      expect(payload.pubkey).toBe(OTHER_PUBKEY);
+      expect(payload.vault).toBe("beta");
+      expect(payload.role).toBe("write");
+      expect(payload.created_user).toBe(true);
+      expect(payload.unrestricted).toBe(false);
+      const link = findPubkeyLink(h.db, OTHER_PUBKEY);
+      expect(link?.userId).toBe(payload.user_id);
+      expect(vaultVerbsForUserVault(h.db, payload.user_id, "beta")).toEqual([
+        "read",
+        "write",
+        "admin",
+      ]);
+      expect(vaultVerbsForUserVault(h.db, payload.user_id, "personal")).toBeNull();
+
+      const listed = await handleAccountMcp(
+        nostrReq(OTHER_SECRET, rpc("tools/call", { name: "list-vaults", arguments: {} })),
+        mcpDeps(h),
+      );
+      const coverage = parseTool(
+        (await listed.json()) as { result: { content: Array<{ text: string }> } },
+      ) as { covered: string; vaults: Array<{ name: string }> };
+      expect(coverage.covered).toBe("listed");
+      expect(coverage.vaults.map((v) => v.name)).toEqual(["beta"]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("second grant upserts role and does not wipe other vaults", async () => {
+    const h = await makeHarness();
+    try {
+      await handleAccountMcp(
+        nostrReq(
+          OWNER_SECRET,
+          rpc("tools/call", {
+            name: "grant-access",
+            arguments: { pubkey: OTHER_PUBKEY, vault: "beta", role: "write" },
+          }),
+        ),
+        mcpDeps(h),
+      );
+      await handleAccountMcp(
+        nostrReq(
+          OWNER_SECRET,
+          rpc("tools/call", {
+            name: "grant-access",
+            arguments: { pubkey: OTHER_PUBKEY, vault: "personal", role: "read" },
+          }),
+        ),
+        mcpDeps(h),
+      );
+      const second = await handleAccountMcp(
+        nostrReq(
+          OWNER_SECRET,
+          rpc("tools/call", {
+            name: "grant-access",
+            arguments: { pubkey: OTHER_PUBKEY, vault: "beta", role: "read" },
+          }),
+        ),
+        mcpDeps(h),
+      );
+      const payload = parseTool(
+        (await second.json()) as { result: { content: Array<{ text: string }> } },
+      ) as { created_user: boolean; user_id: string };
+      expect(payload.created_user).toBe(false);
+      expect(vaultVerbsForUserVault(h.db, payload.user_id, "beta")).toEqual(["read"]);
+      expect(getUserById(h.db, payload.user_id)?.assignedVaults.sort()).toEqual([
+        "beta",
+        "personal",
+      ]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("friend with write on beta can grant beta, not personal", async () => {
+    const h = await makeHarness();
+    try {
+      const ok = await handleAccountMcp(
+        nostrReq(
+          FRIEND_SECRET,
+          rpc("tools/call", {
+            name: "grant-access",
+            arguments: { pubkey: OTHER_PUBKEY, vault: "beta", role: "read" },
+          }),
+        ),
+        mcpDeps(h),
+      );
+      const payload = parseTool(
+        (await ok.json()) as { result: { content: Array<{ text: string }> } },
+      ) as { vault: string; user_id: string };
+      expect(payload.vault).toBe("beta");
+      expect(vaultVerbsForUserVault(h.db, payload.user_id, "beta")).toEqual(["read"]);
+      expect(vaultVerbsForUserVault(h.db, payload.user_id, "personal")).toBeNull();
+
+      const denied = await handleAccountMcp(
+        nostrReq(
+          FRIEND_SECRET,
+          rpc("tools/call", {
+            name: "grant-access",
+            arguments: { pubkey: OTHER_PUBKEY, vault: "personal", role: "read" },
+          }),
+        ),
+        mcpDeps(h),
+      );
+      const body = (await denied.json()) as { error?: { data?: { error_type?: string } } };
+      expect(body.error?.data?.error_type).toBe("grant_not_permitted");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("read-role assignee cannot grant", async () => {
+    const h = await makeHarness();
+    const readerSecret = hexToBytes("44".repeat(32));
+    const readerPub = bytesToHex(schnorr.getPublicKey(readerSecret));
+    try {
+      const reader = await createUser(h.db, "reader", "correct-horse-battery-staple", {
+        allowMulti: true,
+        passwordChanged: true,
+        assignedVaults: ["beta"],
+        role: "read",
+      });
+      bindPubkeyFromHttpAuth(h.db, {
+        userId: reader.id,
+        pubkey: readerPub,
+        proofEvent: "{}",
+        proofEventId: "c".repeat(64),
+        label: "test",
+        now: new Date(),
+      });
+      const res = await handleAccountMcp(
+        nostrReq(
+          readerSecret,
+          rpc("tools/call", {
+            name: "grant-access",
+            arguments: { pubkey: OTHER_PUBKEY, vault: "beta", role: "read" },
+          }),
+        ),
+        mcpDeps(h),
+      );
+      const body = (await res.json()) as { error?: { data?: { error_type?: string } } };
+      expect(body.error?.data?.error_type).toBe("grant_not_permitted");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("granting the owner pubkey is unrestricted and writes no user_vaults row", async () => {
+    const h = await makeHarness();
+    try {
+      const res = await handleAccountMcp(
+        nostrReq(
+          OWNER_SECRET,
+          rpc("tools/call", {
+            name: "grant-access",
+            arguments: { pubkey: OWNER_PUBKEY, vault: "beta", role: "write" },
+          }),
+        ),
+        mcpDeps(h),
+      );
+      const payload = parseTool(
+        (await res.json()) as { result: { content: Array<{ text: string }> } },
+      ) as { unrestricted: boolean; user_id: string };
+      expect(payload.unrestricted).toBe(true);
+      expect(payload.user_id).toBe(h.ownerId);
+      expect(getUserById(h.db, h.ownerId)?.assignedVaults).toEqual([]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("invalid pubkey / missing vault / unknown vault / npub", async () => {
+    const h = await makeHarness();
+    try {
+      const npub = await handleAccountMcp(
+        nostrReq(
+          OWNER_SECRET,
+          rpc("tools/call", {
+            name: "grant-access",
+            arguments: { pubkey: "npub1qqqqqqq", vault: "beta", role: "write" },
+          }),
+        ),
+        mcpDeps(h),
+      );
+      expect(
+        ((await npub.json()) as { error?: { data?: { error_type?: string } } }).error?.data
+          ?.error_type,
+      ).toBe("invalid_pubkey");
+
+      const missing = await handleAccountMcp(
+        nostrReq(
+          OWNER_SECRET,
+          rpc("tools/call", {
+            name: "grant-access",
+            arguments: { pubkey: OTHER_PUBKEY, role: "write" },
+          }),
+        ),
+        mcpDeps(h),
+      );
+      expect(
+        ((await missing.json()) as { error?: { data?: { error_type?: string } } }).error?.data
+          ?.error_type,
+      ).toBe("invalid_vault");
+
+      const unknown = await handleAccountMcp(
+        nostrReq(
+          OWNER_SECRET,
+          rpc("tools/call", {
+            name: "grant-access",
+            arguments: { pubkey: OTHER_PUBKEY, vault: "ghost", role: "write" },
+          }),
+        ),
+        mcpDeps(h),
+      );
+      expect(
+        ((await unknown.json()) as { error?: { data?: { error_type?: string } } }).error?.data
+          ?.error_type,
+      ).toBe("vault_not_installed");
+
+      const badRole = await handleAccountMcp(
+        nostrReq(
+          OWNER_SECRET,
+          rpc("tools/call", {
+            name: "grant-access",
+            arguments: { pubkey: OTHER_PUBKEY, vault: "beta", role: "admin" },
+          }),
+        ),
+        mcpDeps(h),
+      );
+      expect(
+        ((await badRole.json()) as { error?: { data?: { error_type?: string } } }).error?.data
+          ?.error_type,
+      ).toBe("invalid_role");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("revoke drops the row, leaves the user, refuses the owner", async () => {
+    const h = await makeHarness();
+    try {
+      const granted = await handleAccountMcp(
+        nostrReq(
+          OWNER_SECRET,
+          rpc("tools/call", {
+            name: "grant-access",
+            arguments: { pubkey: OTHER_PUBKEY, vault: "beta", role: "write" },
+          }),
+        ),
+        mcpDeps(h),
+      );
+      const g = parseTool(
+        (await granted.json()) as { result: { content: Array<{ text: string }> } },
+      ) as { user_id: string };
+
+      const revoked = await handleAccountMcp(
+        nostrReq(
+          OWNER_SECRET,
+          rpc("tools/call", {
+            name: "revoke-access",
+            arguments: { pubkey: OTHER_PUBKEY, vault: "beta" },
+          }),
+        ),
+        mcpDeps(h),
+      );
+      const r = parseTool(
+        (await revoked.json()) as { result: { content: Array<{ text: string }> } },
+      ) as { revoked: boolean };
+      expect(r.revoked).toBe(true);
+      expect(getUserById(h.db, g.user_id)).not.toBeNull();
+      expect(vaultVerbsForUserVault(h.db, g.user_id, "beta")).toBeNull();
+      expect(findPubkeyLink(h.db, OTHER_PUBKEY)?.userId).toBe(g.user_id);
+
+      const ownerRevoke = await handleAccountMcp(
+        nostrReq(
+          OWNER_SECRET,
+          rpc("tools/call", {
+            name: "revoke-access",
+            arguments: { pubkey: OWNER_PUBKEY, vault: "beta" },
+          }),
+        ),
+        mcpDeps(h),
+      );
+      expect(
+        ((await ownerRevoke.json()) as { error?: { data?: { error_type?: string } } }).error?.data
+          ?.error_type,
+      ).toBe("target_is_hub_admin");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("list-access is pubkey-shaped; friend sees only vaults they can admin", async () => {
+    const h = await makeHarness();
+    try {
+      await handleAccountMcp(
+        nostrReq(
+          OWNER_SECRET,
+          rpc("tools/call", {
+            name: "grant-access",
+            arguments: { pubkey: OTHER_PUBKEY, vault: "personal", role: "write" },
+          }),
+        ),
+        mcpDeps(h),
+      );
+      await handleAccountMcp(
+        nostrReq(
+          OWNER_SECRET,
+          rpc("tools/call", {
+            name: "grant-access",
+            arguments: { pubkey: OTHER_PUBKEY, vault: "beta", role: "read" },
+          }),
+        ),
+        mcpDeps(h),
+      );
+
+      const ownerList = await handleAccountMcp(
+        nostrReq(OWNER_SECRET, rpc("tools/call", { name: "list-access", arguments: {} })),
+        mcpDeps(h),
+      );
+      const ownerRows = parseTool(
+        (await ownerList.json()) as { result: { content: Array<{ text: string }> } },
+      ) as { access: Array<{ pubkey: string; vault: string; role: string }> };
+      expect(
+        ownerRows.access
+          .filter((a) => a.pubkey === OTHER_PUBKEY)
+          .map((a) => a.vault)
+          .sort(),
+      ).toEqual(["beta", "personal"]);
+
+      const friendList = await handleAccountMcp(
+        nostrReq(FRIEND_SECRET, rpc("tools/call", { name: "list-access", arguments: {} })),
+        mcpDeps(h),
+      );
+      const friendRows = parseTool(
+        (await friendList.json()) as { result: { content: Array<{ text: string }> } },
+      ) as { access: Array<{ pubkey: string; vault: string }> };
+      expect(friendRows.access.every((a) => a.vault === "beta")).toBe(true);
+      expect(friendRows.access.some((a) => a.pubkey === OTHER_PUBKEY)).toBe(true);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("Bearer host:admin can grant", async () => {
+    const h = await makeHarness();
+    try {
+      const token = await bearer(h, [HOST_ADMIN_SCOPE]);
+      const res = await handleAccountMcp(
+        bearerReq(
+          token,
+          rpc("tools/call", {
+            name: "grant-access",
+            arguments: { pubkey: OTHER_PUBKEY, vault: "personal", role: "write" },
+          }),
+        ),
+        mcpDeps(h),
+      );
+      const payload = parseTool(
+        (await res.json()) as { result: { content: Array<{ text: string }> } },
+      ) as { created_user: boolean; vault: string; user_id: string };
+      expect(payload.created_user).toBe(true);
+      expect(payload.vault).toBe("personal");
+      expect(vaultVerbsForUserVault(h.db, payload.user_id, "personal")).toEqual([
+        "read",
+        "write",
+        "admin",
+      ]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("first-admin Bearer named beta:read cannot grant personal or beta", async () => {
+    const h = await makeHarness();
+    try {
+      const token = await bearer(h, ["account:self:vaults:beta:read"]);
+      const personal = await handleAccountMcp(
+        bearerReq(
+          token,
+          rpc("tools/call", {
+            name: "grant-access",
+            arguments: { pubkey: OTHER_PUBKEY, vault: "personal", role: "write" },
+          }),
+        ),
+        mcpDeps(h),
+      );
+      expect(
+        ((await personal.json()) as { error?: { data?: { error_type?: string } } }).error?.data
+          ?.error_type,
+      ).toBe("grant_not_permitted");
+      const beta = await handleAccountMcp(
+        bearerReq(
+          token,
+          rpc("tools/call", {
+            name: "grant-access",
+            arguments: { pubkey: OTHER_PUBKEY, vault: "beta", role: "write" },
+          }),
+        ),
+        mcpDeps(h),
+      );
+      expect(
+        ((await beta.json()) as { error?: { data?: { error_type?: string } } }).error?.data
+          ?.error_type,
+      ).toBe("grant_not_permitted");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("first-admin Bearer account:self:vaults (coverage wildcard) can grant personal", async () => {
+    const h = await makeHarness();
+    try {
+      const token = await bearer(h, [ACCOUNT_VAULTS_SCOPE]);
+      const res = await handleAccountMcp(
+        bearerReq(
+          token,
+          rpc("tools/call", {
+            name: "grant-access",
+            arguments: { pubkey: OTHER_PUBKEY, vault: "personal", role: "write" },
+          }),
+        ),
+        mcpDeps(h),
+      );
+      const payload = parseTool(
+        (await res.json()) as { result: { content: Array<{ text: string }> } },
+      ) as { vault: string; created_user: boolean };
+      expect(payload.vault).toBe("personal");
+      expect(payload.created_user).toBe(true);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("friend Bearer named beta:read cannot grant even with write assignment", async () => {
+    const h = await makeHarness();
+    try {
+      const token = await bearer(h, ["account:self:vaults:beta:read"], h.friendId);
+      const res = await handleAccountMcp(
+        bearerReq(
+          token,
+          rpc("tools/call", {
+            name: "grant-access",
+            arguments: { pubkey: OTHER_PUBKEY, vault: "beta", role: "write" },
+          }),
+        ),
+        mcpDeps(h),
+      );
+      expect(
+        ((await res.json()) as { error?: { data?: { error_type?: string } } }).error?.data
+          ?.error_type,
+      ).toBe("grant_not_permitted");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("username collision on both n-prefixes refuses rather than granting the wrong user", async () => {
+    const h = await makeHarness();
+    try {
+      await createUser(h.db, `n${OTHER_PUBKEY.slice(0, 31)}`, "correct-horse-battery-staple", {
+        allowMulti: true,
+        passwordChanged: true,
+      });
+      await createUser(h.db, `n${OTHER_PUBKEY.slice(1, 32)}`, "correct-horse-battery-staple", {
+        allowMulti: true,
+        passwordChanged: true,
+      });
+      const res = await handleAccountMcp(
+        nostrReq(
+          OWNER_SECRET,
+          rpc("tools/call", {
+            name: "grant-access",
+            arguments: { pubkey: OTHER_PUBKEY, vault: "beta", role: "write" },
+          }),
+        ),
+        mcpDeps(h),
+      );
+      expect(
+        ((await res.json()) as { error?: { data?: { error_type?: string } } }).error?.data
+          ?.error_type,
+      ).toBe("username_taken");
+      expect(findPubkeyLink(h.db, OTHER_PUBKEY)).toBeNull();
     } finally {
       h.cleanup();
     }
