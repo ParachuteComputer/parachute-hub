@@ -10485,12 +10485,15 @@ describe("single OAuth consent + grantable vault admin + delegate-only cap (2026
       });
       expect(extras).not.toContain("account:vaults");
       expect(extras).not.toContain("account:self:vaults");
+      expect(extras).toContain("account:self:read");
+      expect(extras).toContain("account:self:write");
+      expect(extras).toContain("account:self:admin");
     } finally {
       cleanup();
     }
   });
 
-  test("grantable extras are empty when the client already asked for account:vaults", async () => {
+  test("grantable extras offer the REST ladder when the client already asked for account:vaults", async () => {
     const { db, cleanup } = await makeDb();
     try {
       const admin = await createUser(db, "admin", "pw");
@@ -10499,7 +10502,12 @@ describe("single OAuth consent + grantable vault admin + delegate-only cap (2026
         requested: ["account:vaults"],
         vaultName: undefined,
       });
-      expect(extras).toEqual([]);
+      expect(extras).toContain("account:self:read");
+      expect(extras).toContain("account:self:write");
+      expect(extras).toContain("account:self:admin");
+      expect(extras).not.toContain("vault:read");
+      expect(extras).not.toContain("vault:write");
+      expect(extras).not.toContain("account:vaults");
     } finally {
       cleanup();
     }
@@ -10783,7 +10791,7 @@ describe("single OAuth consent + grantable vault admin + delegate-only cap (2026
     }
   });
 
-  test("account:vaults cannot be combined with other scopes", async () => {
+  test("account:vaults cannot be combined with vault-audience scopes", async () => {
     const { db, cleanup } = await makeDb();
     try {
       const owner = await createUser(db, "owner", "pw");
@@ -10804,6 +10812,187 @@ describe("single OAuth consent + grantable vault admin + delegate-only cap (2026
       const loc = consentRes.headers.get("location") ?? "";
       expect(loc).toContain("error=invalid_scope");
       expect(loc).not.toContain("code=");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("account:vaults plus account:self:read mints both at aud=account", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const owner = await createUser(db, "owner", "pw");
+      const session = createSession(db, { userId: owner.id });
+      const reg = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        status: "approved",
+      });
+      const { verifier, challenge } = makePkce();
+      const consentRes = await submitConsent(
+        db,
+        session.id,
+        reg.client.clientId,
+        "account:vaults account:self:read",
+        challenge,
+      );
+      expect(consentRes.status).toBe(302);
+      const loc = consentRes.headers.get("location") ?? "";
+      expect(loc).not.toContain("error=");
+      const code = new URL(loc).searchParams.get("code");
+      const { scope, aud } = await redeemToScopeAud(db, code ?? "", reg.client.clientId, verifier);
+      expect(scope.split(" ").sort()).toEqual(["account:self:read", "account:self:vaults"]);
+      expect(aud).toBe("account");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("whole-account pick plus extra_scope account:self:admin at resource=/mcp mints both", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const owner = await createUser(db, "owner", "pw");
+      const session = createSession(db, { userId: owner.id });
+      const reg = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        status: "approved",
+      });
+      const { verifier, challenge } = makePkce();
+      const consentRes = await submitConsent(
+        db,
+        session.id,
+        reg.client.clientId,
+        "vault:read",
+        challenge,
+        {
+          vault_pick: VAULT_PICK_ACCOUNT,
+          extra_scope: "account:self:admin",
+          resource: `${ISSUER}/mcp`,
+        },
+      );
+      expect(consentRes.status).toBe(302);
+      const loc = consentRes.headers.get("location") ?? "";
+      expect(loc).not.toContain("error=");
+      const code = new URL(loc).searchParams.get("code");
+      const tokenForm = new URLSearchParams({
+        grant_type: "authorization_code",
+        code: code ?? "",
+        client_id: reg.client.clientId,
+        redirect_uri: "https://app.example/cb",
+        code_verifier: verifier,
+        resource: `${ISSUER}/mcp`,
+      });
+      const tokenRes = await handleToken(
+        db,
+        new Request(`${ISSUER}/oauth/token`, {
+          method: "POST",
+          body: tokenForm,
+          headers: { "content-type": "application/x-www-form-urlencoded" },
+        }),
+        capDeps,
+      );
+      expect(tokenRes.status).toBe(200);
+      const body = (await tokenRes.json()) as { access_token: string; scope: string };
+      const { payload } = await validateAccessToken(db, body.access_token, ISSUER);
+      expect(body.scope.split(" ").sort()).toEqual(["account:self:admin", "account:self:vaults"]);
+      expect(payload.aud).toBe("account");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("whole-account pick plus extra_scope account:self:admin mints both", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const owner = await createUser(db, "owner", "pw");
+      const session = createSession(db, { userId: owner.id });
+      const reg = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        status: "approved",
+      });
+      const { verifier, challenge } = makePkce();
+      const consentRes = await submitConsent(
+        db,
+        session.id,
+        reg.client.clientId,
+        "vault:read",
+        challenge,
+        { vault_pick: VAULT_PICK_ACCOUNT, extra_scope: "account:self:admin" },
+      );
+      expect(consentRes.status).toBe(302);
+      const loc = consentRes.headers.get("location") ?? "";
+      expect(loc).not.toContain("error=");
+      const code = new URL(loc).searchParams.get("code");
+      const { scope, aud } = await redeemToScopeAud(db, code ?? "", reg.client.clientId, verifier);
+      expect(scope.split(" ").sort()).toEqual(["account:self:admin", "account:self:vaults"]);
+      expect(scope.split(" ")).not.toContain("vault:read");
+      expect(aud).toBe("account");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("whole-account pick drops leftover named vault extras (XOR)", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      await createUser(db, "owner", "pw");
+      const friend = await createUser(db, "friend", "pw", { allowMulti: true });
+      setUserVaults(db, friend.id, ["work"]);
+      const session = createSession(db, { userId: friend.id });
+      const reg = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        status: "approved",
+      });
+      const { verifier, challenge } = makePkce();
+      const consentRes = await submitConsent(
+        db,
+        session.id,
+        reg.client.clientId,
+        "vault:read",
+        challenge,
+        { vault_pick: VAULT_PICK_ACCOUNT, extra_scope: "vault:work:write" },
+      );
+      expect(consentRes.status).toBe(302);
+      const loc = consentRes.headers.get("location") ?? "";
+      expect(loc).not.toContain("error=");
+      const code = new URL(loc).searchParams.get("code");
+      const { scope, aud } = await redeemToScopeAud(db, code ?? "", reg.client.clientId, verifier);
+      expect(scope.split(" ")).toEqual(["account:self:vaults"]);
+      expect(scope).not.toContain("vault:work:write");
+      expect(aud).toBe("account");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("GET account:vaults + account:self:read is not invalid_scope", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const owner = await createUser(db, "owner", "pw");
+      const session = createSession(db, { userId: owner.id });
+      const reg = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        status: "approved",
+      });
+      const { challenge } = makePkce();
+      const res = handleAuthorizeGet(
+        db,
+        new Request(
+          authorizeUrl({
+            client_id: reg.client.clientId,
+            redirect_uri: "https://app.example/cb",
+            response_type: "code",
+            code_challenge: challenge,
+            code_challenge_method: "S256",
+            scope: "account:vaults account:self:read",
+          }),
+          { headers: { cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, TTL_S)}` } },
+        ),
+        capDeps,
+      );
+      expect(res.status).toBe(200);
+      const html = await res.text();
+      expect(html).not.toContain("invalid_scope");
+      expect(html).toContain("account:vaults");
+      expect(html).toContain("account:self:read");
     } finally {
       cleanup();
     }
