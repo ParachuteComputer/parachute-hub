@@ -6,6 +6,23 @@ All notable changes to `@openparachute/hub` are documented here. The format foll
 >
 > This backfill covers the 0.6.x line only. Two pre-existing gaps remain undocumented and are **not** addressed here: the `0.5.13` stable itself (the file's newest entry is `0.5.13-rc.48`, never the stable) and the entire `0.5.14-rc` chain (rc.1–rc.21 on npm), which never promoted to a `0.5.14` stable — its work folded forward into 0.6.0.
 
+## [0.7.18-rc.5] - 2026-08-28
+
+**Account-MCP update-note.** One PR on `next` after 0.7.18-rc.4.
+Version bump only; no new code in this commit. Merging this to `next`
+does not publish. The following next→main PR publishes `@rc`.
+
+- **Account-MCP `update-note({vault, id, …})` (#896).** Option B
+  second slice. `vault` and `id` are required. Same per-call write
+  gate as `create-note` (named Bearer `:read` cannot mint write,
+  including first-admin). 60s `vault:<name>:write` mint PATCHes REST
+  `/api/notes/:id` (path ids encoded). `tools/list` and `tools/call`
+  share the filtered catalog; hidden tools are `Unknown tool`. Cloud
+  follow-up: parachute-cloud#275.
+
+Leaves #880 and #881 open. Auto-provision still defaults off. Do not
+suffix-drop 0.7.18.
+
 ## [0.7.18-rc.4] - 2026-08-27
 
 **Account-MCP at root `/mcp` (OAuth) plus create-note.** Two PRs on
