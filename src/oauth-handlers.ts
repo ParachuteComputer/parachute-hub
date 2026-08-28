@@ -168,8 +168,9 @@ function isUnnamedVaultScope(scope: string): boolean {
 
 /**
  * XOR rewrite: unnamed `vault:<verb>` becomes the account-MCP connection
- * grant. Named vault scopes and everything else stay put — the mint
- * choke-point still refuses mixing `account:vaults` with other families.
+ * grant. Named vault scopes stay put here; the `:account:` picker path
+ * drops them after this rewrite so they cannot combine-refuse. Same-
+ * audience `account:self:{read,write,admin}` extras ride through.
  */
 function replaceUnnamedVaultScopesWithAccountVaults(scopes: readonly string[]): string[] {
   const rest = scopes.filter((s) => !isUnnamedVaultScope(s));
@@ -1585,10 +1586,32 @@ function isAccountVaultsConnectionScope(scope: string): boolean {
   return scope === ACCOUNT_VAULTS_UNNARROWED || scope === accountVaultsScope("self");
 }
 
+function isAccountSelfRestScope(scope: string): boolean {
+  return (
+    scope === ACCOUNT_SELF_READ_SCOPE ||
+    scope === ACCOUNT_SELF_WRITE_SCOPE ||
+    scope === ACCOUNT_SELF_ADMIN_SCOPE
+  );
+}
+
+/** Same `aud=account` companions of the connection grant. RFC 8707 forbids
+ * mixing vault-audience scopes with `account:vaults`; it does not forbid
+ * `account:self:{read,write,admin}` — they share the account audience. */
+function isAccountAudienceCompanion(scope: string): boolean {
+  return isAccountVaultsConnectionScope(scope) || isAccountSelfRestScope(scope);
+}
+
+function isNamedVaultScope(scope: string): boolean {
+  const parts = scope.split(":");
+  const name = parts[1];
+  const verb = parts[2];
+  return parts.length === 3 && parts[0] === "vault" && !!name && !!verb && VAULT_VERBS.has(verb);
+}
+
 function accountVaultsCombinedWithOtherScopes(scopes: readonly string[]): boolean {
   const has = scopes.some(isAccountVaultsConnectionScope);
   if (!has) return false;
-  return scopes.some((s) => !isAccountVaultsConnectionScope(s));
+  return scopes.some((s) => !isAccountAudienceCompanion(s));
 }
 
 function capScopesToUserAuthority(
@@ -1681,16 +1704,24 @@ export function grantableExtraScopes(
   // The picker is the only path to `account:vaults`. Offering it as an extra
   // next to the client's vault scopes hits `accountVaultsCombinedWithOtherScopes`
   // at mint — a checkbox that looks grantable and then bounces the whole
-  // authorize. The reverse landmine (requested `account:vaults`, extras offer
-  // vault verbs) is the same XOR: extras would combine-refuse, so offer none.
-  if (opts.requested.some(isAccountVaultsConnectionScope)) return [];
+  // authorize. When the client already asked for the connection grant,
+  // vault extras are still that landmine (cross-audience), but the REST
+  // ladder is the same `aud=account` and is what "plus account access" means.
+  const restLadder = [ACCOUNT_SELF_READ_SCOPE, ACCOUNT_SELF_WRITE_SCOPE, ACCOUNT_SELF_ADMIN_SCOPE];
+  if (opts.requested.some(isAccountVaultsConnectionScope)) {
+    const already = new Set(opts.requested);
+    return capScopesToUserAuthority(
+      db,
+      userId,
+      restLadder.filter((c) => !already.has(c)),
+      { userIsAdmin: opts.userIsAdmin },
+    );
+  }
   const candidates = [
     ...(v
       ? [`vault:${v}:read`, `vault:${v}:write`, `vault:${v}:admin`]
       : ["vault:read", "vault:write", "vault:admin"]),
-    ACCOUNT_SELF_READ_SCOPE,
-    ACCOUNT_SELF_WRITE_SCOPE,
-    ACCOUNT_SELF_ADMIN_SCOPE,
+    ...restLadder,
   ];
 
   // Compare both naming shapes in one canonical key space. When an admin's
@@ -2191,7 +2222,9 @@ async function handleConsentSubmit(
           400,
         );
       }
-      scopes = replaceUnnamedVaultScopesWithAccountVaults(scopes);
+      scopes = replaceUnnamedVaultScopesWithAccountVaults(scopes).filter(
+        (s) => !isNamedVaultScope(s),
+      );
     } else {
       const manifest = (deps.loadServicesManifest ?? readServicesManifest)();
       const validNames = listVaultNames(manifest);

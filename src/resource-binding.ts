@@ -30,6 +30,11 @@
 import { ACCOUNT_VAULTS_UNNARROWED, accountVaultsScope } from "@openparachute/door-contract";
 
 import { VAULT_VERBS } from "./jwt-audience.ts";
+import {
+  ACCOUNT_SELF_ADMIN_SCOPE,
+  ACCOUNT_SELF_READ_SCOPE,
+  ACCOUNT_SELF_WRITE_SCOPE,
+} from "./scope-explanations.ts";
 
 /**
  * Two recognised per-vault resource shapes, both rooted at the hub origin:
@@ -200,8 +205,9 @@ export function narrowResourceVaultScopes(scopes: readonly string[], vaultName: 
 
 /**
  * The root-`/mcp` counterpart of `narrowResourceVaultScopes`: keep vault
- * scopes and the account-MCP connection grant (`account:vaults` /
- * `account:self:vaults`), drop everything else.
+ * scopes, the account-MCP connection grant (`account:vaults` /
+ * `account:self:vaults`), and same-audience `account:self:{read,write,admin}`,
+ * drop everything else.
  *
  * Root `/mcp` is two token shapes at one URL, branched on what arrives:
  * vault-audience Bearer still names one vault; `account:vaults` mints
@@ -210,8 +216,10 @@ export function narrowResourceVaultScopes(scopes: readonly string[], vaultName: 
  * verbatim: those scopes are unusable in either token this door mints, and
  * carrying them only inflates the consent surface.
  *
- * `account:vaults` cannot be combined with other scopes (authorize already
- * refuses that). This filter still keeps both if a client asked for both —
+ * `account:vaults` cannot be combined with vault-audience scopes (authorize
+ * already refuses that). Same-audience `account:self:{read,write,admin}`
+ * extras are keepable — they mint `aud=account` too. This filter still
+ * keeps a mixed vault + connection request if a client asked for both;
  * the combine check, not this function, is the refusal. Named
  * `account:self:vaults:<vault>` forms are NOT the connection grant and are
  * dropped here.
@@ -229,8 +237,18 @@ export function isAccountVaultsRootScope(scope: string): boolean {
   return scope === ACCOUNT_VAULTS_UNNARROWED || scope === accountVaultsScope("self");
 }
 
+function isAccountSelfRestScope(scope: string): boolean {
+  return (
+    scope === ACCOUNT_SELF_READ_SCOPE ||
+    scope === ACCOUNT_SELF_WRITE_SCOPE ||
+    scope === ACCOUNT_SELF_ADMIN_SCOPE
+  );
+}
+
 export function narrowRootMcpScopes(scopes: readonly string[]): string[] {
-  return scopes.filter((s) => s.split(":")[0] === "vault" || isAccountVaultsRootScope(s));
+  return scopes.filter(
+    (s) => s.split(":")[0] === "vault" || isAccountVaultsRootScope(s) || isAccountSelfRestScope(s),
+  );
 }
 
 /**
