@@ -2162,7 +2162,6 @@ describe("handleSetupVaultPost", () => {
       db.close();
     }
   }
-
 });
 
 // --- end-to-end through hubFetch -----------------------------------------
@@ -2642,26 +2641,39 @@ describe("done screen MCP command — OAuth-default, no auto-mint", () => {
       );
       expect(res.status).toBe(200);
       const html = await res.text();
-      // The bare OAuth command is the rendered command.
+      // Whole-house command is the recommended default; per-vault is the
+      // narrower option. Root `/mcp` is no longer the copy-paste target
+      // (its PRM is vault-only; `/account/mcp` is the honest house door).
       expect(html).toContain(
-        "claude mcp add --transport http parachute-default https://hub.example/mcp",
+        "claude mcp add --transport http parachute-account https://hub.example/account/mcp",
       );
+      expect(html).toContain(
+        "claude mcp add --transport http parachute-default https://hub.example/vault/default/mcp",
+      );
+      expect(html).toContain('data-testid="mcp-house-command"');
+      expect(html).toContain('data-testid="mcp-vault-command"');
       // Load-bearing regression (Austen's report): the rendered COMMAND
-      // (the MCP tile's <pre> block) must NOT carry a `--header
+      // (the MCP tile's <pre> blocks) must NOT carry a `--header
       // "Authorization: Bearer ..."` flag. This is the assertion that
       // would have caught the bug — the prior build baked the header into
       // the command. The headless-client fine print legitimately mentions
       // the header form with an escaped `<token>` placeholder, so we
-      // scope the negative assertion to the command block, not the whole
+      // scope the negative assertion to the command blocks, not the whole
       // document. Anchor to the MCP-tile <h2> so the regex can't drift
       // onto another tile's <pre> (e.g. the tailnet/public reachable
       // tile's bare Tailscale command) under a different expose mode.
-      const cmdPre = html.match(/<h2>Connect Claude Code \(MCP\)<\/h2>[\s\S]*?<pre>([^<]*)<\/pre>/);
-      expect(cmdPre).not.toBeNull();
-      const cmdText = cmdPre?.[1] ?? "";
-      expect(cmdText).not.toContain("--header");
-      expect(cmdText).not.toContain("Authorization");
-      expect(cmdText).not.toContain("Bearer");
+      const tile = html.match(
+        /<h2>Connect Claude Code \(MCP\)<\/h2>[\s\S]*?(?=<div class="done-tile">|$)/,
+      );
+      expect(tile).not.toBeNull();
+      const tileHtml = tile?.[0] ?? "";
+      const cmdPres = [...tileHtml.matchAll(/<pre[^>]*>([^<]*)<\/pre>/g)].map((m) => m[1]);
+      expect(cmdPres.length).toBe(2);
+      for (const cmdText of cmdPres) {
+        expect(cmdText).not.toContain("--header");
+        expect(cmdText).not.toContain("Authorization");
+        expect(cmdText).not.toContain("Bearer");
+      }
       // The document must NOT carry a real or masked Bearer token — the
       // only legitimate `Bearer` mention is the escaped placeholder in
       // the guidance.
@@ -3471,8 +3483,10 @@ describe("typed vault name (hub#267)", () => {
         },
       );
       const html = await res.text();
+      expect(html).toContain("parachute-account");
+      expect(html).toContain("https://hub.example/account/mcp");
       expect(html).toContain("parachute-my-personal-vault");
-      expect(html).toContain("https://hub.example/mcp");
+      expect(html).toContain("https://hub.example/vault/my-personal-vault/mcp");
     } finally {
       db.close();
     }

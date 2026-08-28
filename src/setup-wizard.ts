@@ -69,6 +69,10 @@ import {
   setSetting,
 } from "./hub-settings.ts";
 import { signAccessToken } from "./jwt-sign.ts";
+import {
+  accountClaudeMcpAddCommand,
+  assignedVaultClaudeMcpAddCommand,
+} from "./mcp-connect-commands.ts";
 import { escapeHtml } from "./oauth-ui.ts";
 import {
   type IssueOperatorTokenResult,
@@ -1130,9 +1134,9 @@ export function renderDoneStep(props: RenderDoneStepProps): string {
 }
 
 /**
- * The MCP-connect tile. Renders the bare `claude mcp add` command —
+ * The MCP-connect tile. Renders two bare `claude mcp add` commands —
  * no token, no `--header`. Vault/init is OAuth-default (parachute-vault
- * #491), so the command triggers browser OAuth on first use: the
+ * #491), so each command triggers browser OAuth on first use: the
  * operator signs in to this hub + approves access, and Claude Code
  * stores the resulting credential. For headless clients that can't do
  * the browser flow, the fine print points at `/admin/tokens` (the
@@ -1147,24 +1151,32 @@ export function renderDoneStep(props: RenderDoneStepProps): string {
  * was a privilege over-grant + a shoulder-surf hazard. The bare OAuth
  * command was always the correct UX; it's now the only one.
  *
- * URL shape (hub#777): points at the canonical root `<hubOrigin>/mcp`
- * rather than the per-vault `/vault/<name>/mcp` form — root `/mcp` is
- * vault-agnostic (the OAuth consent picks the audience), so it stays
- * correct even if the operator renames this vault or adds more later.
- * At this point in the wizard there's exactly one vault, so the OAuth
- * consent screen has nothing to pick between. The server name stays
- * `parachute-<vault>` so the connection is still labeled by vault.
+ * URL shape: lead with `/account/mcp` (whole house / all assigned
+ * vaults). That is vault-agnostic — it stays correct if this vault is
+ * renamed or more vaults are added — and its PRM advertises
+ * `account:vaults` alone, so a catalog-copy OAuth client can actually
+ * complete. Root `/mcp` OAuth discovery is the one-vault path (its PRM
+ * is vault-only; advertising `account:vaults` there next to `vault:*`
+ * would bounce the whole authorize request). NIP-98 clients can still
+ * POST a signed request to `/account/mcp` or `/mcp`. The per-vault
+ * command is the narrower OAuth option.
  */
 function renderMcpTile(vaultName: string, hubOrigin: string): string {
   const safeVault = escapeHtml(vaultName);
-  const bareCmd = `claude mcp add --transport http parachute-${vaultName} ${hubOrigin}/mcp`;
+  const houseCmd = accountClaudeMcpAddCommand(hubOrigin);
+  const vaultCmd = assignedVaultClaudeMcpAddCommand(hubOrigin, vaultName);
   return `<div class="done-tile">
     <h2>Connect Claude Code (MCP)</h2>
-    <p>Wire <code>vault:${safeVault}</code> into Claude Code as an MCP server:</p>
-    <pre>${escapeHtml(bareCmd)}</pre>
+    <p>All assigned vaults — one connection, capability grows from grants:</p>
+    <pre data-testid="mcp-house-command">${escapeHtml(houseCmd)}</pre>
+    <p>Or just this vault (<code>vault:${safeVault}</code>):</p>
+    <pre data-testid="mcp-vault-command">${escapeHtml(vaultCmd)}</pre>
     <p class="fine">No token needed — the command triggers browser OAuth on
-      first use (you sign in to this hub and approve access). For headless
-      clients that can't do the browser flow, mint a hub token at
+      first use (you sign in to this hub and approve access). The whole-house
+      URL is <code>/account/mcp</code>. Root <code>/mcp</code> is the
+      one-vault OAuth path; NIP-98 clients can still POST a signed request
+      there. For headless clients that can't do the browser flow, mint a hub
+      token at
       <a href="/admin/tokens"><code>/admin/tokens</code></a> (or with
       <code>parachute auth mint-token</code>) and append
       <code>--header "Authorization: Bearer &lt;token&gt;"</code>.</p>
