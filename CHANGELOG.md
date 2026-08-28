@@ -6,6 +6,22 @@ All notable changes to `@openparachute/hub` are documented here. The format foll
 >
 > This backfill covers the 0.6.x line only. Two pre-existing gaps remain undocumented and are **not** addressed here: the `0.5.13` stable itself (the file's newest entry is `0.5.13-rc.48`, never the stable) and the entire `0.5.14-rc` chain (rc.1–rc.21 on npm), which never promoted to a `0.5.14` stable — its work folded forward into 0.6.0.
 
+## [0.7.18-rc.7] - 2026-08-28
+
+**Same-audience REST extras with whole-account pick.** One PR on
+`next` after 0.7.18-rc.6. Version bump only; no new code in this
+commit. Merging this to `next` does not publish. The following
+next→main PR publishes `@rc`.
+
+- **Allow `account:self:{read,write,admin}` next to `account:vaults`
+  (#904).** Live bounce on rc.6: All assigned vaults plus Grant
+  additional access was `invalid_scope`. Those extras share
+  `aud=account`; vault-audience mixes still refuse. `:account:` pick
+  drops leftover named vault extras. Root PRM stays vault-only.
+
+Leaves #880, #881, and #899 open. Auto-provision still defaults off. Do
+not suffix-drop 0.7.18.
+
 ## [0.7.18-rc.6] - 2026-08-28
 
 **Consent picker XOR at `/mcp`.** Two PRs on `next` after 0.7.18-rc.5.
