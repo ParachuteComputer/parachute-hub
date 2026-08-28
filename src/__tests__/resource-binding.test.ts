@@ -204,6 +204,18 @@ describe("narrowRootMcpScopes", () => {
     ]);
   });
 
+  test("keeps same-audience account:self REST ladder with the connection grant", () => {
+    expect(
+      narrowRootMcpScopes([
+        "account:vaults",
+        "account:self:read",
+        "account:self:write",
+        "account:self:admin",
+        "scribe:admin",
+      ]),
+    ).toEqual(["account:vaults", "account:self:read", "account:self:write", "account:self:admin"]);
+  });
+
   test("keeps vault scopes and account:vaults together (combine check refuses later)", () => {
     expect(narrowRootMcpScopes(["vault:read", "account:vaults", "scribe:admin"])).toEqual([
       "vault:read",
