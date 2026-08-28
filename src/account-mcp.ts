@@ -34,7 +34,13 @@ import {
 } from "@openparachute/door-contract";
 import { type AccountVaultMeta, listVaultsWithMeta } from "./account-api.ts";
 import { HOST_ADMIN_SCOPE, provisionVault } from "./admin-vaults.ts";
-import { GrantError, callerCanAdminVault, grantAccess, listAccess, revokeAccess } from "./grant-access.ts";
+import {
+  GrantError,
+  callerCanAdminVault,
+  grantAccess,
+  listAccess,
+  revokeAccess,
+} from "./grant-access.ts";
 import { signAccessToken } from "./jwt-sign.ts";
 import { getUserById, isFirstAdmin, vaultVerbsForUserVault } from "./users.ts";
 
@@ -331,6 +337,27 @@ function buildNotesQuery(args: Record<string, unknown>): string {
     const clamped = Math.min(Math.max(1, Math.floor(rawLimit)), MAX_NOTES_LIMIT);
     p.set("limit", String(clamped));
   }
+  // Vault REST defaults: created_at ASC, lean ~120-char preview. Forward the
+  // params that make "latest notes with bodies" expressible. Unknown sort is
+  // dropped rather than 400'd so a hallucinated value does not fail the fan-out.
+  if (args.sort === "asc" || args.sort === "desc") p.set("sort", args.sort);
+  if (typeof args.order_by === "string" && args.order_by.length > 0) {
+    p.set("order_by", args.order_by);
+  }
+  if (args.include_content === true || args.include_content === "true") {
+    p.set("include_content", "true");
+  } else if (args.include_content === false || args.include_content === "false") {
+    p.set("include_content", "false");
+  }
+  const rawOffset =
+    typeof args.offset === "number"
+      ? args.offset
+      : typeof args.offset === "string"
+        ? Number.parseInt(args.offset, 10)
+        : undefined;
+  if (rawOffset !== undefined && Number.isFinite(rawOffset) && rawOffset >= 0) {
+    p.set("offset", String(Math.floor(rawOffset)));
+  }
   return p.toString();
 }
 
@@ -396,7 +423,10 @@ const queryNotesTool: AccountMcpTool = {
   description:
     "Search notes across the vaults this connection can reach. Omit `vault` to fan the query out " +
     "(results are grouped per vault, not ranked across vaults); pass `vault` to target one. " +
-    "Supports keyword `search`, `tag` and `metadata` filters, and `limit`.",
+    "Default order is created_at ASC (oldest first) and the lean ~120-char preview — pass " +
+    '`sort: "desc"` for newest-first and `include_content: true` for bodies. Also: keyword ' +
+    "`search`, `tag`, `metadata`, `limit` (per vault, default 50), `order_by` (`updated_at` or " +
+    "an indexed field), `offset`.",
   inputSchema: {
     type: "object",
     properties: {
@@ -416,6 +446,25 @@ const queryNotesTool: AccountMcpTool = {
         description: 'Structured metadata filters, e.g. {"status":{"eq":"open"}}.',
       },
       limit: { type: "number", description: "Maximum notes per vault (default 50)." },
+      sort: {
+        type: "string",
+        enum: ["asc", "desc"],
+        description: "Order by created_at. Default asc (oldest first). Pass desc for newest first.",
+      },
+      order_by: {
+        type: "string",
+        description:
+          "Sort by this field instead of created_at. `updated_at` needs no schema; other " +
+          "fields must be indexed on the target vault.",
+      },
+      include_content: {
+        type: "boolean",
+        description: "Return full note bodies. Default false: lean rows with a ~120-char preview.",
+      },
+      offset: {
+        type: "number",
+        description: "Skip this many notes per vault (default 0).",
+      },
     },
     additionalProperties: false,
   },
@@ -453,7 +502,8 @@ function noteUpdateBody(args: Record<string, unknown>): Record<string, unknown> 
   if (typeof args.content === "string") body.content = args.content;
   if (typeof args.append === "string") body.append = args.append;
   if (typeof args.prepend === "string") body.prepend = args.prepend;
-  if (args.content_edit && typeof args.content_edit === "object") body.content_edit = args.content_edit;
+  if (args.content_edit && typeof args.content_edit === "object")
+    body.content_edit = args.content_edit;
   if (typeof args.path === "string") body.path = args.path;
   if (args.tags && typeof args.tags === "object") body.tags = args.tags;
   if (args.metadata && typeof args.metadata === "object" && args.metadata !== null) {
@@ -749,9 +799,7 @@ export function toolsForPrincipal(ctx: AccountToolContext): readonly AccountMcpT
   const installed = installedVaults(ctx);
   const coverage = resolveCoverage(ctx.db, ctx.principal, installed);
   const canWrite = coverage.vaults.some((v) => canWriteVault(ctx.db, ctx.principal, v.name));
-  const canAdmin = coverage.vaults.some((v) =>
-    callerCanAdminVault(ctx.db, ctx.principal, v.name),
-  );
+  const canAdmin = coverage.vaults.some((v) => callerCanAdminVault(ctx.db, ctx.principal, v.name));
   const create = canCreate(ctx.principal);
   return ACCOUNT_MCP_TOOLS.filter((t) => {
     if (t.name === "create-vault") return create;

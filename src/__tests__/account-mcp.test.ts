@@ -10,7 +10,8 @@ import type { Database } from "bun:sqlite";
  *     auto-provisioned = empty; read-role still lists + queries;
  *   - create-vault: owner yes, friend no, no token in the tool result;
  *   - query-notes: fan-out attribution + one-vault failure isolation +
- *     vault_not_covered fail-closed;
+ *     vault_not_covered fail-closed; sort/include_content/order_by/offset
+ *     forwarded to vault REST;
  *   - grant-access: grant-first creates a key-only user; one-row upsert;
  *     friend write can grant their vault, read cannot; owner unrestricted
  *     is a no-op; revoke leaves the user; list-access is pubkey-shaped;
@@ -599,7 +600,9 @@ describe("account MCP — create-vault", () => {
         ),
         mcpDeps(h),
       );
-      const body = (await res.json()) as { result?: { isError?: boolean; content?: Array<{ text?: string }> } };
+      const body = (await res.json()) as {
+        result?: { isError?: boolean; content?: Array<{ text?: string }> };
+      };
       expect(body.result?.isError).toBe(true);
       expect(body.result?.content?.[0]?.text).toMatch(/Unknown tool: create-vault/);
     } finally {
@@ -710,6 +713,107 @@ describe("account MCP — query-notes", () => {
     }
   });
 
+  test("forwards sort, include_content, order_by, offset to vault REST", async () => {
+    const h = await makeHarness();
+    try {
+      const seen: string[] = [];
+      const fetchImpl = async (input: string | URL | Request) => {
+        const href =
+          typeof input === "string"
+            ? input
+            : input instanceof URL
+              ? input.href
+              : (input as Request).url;
+        seen.push(href);
+        return Response.json([{ id: "n-beta" }], { status: 200 });
+      };
+      const res = await handleAccountMcp(
+        nostrReq(
+          FRIEND_SECRET,
+          rpc("tools/call", {
+            name: "query-notes",
+            arguments: {
+              vault: "beta",
+              sort: "desc",
+              include_content: true,
+              order_by: "updated_at",
+              offset: 2,
+              limit: 3,
+            },
+          }),
+        ),
+        mcpDeps(h, { fetchImpl }),
+      );
+      expect(res.status).toBe(200);
+      expect(seen).toHaveLength(1);
+      const u = new URL(seen[0]!);
+      expect(u.searchParams.get("sort")).toBe("desc");
+      expect(u.searchParams.get("include_content")).toBe("true");
+      expect(u.searchParams.get("order_by")).toBe("updated_at");
+      expect(u.searchParams.get("offset")).toBe("2");
+      expect(u.searchParams.get("limit")).toBe("3");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("omits unknown sort rather than forwarding it", async () => {
+    const h = await makeHarness();
+    try {
+      const seen: string[] = [];
+      const fetchImpl = async (input: string | URL | Request) => {
+        const href =
+          typeof input === "string"
+            ? input
+            : input instanceof URL
+              ? input.href
+              : (input as Request).url;
+        seen.push(href);
+        return Response.json([], { status: 200 });
+      };
+      await handleAccountMcp(
+        nostrReq(
+          FRIEND_SECRET,
+          rpc("tools/call", {
+            name: "query-notes",
+            arguments: { vault: "beta", sort: "newest" },
+          }),
+        ),
+        mcpDeps(h, { fetchImpl }),
+      );
+      expect(seen).toHaveLength(1);
+      const u = new URL(seen[0]!);
+      expect(u.searchParams.has("sort")).toBe(false);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("tools/list advertises sort and include_content on query-notes", async () => {
+    const h = await makeHarness();
+    try {
+      const token = await bearer(h, [HOST_ADMIN_SCOPE]);
+      const listed = await handleAccountMcp(bearerReq(token, rpc("tools/list")), mcpDeps(h));
+      const listBody = (await listed.json()) as {
+        result: {
+          tools: Array<{
+            name: string;
+            description?: string;
+            inputSchema?: { properties?: Record<string, unknown> };
+          }>;
+        };
+      };
+      const qn = listBody.result.tools.find((t) => t.name === "query-notes");
+      expect(qn?.inputSchema?.properties).toHaveProperty("sort");
+      expect(qn?.inputSchema?.properties).toHaveProperty("include_content");
+      expect(qn?.inputSchema?.properties).toHaveProperty("order_by");
+      expect(qn?.description).toMatch(/sort/);
+      expect(qn?.description).toMatch(/include_content/);
+    } finally {
+      h.cleanup();
+    }
+  });
+
   test("friend can query their assigned vault", async () => {
     const h = await makeHarness();
     try {
@@ -800,12 +904,16 @@ describe("account MCP — create-note", () => {
             arguments: { vault: "beta", content: "nope" },
           }),
         ),
-        mcpDeps(h, { fetchImpl: async () => {
-          fetched += 1;
-          return Response.json({}, { status: 201 });
-        } }),
+        mcpDeps(h, {
+          fetchImpl: async () => {
+            fetched += 1;
+            return Response.json({}, { status: 201 });
+          },
+        }),
       );
-      const body = (await res.json()) as { result?: { isError?: boolean; content?: Array<{ text?: string }> } };
+      const body = (await res.json()) as {
+        result?: { isError?: boolean; content?: Array<{ text?: string }> };
+      };
       expect(body.result?.isError).toBe(true);
       expect(body.result?.content?.[0]?.text).toMatch(/Unknown tool: create-note/);
       expect(fetched).toBe(0);
@@ -824,10 +932,12 @@ describe("account MCP — create-note", () => {
           token,
           rpc("tools/call", { name: "create-note", arguments: { vault: "beta", content: "nope" } }),
         ),
-        mcpDeps(h, { fetchImpl: async () => {
-          fetched += 1;
-          return Response.json({}, { status: 201 });
-        } }),
+        mcpDeps(h, {
+          fetchImpl: async () => {
+            fetched += 1;
+            return Response.json({}, { status: 201 });
+          },
+        }),
       );
       const body = (await res.json()) as {
         result?: { isError?: boolean; content?: Array<{ text?: string }> };
@@ -850,10 +960,12 @@ describe("account MCP — create-note", () => {
           token,
           rpc("tools/call", { name: "create-note", arguments: { vault: "beta", content: "nope" } }),
         ),
-        mcpDeps(h, { fetchImpl: async () => {
-          fetched += 1;
-          return Response.json({}, { status: 201 });
-        } }),
+        mcpDeps(h, {
+          fetchImpl: async () => {
+            fetched += 1;
+            return Response.json({}, { status: 201 });
+          },
+        }),
       );
       const body = (await res.json()) as {
         result?: { isError?: boolean; content?: Array<{ text?: string }> };
@@ -872,7 +984,9 @@ describe("account MCP — create-note", () => {
       const seen: string[] = [];
       const fetchImpl = async (input: string | URL | Request, init?: RequestInit) => {
         const req = input instanceof Request ? input : new Request(String(input), init);
-        const parts = (req.headers.get("authorization") ?? "").replace(/^Bearer\s+/i, "").split(".");
+        const parts = (req.headers.get("authorization") ?? "")
+          .replace(/^Bearer\s+/i, "")
+          .split(".");
         const payload = JSON.parse(Buffer.from(parts[1] ?? "", "base64url").toString()) as {
           scope?: string;
         };
@@ -939,10 +1053,7 @@ describe("account MCP — create-note", () => {
         label: "test",
         now: new Date(),
       });
-      const listed = await handleAccountMcp(
-        nostrReq(readerSecret, rpc("tools/list")),
-        mcpDeps(h),
-      );
+      const listed = await handleAccountMcp(nostrReq(readerSecret, rpc("tools/list")), mcpDeps(h));
       const names = (
         (await listed.json()) as { result: { tools: Array<{ name: string }> } }
       ).result.tools.map((t) => t.name);
@@ -1085,7 +1196,10 @@ describe("account MCP — update-note", () => {
       const res = await handleAccountMcp(
         bearerReq(
           token,
-          rpc("tools/call", { name: "update-note", arguments: { vault: "beta", id: "n1", content: "nope" } }),
+          rpc("tools/call", {
+            name: "update-note",
+            arguments: { vault: "beta", id: "n1", content: "nope" },
+          }),
         ),
         mcpDeps(h, {
           fetchImpl: async () => {
@@ -1111,7 +1225,9 @@ describe("account MCP — update-note", () => {
       const seen: Array<{ method: string; scope: string }> = [];
       const fetchImpl = async (input: string | URL | Request, init?: RequestInit) => {
         const req = input instanceof Request ? input : new Request(String(input), init);
-        const parts = (req.headers.get("authorization") ?? "").replace(/^Bearer\s+/i, "").split(".");
+        const parts = (req.headers.get("authorization") ?? "")
+          .replace(/^Bearer\s+/i, "")
+          .split(".");
         const payload = JSON.parse(Buffer.from(parts[1] ?? "", "base64url").toString()) as {
           scope?: string;
         };
@@ -1568,7 +1684,9 @@ describe("account MCP — grant-access", () => {
         ),
         mcpDeps(h),
       );
-      const body = (await res.json()) as { result?: { isError?: boolean; content?: Array<{ text?: string }> } };
+      const body = (await res.json()) as {
+        result?: { isError?: boolean; content?: Array<{ text?: string }> };
+      };
       expect(body.result?.isError).toBe(true);
       expect(body.result?.content?.[0]?.text).toMatch(/Unknown tool: grant-access/);
     } finally {
@@ -1817,8 +1935,11 @@ describe("account MCP — grant-access", () => {
         mcpDeps(h),
       );
       expect(
-        ((await personal.json()) as { result?: { isError?: boolean; content?: Array<{ text?: string }> } })
-          .result?.content?.[0]?.text,
+        (
+          (await personal.json()) as {
+            result?: { isError?: boolean; content?: Array<{ text?: string }> };
+          }
+        ).result?.content?.[0]?.text,
       ).toMatch(/Unknown tool: grant-access/);
       const beta = await handleAccountMcp(
         bearerReq(
@@ -1831,8 +1952,11 @@ describe("account MCP — grant-access", () => {
         mcpDeps(h),
       );
       expect(
-        ((await beta.json()) as { result?: { isError?: boolean; content?: Array<{ text?: string }> } })
-          .result?.content?.[0]?.text,
+        (
+          (await beta.json()) as {
+            result?: { isError?: boolean; content?: Array<{ text?: string }> };
+          }
+        ).result?.content?.[0]?.text,
       ).toMatch(/Unknown tool: grant-access/);
     } finally {
       h.cleanup();
@@ -1878,8 +2002,11 @@ describe("account MCP — grant-access", () => {
         mcpDeps(h),
       );
       expect(
-        ((await res.json()) as { result?: { isError?: boolean; content?: Array<{ text?: string }> } })
-          .result?.content?.[0]?.text,
+        (
+          (await res.json()) as {
+            result?: { isError?: boolean; content?: Array<{ text?: string }> };
+          }
+        ).result?.content?.[0]?.text,
       ).toMatch(/Unknown tool: grant-access/);
     } finally {
       h.cleanup();
