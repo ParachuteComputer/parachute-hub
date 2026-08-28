@@ -14,6 +14,8 @@ import type { Database } from "bun:sqlite";
  *   - grant-access: grant-first creates a key-only user; one-row upsert;
  *     friend write can grant their vault, read cannot; owner unrestricted
  *     is a no-op; revoke leaves the user; list-access is pubkey-shaped;
+ *   - create-note / update-note: vault required; write-audience mint;
+ *     catalog-hidden below write; PATCH encodes path ids;
  *   - descriptor advertises account_mcp_endpoint (see account-api.test).
  */
 import { describe, expect, test } from "bun:test";
@@ -438,6 +440,7 @@ describe("account MCP — initialize + tools", () => {
         "create-vault",
         "query-notes",
         "create-note",
+        "update-note",
         "grant-access",
         "revoke-access",
         "list-access",
@@ -945,8 +948,229 @@ describe("account MCP — create-note", () => {
       ).result.tools.map((t) => t.name);
       expect(names).toEqual(["list-vaults", "query-notes"]);
       expect(names).not.toContain("create-note");
+      expect(names).not.toContain("update-note");
       expect(names).not.toContain("grant-access");
       expect(names).not.toContain("create-vault");
+    } finally {
+      h.cleanup();
+    }
+  });
+});
+
+describe("account MCP — update-note", () => {
+  test("owner PATCHes the named vault with a write-audience mint", async () => {
+    const h = await makeHarness();
+    try {
+      const seen: Array<{ url: string; method: string; scope: string; body: unknown }> = [];
+      const fetchImpl = async (input: string | URL | Request, init?: RequestInit) => {
+        const req = input instanceof Request ? input : new Request(String(input), init);
+        const auth = req.headers.get("authorization") ?? "";
+        const parts = auth.replace(/^Bearer\s+/i, "").split(".");
+        const payload = JSON.parse(Buffer.from(parts[1] ?? "", "base64url").toString()) as {
+          scope?: string;
+        };
+        seen.push({
+          url: req.url,
+          method: req.method,
+          scope: payload.scope ?? "",
+          body: JSON.parse(await req.text()),
+        });
+        return Response.json({ id: "n1", path: "Log/hello", content: "there" }, { status: 200 });
+      };
+      const res = await handleAccountMcp(
+        nostrReq(
+          OWNER_SECRET,
+          rpc("tools/call", {
+            name: "update-note",
+            arguments: { vault: "beta", id: "n1", content: "there" },
+          }),
+        ),
+        mcpDeps(h, { fetchImpl }),
+      );
+      const out = parseTool(
+        (await res.json()) as { result: { content: Array<{ text: string }> } },
+      ) as { vault: string; note: { id: string; content: string } };
+      expect(out.vault).toBe("beta");
+      expect(out.note.id).toBe("n1");
+      expect(out.note.content).toBe("there");
+      expect(seen).toHaveLength(1);
+      expect(seen[0]?.url).toContain("/vault/beta/api/notes/n1");
+      expect(seen[0]?.method).toBe("PATCH");
+      expect(seen[0]?.scope).toBe("vault:beta:write");
+      expect(seen[0]?.body).toEqual({ content: "there" });
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("path id is encoded on the PATCH URL", async () => {
+    const h = await makeHarness();
+    try {
+      const seen: string[] = [];
+      const fetchImpl = async (input: string | URL | Request, init?: RequestInit) => {
+        const req = input instanceof Request ? input : new Request(String(input), init);
+        seen.push(req.url);
+        return Response.json({ id: "n1", path: "Log/hello" }, { status: 200 });
+      };
+      const res = await handleAccountMcp(
+        nostrReq(
+          OWNER_SECRET,
+          rpc("tools/call", {
+            name: "update-note",
+            arguments: { vault: "beta", id: "Log/hello", append: " more", force: true },
+          }),
+        ),
+        mcpDeps(h, { fetchImpl }),
+      );
+      expect(res.status).toBe(200);
+      expect(seen).toHaveLength(1);
+      expect(seen[0]).toContain("/vault/beta/api/notes/Log%2Fhello");
+      expect(seen[0]).not.toContain("/api/notes/Log/hello");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("read-role cannot update-note — Unknown tool, fetch never called", async () => {
+    const h = await makeHarness();
+    const readerSecret = hexToBytes("66".repeat(32));
+    const readerPub = bytesToHex(schnorr.getPublicKey(readerSecret));
+    let fetched = 0;
+    try {
+      const reader = await createUser(h.db, "reader3", "correct-horse-battery-staple", {
+        allowMulti: true,
+        passwordChanged: true,
+        assignedVaults: ["beta"],
+        role: "read",
+      });
+      bindPubkeyFromHttpAuth(h.db, {
+        userId: reader.id,
+        pubkey: readerPub,
+        proofEvent: "{}",
+        proofEventId: "f".repeat(64),
+        label: "test",
+        now: new Date(),
+      });
+      const res = await handleAccountMcp(
+        nostrReq(
+          readerSecret,
+          rpc("tools/call", {
+            name: "update-note",
+            arguments: { vault: "beta", id: "n1", content: "nope" },
+          }),
+        ),
+        mcpDeps(h, {
+          fetchImpl: async () => {
+            fetched += 1;
+            return Response.json({}, { status: 200 });
+          },
+        }),
+      );
+      const body = (await res.json()) as {
+        result?: { isError?: boolean; content?: Array<{ text?: string }> };
+      };
+      expect(body.result?.isError).toBe(true);
+      expect(body.result?.content?.[0]?.text).toMatch(/Unknown tool: update-note/);
+      expect(fetched).toBe(0);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("first-admin Bearer named beta:read cannot update-note on beta", async () => {
+    const h = await makeHarness();
+    let fetched = 0;
+    try {
+      const token = await bearer(h, ["account:self:vaults:beta:read"], h.ownerId);
+      const res = await handleAccountMcp(
+        bearerReq(
+          token,
+          rpc("tools/call", { name: "update-note", arguments: { vault: "beta", id: "n1", content: "nope" } }),
+        ),
+        mcpDeps(h, {
+          fetchImpl: async () => {
+            fetched += 1;
+            return Response.json({}, { status: 200 });
+          },
+        }),
+      );
+      const body = (await res.json()) as {
+        result?: { isError?: boolean; content?: Array<{ text?: string }> };
+      };
+      expect(body.result?.isError).toBe(true);
+      expect(body.result?.content?.[0]?.text).toMatch(/Unknown tool: update-note/);
+      expect(fetched).toBe(0);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("friend NIP-98 write-role can update-note on the assigned vault", async () => {
+    const h = await makeHarness();
+    try {
+      const seen: Array<{ method: string; scope: string }> = [];
+      const fetchImpl = async (input: string | URL | Request, init?: RequestInit) => {
+        const req = input instanceof Request ? input : new Request(String(input), init);
+        const parts = (req.headers.get("authorization") ?? "").replace(/^Bearer\s+/i, "").split(".");
+        const payload = JSON.parse(Buffer.from(parts[1] ?? "", "base64url").toString()) as {
+          scope?: string;
+        };
+        seen.push({ method: req.method, scope: payload.scope ?? "" });
+        return Response.json({ id: "n-friend", content: "edited" }, { status: 200 });
+      };
+      const res = await handleAccountMcp(
+        nostrReq(
+          FRIEND_SECRET,
+          rpc("tools/call", {
+            name: "update-note",
+            arguments: { vault: "beta", id: "n-friend", append: " more" },
+          }),
+        ),
+        mcpDeps(h, { fetchImpl }),
+      );
+      const out = parseTool(
+        (await res.json()) as { result: { content: Array<{ text: string }> } },
+      ) as { vault: string; note: { id: string } };
+      expect(out.vault).toBe("beta");
+      expect(out.note.id).toBe("n-friend");
+      expect(seen).toEqual([{ method: "PATCH", scope: "vault:beta:write" }]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("missing id is invalid_id", async () => {
+    const h = await makeHarness();
+    try {
+      const res = await handleAccountMcp(
+        nostrReq(
+          OWNER_SECRET,
+          rpc("tools/call", { name: "update-note", arguments: { vault: "beta", content: "x" } }),
+        ),
+        mcpDeps(h),
+      );
+      const body = (await res.json()) as { error?: { data?: { error_type?: string } } };
+      expect(body.error?.data?.error_type).toBe("invalid_id");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("unassigned vault is vault_not_covered", async () => {
+    const h = await makeHarness();
+    try {
+      const res = await handleAccountMcp(
+        nostrReq(
+          FRIEND_SECRET,
+          rpc("tools/call", {
+            name: "update-note",
+            arguments: { vault: "personal", id: "n1", content: "nope" },
+          }),
+        ),
+        mcpDeps(h),
+      );
+      const body = (await res.json()) as { error?: { data?: { error_type?: string } } };
+      expect(body.error?.data?.error_type).toBe("vault_not_covered");
     } finally {
       h.cleanup();
     }
