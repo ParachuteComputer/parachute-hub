@@ -22,6 +22,8 @@ import {
   accountMcpEndpoint,
   assignedVaultClaudeMcpAddCommand,
   assignedVaultMcpEndpoint,
+  rootClaudeMcpAddCommand,
+  rootMcpEndpoint,
 } from "../mcp-connect-commands.ts";
 import type { VaultVerb } from "../users.ts";
 
@@ -179,8 +181,9 @@ describe("renderAccountHome", () => {
     // The MCP endpoint + connect command also drop the trailing slash — no
     // `//vault` or `//account` double-slash sneaks in.
     expect(html).toContain(`${HUB_ORIGIN}/vault/alice/mcp`);
-    expect(html).toContain(`${HUB_ORIGIN}/account/mcp`);
+    expect(html).toContain(`${HUB_ORIGIN}/mcp`);
     expect(html).not.toContain(`${HUB_ORIGIN}//vault`);
+    expect(html).not.toContain(`${HUB_ORIGIN}//mcp`);
     expect(html).not.toContain(`${HUB_ORIGIN}//account`);
   });
 
@@ -566,6 +569,10 @@ describe("renderAccountHome", () => {
     expect(accountClaudeMcpAddCommand("https://hub.example")).toBe(
       "claude mcp add --transport http parachute-account https://hub.example/account/mcp",
     );
+    expect(rootMcpEndpoint("https://hub.example")).toBe("https://hub.example/mcp");
+    expect(rootClaudeMcpAddCommand("https://hub.example")).toBe(
+      "claude mcp add --transport http parachute https://hub.example/mcp",
+    );
   });
 
   test("escapes hostile content in username and vault name", () => {
@@ -716,13 +723,13 @@ describe("renderAccountHome", () => {
     // suffix is load-bearing (only it returns the WWW-Authenticate header).
     expect(html).toContain(`${HUB_ORIGIN}/vault/alice/mcp`);
     expect(html).toMatch(/data-testid="onboarding-mcp-endpoint">[^<]*\/vault\/alice\/mcp</);
-    // Whole-house /account/mcp is the labeled second option, not a replacement.
+    // Root `/mcp` is the labeled second option (picker at consent), not a
+    // replacement for the per-vault door. `/account/mcp` is not shown.
     expect(html).toContain('data-testid="onboarding-house"');
-    expect(html).toContain("All assigned vaults");
-    expect(html).toMatch(/data-testid="onboarding-account-mcp-endpoint">[^<]*\/account\/mcp</);
-    expect(html).toContain(
-      `claude mcp add --transport http parachute-account ${HUB_ORIGIN}/account/mcp`,
-    );
+    expect(html).toContain("This hub");
+    expect(html).toMatch(/data-testid="onboarding-hub-mcp-endpoint">[^<]*\/mcp</);
+    expect(html).toContain(`claude mcp add --transport http parachute ${HUB_ORIGIN}/mcp`);
+    expect(html).not.toContain("/account/mcp");
     // Both connect methods are inline in step ②.
     expect(html).toContain('data-testid="onboarding-mcp-add-command"');
     expect(html).toContain("Add custom connector");
@@ -774,10 +781,11 @@ describe("renderAccountHome", () => {
     // whole-house door.
     expect(html).toContain('data-testid="onboarding-mcp-endpoint"');
     expect(html).toContain('data-testid="onboarding-mcp-add-command"');
-    expect(html).toContain('data-testid="onboarding-account-mcp-endpoint"');
+    expect(html).toContain('data-testid="onboarding-hub-mcp-endpoint"');
     expect(html).toContain("Claude.ai (web)");
     expect(html).toContain("Claude Code (terminal)");
-    expect(html).toContain("All assigned vaults");
+    expect(html).toContain("This hub");
+    expect(html).not.toContain("/account/mcp");
   });
 
   test("onboarding NON-condensed (not connected) state has no 'Connect another AI' expander (hub#583)", () => {
@@ -857,7 +865,7 @@ describe("renderAccountHome", () => {
     // per-vault tiles below still list every vault (by name + Notes CTA), but
     // no longer repeat the connect endpoint (dedup — connect lives only here).
     expect(html).toMatch(/data-testid="onboarding-mcp-endpoint">[^<]*\/vault\/personal\/mcp</);
-    expect(html).toContain(`${HUB_ORIGIN}/account/mcp`); // whole-house second option
+    expect(html).toContain(`${HUB_ORIGIN}/mcp`); // picker-at-consent second option
     expect(html).toContain("<strong>family</strong>"); // second vault still has a tile
     expect(html).not.toContain(`${HUB_ORIGIN}/vault/family/mcp`); // no duplicated connect
   });

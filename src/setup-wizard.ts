@@ -70,8 +70,8 @@ import {
 } from "./hub-settings.ts";
 import { signAccessToken } from "./jwt-sign.ts";
 import {
-  accountClaudeMcpAddCommand,
   assignedVaultClaudeMcpAddCommand,
+  rootClaudeMcpAddCommand,
 } from "./mcp-connect-commands.ts";
 import { escapeHtml } from "./oauth-ui.ts";
 import {
@@ -1151,32 +1151,28 @@ export function renderDoneStep(props: RenderDoneStepProps): string {
  * was a privilege over-grant + a shoulder-surf hazard. The bare OAuth
  * command was always the correct UX; it's now the only one.
  *
- * URL shape: lead with `/account/mcp` (whole house / all assigned
- * vaults). That is vault-agnostic — it stays correct if this vault is
- * renamed or more vaults are added — and its PRM advertises
- * `account:vaults` alone, so a catalog-copy OAuth client can actually
- * complete. Root `/mcp` OAuth discovery is the one-vault path (its PRM
- * is vault-only; advertising `account:vaults` there next to `vault:*`
- * would bounce the whole authorize request). NIP-98 clients can still
- * POST a signed request to `/account/mcp` or `/mcp`. The per-vault
- * command is the narrower OAuth option.
+ * URL shape: lead with `/mcp`. The consent picker is the XOR — this vault
+ * or all assigned vaults — so humans never need a second URL for the
+ * house. Root PRM stays vault-only (advertising `account:vaults` next to
+ * `vault:*` would bounce a catalog-copy authorize). The per-vault command
+ * is the skip-picker narrower option. `/account/mcp` stays the honest
+ * single-family discovery door; it is not in this copy.
  */
 function renderMcpTile(vaultName: string, hubOrigin: string): string {
   const safeVault = escapeHtml(vaultName);
-  const houseCmd = accountClaudeMcpAddCommand(hubOrigin);
+  const houseCmd = rootClaudeMcpAddCommand(hubOrigin);
   const vaultCmd = assignedVaultClaudeMcpAddCommand(hubOrigin, vaultName);
   return `<div class="done-tile">
     <h2>Connect Claude Code (MCP)</h2>
-    <p>All assigned vaults — one connection, capability grows from grants:</p>
+    <p>This hub — when you approve, pick this vault or all assigned vaults:</p>
     <pre data-testid="mcp-house-command">${escapeHtml(houseCmd)}</pre>
-    <p>Or just this vault (<code>vault:${safeVault}</code>):</p>
+    <p>Or skip the picker and connect just this vault (<code>vault:${safeVault}</code>):</p>
     <pre data-testid="mcp-vault-command">${escapeHtml(vaultCmd)}</pre>
     <p class="fine">No token needed — the command triggers browser OAuth on
-      first use (you sign in to this hub and approve access). The whole-house
-      URL is <code>/account/mcp</code>. Root <code>/mcp</code> is the
-      one-vault OAuth path; NIP-98 clients can still POST a signed request
-      there. For headless clients that can't do the browser flow, mint a hub
-      token at
+      first use (you sign in to this hub and approve access). Root
+      <code>/mcp</code> is the one URL; the consent picker chooses the
+      grant. The per-vault URL is the narrower option. For headless
+      clients that can't do the browser flow, mint a hub token at
       <a href="/admin/tokens"><code>/admin/tokens</code></a> (or with
       <code>parachute auth mint-token</code>) and append
       <code>--header "Authorization: Bearer &lt;token&gt;"</code>.</p>
