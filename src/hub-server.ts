@@ -4393,6 +4393,10 @@ export function hubFetch(
         }
         const accountMcp = isNostrAuthorization(req) || peekBearerAudience(req) === "account";
         if (accountMcp) {
+          // Success path: same handler as /account/mcp. Failure path: that
+          // handler's 401 challenge still points at the /account/mcp PRM
+          // (RFC 9728 §3.3 mismatch vs the requested /mcp URL). hub#899;
+          // do not mix scope families on the root PRM to paper over it.
           if (!getDb) return dbNotConfigured();
           return handleAccountMcp(req, {
             db: getDb(),
