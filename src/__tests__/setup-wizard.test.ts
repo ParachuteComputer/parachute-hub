@@ -2641,15 +2641,14 @@ describe("done screen MCP command — OAuth-default, no auto-mint", () => {
       );
       expect(res.status).toBe(200);
       const html = await res.text();
-      // Whole-house command is the recommended default; per-vault is the
-      // narrower option. Root `/mcp` is no longer the copy-paste target
-      // (its PRM is vault-only; `/account/mcp` is the honest house door).
-      expect(html).toContain(
-        "claude mcp add --transport http parachute-account https://hub.example/account/mcp",
-      );
+      // Root `/mcp` is the recommended default (picker chooses this vault
+      // XOR all assigned vaults). Per-vault is the skip-picker narrower
+      // option. `/account/mcp` is not in the human-facing copy.
+      expect(html).toContain("claude mcp add --transport http parachute https://hub.example/mcp");
       expect(html).toContain(
         "claude mcp add --transport http parachute-default https://hub.example/vault/default/mcp",
       );
+      expect(html).not.toContain("/account/mcp");
       expect(html).toContain('data-testid="mcp-house-command"');
       expect(html).toContain('data-testid="mcp-vault-command"');
       // Load-bearing regression (Austen's report): the rendered COMMAND
@@ -3483,8 +3482,8 @@ describe("typed vault name (hub#267)", () => {
         },
       );
       const html = await res.text();
-      expect(html).toContain("parachute-account");
-      expect(html).toContain("https://hub.example/account/mcp");
+      expect(html).toContain("claude mcp add --transport http parachute https://hub.example/mcp");
+      expect(html).not.toContain("/account/mcp");
       expect(html).toContain("parachute-my-personal-vault");
       expect(html).toContain("https://hub.example/vault/my-personal-vault/mcp");
     } finally {

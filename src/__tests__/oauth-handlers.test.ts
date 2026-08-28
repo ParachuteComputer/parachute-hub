@@ -39,6 +39,7 @@ import {
   rootMcpProtectedResourceMetadata,
   vaultScopeForUser,
 } from "../oauth-handlers.ts";
+import { VAULT_PICK_ACCOUNT } from "../oauth-ui.ts";
 import { PENDING_LOGIN_COOKIE_NAME, _resetPendingLogins } from "../pending-login.ts";
 import { __resetForTests as resetRateLimit } from "../rate-limit.ts";
 import type { ServicesManifest } from "../services-manifest.ts";
@@ -5482,6 +5483,60 @@ describe("handleAuthorizeGet — skip consent when scope already granted (#75)",
     }
   });
 
+  test("unnamed vault:read is skip-consent covered by a prior account:self:vaults grant", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const user = await createUser(db, "owner", "pw");
+      const session = createSession(db, { userId: user.id });
+      const reg = registerClient(db, { redirectUris: ["https://app.example/cb"] });
+      const { verifier, challenge } = makePkce();
+      recordGrant(db, user.id, reg.client.clientId, ["account:self:vaults"]);
+
+      const getRes = handleAuthorizeGet(
+        db,
+        new Request(
+          authorizeUrl({
+            client_id: reg.client.clientId,
+            redirect_uri: "https://app.example/cb",
+            response_type: "code",
+            scope: "vault:read vault:write",
+            code_challenge: challenge,
+            code_challenge_method: "S256",
+          }),
+          { headers: { cookie: buildSessionCookie(session.id, 86400) } },
+        ),
+        { issuer: ISSUER, loadServicesManifest: fixtureLoadServicesManifest },
+      );
+      expect(getRes.status).toBe(302);
+      const code = new URL(getRes.headers.get("location") ?? "").searchParams.get("code");
+      expect(code).toBeTruthy();
+
+      const tokenRes = await handleToken(
+        db,
+        new Request(`${ISSUER}/oauth/token`, {
+          method: "POST",
+          body: new URLSearchParams({
+            grant_type: "authorization_code",
+            code: code ?? "",
+            client_id: reg.client.clientId,
+            redirect_uri: "https://app.example/cb",
+            code_verifier: verifier,
+          }),
+          headers: { "content-type": "application/x-www-form-urlencoded" },
+        }),
+        { issuer: ISSUER, loadServicesManifest: fixtureLoadServicesManifest },
+      );
+      expect(tokenRes.status).toBe(200);
+      const body = (await tokenRes.json()) as { access_token: string; scope: string };
+      expect(body.scope.split(" ")).toContain("account:self:vaults");
+      expect(body.scope.split(" ")).not.toContain("vault:read");
+      const { payload } = await validateAccessToken(db, body.access_token, ISSUER);
+      expect(payload.aud).toBe("account");
+    } finally {
+      cleanup();
+    }
+  });
+
   test("re-registered client_id (different uuid) requires fresh consent", async () => {
     // Re-registration mints a new client_id; the grant row is keyed on
     // (user, client_id), so the new client has no prior grant. Consent
@@ -6673,12 +6728,12 @@ describe("handleAuthorizeGet — multi-user assigned vault picker lock (PR 4)", 
       expect(res.status).toBe(200);
       const html = await res.text();
       expect(html).toContain("vault-picker-locked");
-      expect(html).toContain("Assigned vault");
+      expect(html).toContain("Assigned");
       expect(html).toContain("admin-managed");
-      // Hidden input carries the assigned vault as the picker value.
-      expect(html).toContain('<input type="hidden" name="vault_pick" value="default"');
-      // No free-choice radio inputs.
-      expect(html).not.toContain('type="radio" name="vault_pick"');
+      // Assigned vault is the default radio; whole-account is the second option.
+      expect(html).toMatch(/name="vault_pick" value="default" checked/);
+      expect(html).toContain('data-testid="vault-pick-account"');
+      expect(html).not.toContain('<input type="hidden" name="vault_pick"');
     } finally {
       cleanup();
     }
@@ -6763,9 +6818,11 @@ describe("handleAuthorizeGet — resolved scope display (approval-UX rc.19)", ()
       });
       expect(res.status).toBe(200);
       const html = await res.text();
-      // The fixture services manifest has a single vault named "default" — the
-      // picker pre-checks it and the consent screen renders the resolved form.
-      expect(html).toContain('<code class="scope-name">vault:default:read</code>');
+      // Free picker defaults to whole-account, so the scope row stays
+      // unresolved (`<TBD>`) rather than pretending Approve mints
+      // `vault:default:read`.
+      expect(html).toContain('<code class="scope-name">vault:&lt;TBD&gt;:read</code>');
+      expect(html).toContain('data-testid="vault-pick-account"');
     } finally {
       cleanup();
     }
@@ -8038,8 +8095,9 @@ describe("handleAuthorizeGet — stale assigned_vault surfaces banner (hub#284)"
       const html = await res.text();
       expect(html).not.toContain('class="stale-assignment-banner"');
       expect(html).not.toContain("Your assigned vault was removed");
-      // Locked-picker still rendered as before.
-      expect(html).toContain('<input type="hidden" name="vault_pick" value="default"');
+      // Locked picker: assigned vault is the default radio.
+      expect(html).toContain("vault-picker-locked");
+      expect(html).toMatch(/name="vault_pick" value="default" checked/);
     } finally {
       cleanup();
     }
@@ -10253,6 +10311,8 @@ describe("RFC 8707 resource binding — vault-bound MCP (fix #461)", () => {
         expect(res.status).toBe(200);
         const copied = await res.text();
         expect(copied).toContain("Pick a vault");
+        expect(copied).toContain("All assigned vaults");
+        expect(copied).toContain('data-testid="vault-pick-account"');
       } finally {
         cleanup();
       }
@@ -10404,6 +10464,42 @@ describe("single OAuth consent + grantable vault admin + delegate-only cap (2026
       expect(extras.indexOf("account:self:write")).toBeLessThan(
         extras.indexOf("account:self:admin"),
       );
+      // Picker is the only path to account:vaults — extras must not offer it
+      // even on an empty request (ticking it plus a vault extra is the
+      // combine-refusal landmine).
+      expect(extras).not.toContain("account:vaults");
+      expect(extras).not.toContain("account:self:vaults");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("grantable extras omit account:vaults when the client already asked for vault scopes", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const admin = await createUser(db, "admin", "pw");
+      const extras = grantableExtraScopes(db, admin.id, {
+        userIsAdmin: true,
+        requested: ["vault:read"],
+        vaultName: undefined,
+      });
+      expect(extras).not.toContain("account:vaults");
+      expect(extras).not.toContain("account:self:vaults");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("grantable extras are empty when the client already asked for account:vaults", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const admin = await createUser(db, "admin", "pw");
+      const extras = grantableExtraScopes(db, admin.id, {
+        userIsAdmin: true,
+        requested: ["account:vaults"],
+        vaultName: undefined,
+      });
+      expect(extras).toEqual([]);
     } finally {
       cleanup();
     }
@@ -10708,6 +10804,102 @@ describe("single OAuth consent + grantable vault admin + delegate-only cap (2026
       const loc = consentRes.headers.get("location") ?? "";
       expect(loc).toContain("error=invalid_scope");
       expect(loc).not.toContain("code=");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("non-admin picking whole-account mints account:self:vaults (cap admits the connection grant)", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      await createUser(db, "owner", "pw");
+      const friend = await createUser(db, "friend", "pw", { allowMulti: true });
+      setUserVaults(db, friend.id, ["work"]);
+      const session = createSession(db, { userId: friend.id });
+      const reg = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        status: "approved",
+      });
+      const { verifier, challenge } = makePkce();
+      const consentRes = await submitConsent(
+        db,
+        session.id,
+        reg.client.clientId,
+        "vault:read",
+        challenge,
+        { vault_pick: VAULT_PICK_ACCOUNT },
+      );
+      expect(consentRes.status).toBe(302);
+      const loc = consentRes.headers.get("location") ?? "";
+      expect(loc).not.toContain("error=");
+      const code = new URL(loc).searchParams.get("code");
+      const { scope, aud } = await redeemToScopeAud(db, code ?? "", reg.client.clientId, verifier);
+      expect(scope.split(" ")).toContain("account:self:vaults");
+      expect(scope.split(" ")).not.toContain("vault:read");
+      expect(scope.split(" ")).not.toContain("vault:work:read");
+      expect(aud).toBe("account");
+      const grant = findGrant(db, friend.id, reg.client.clientId);
+      expect(grant?.scopes).toContain("account:self:vaults");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("non-admin 4-part account:self:vaults:<vault> is dropped (client cannot pre-narrow)", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      await createUser(db, "owner", "pw");
+      const friend = await createUser(db, "friend", "pw", { allowMulti: true });
+      setUserVaults(db, friend.id, ["work"]);
+      const session = createSession(db, { userId: friend.id });
+      const reg = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        status: "approved",
+      });
+      const { verifier, challenge } = makePkce();
+      const consentRes = await submitConsent(
+        db,
+        session.id,
+        reg.client.clientId,
+        "account:self:vaults:work vault:work:read",
+        challenge,
+      );
+      expect(consentRes.status).toBe(302);
+      const loc = consentRes.headers.get("location") ?? "";
+      expect(loc).not.toContain("error=");
+      const code = new URL(loc).searchParams.get("code");
+      const { scope } = await redeemToScopeAud(db, code ?? "", reg.client.clientId, verifier);
+      expect(scope.split(" ")).toContain("vault:work:read");
+      expect(scope).not.toContain("account:self:vaults:work");
+      expect(scope.split(" ")).not.toContain("account:self:vaults");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("owner picking whole-account rewrites unnamed vault:read to account:self:vaults", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const owner = await createUser(db, "owner", "pw");
+      const session = createSession(db, { userId: owner.id });
+      const reg = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        status: "approved",
+      });
+      const { verifier, challenge } = makePkce();
+      const consentRes = await submitConsent(
+        db,
+        session.id,
+        reg.client.clientId,
+        "vault:read vault:write",
+        challenge,
+        { vault_pick: VAULT_PICK_ACCOUNT },
+      );
+      expect(consentRes.status).toBe(302);
+      const code = new URL(consentRes.headers.get("location") ?? "").searchParams.get("code");
+      const { scope, aud } = await redeemToScopeAud(db, code ?? "", reg.client.clientId, verifier);
+      expect(scope.split(" ")).toEqual(["account:self:vaults"]);
+      expect(aud).toBe("account");
     } finally {
       cleanup();
     }

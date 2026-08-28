@@ -1,16 +1,16 @@
 /**
  * Copy-paste MCP connect URLs and Claude Code commands.
  *
- * Two doors, two names — do not mix them:
- *   - `/account/mcp` — whole house / all assigned vaults (`account:vaults`)
- *   - `/vault/<name>/mcp` — one assigned vault (`vault:<name>:*`)
+ * Humans are pointed at:
+ *   - `/mcp` — one URL; the consent picker chooses this vault XOR all
+ *     assigned vaults. Root PRM stays vault-only (catalog-copy must not
+ *     mix `account:vaults` with `vault:*` — that combination is
+ *     `invalid_scope`).
+ *   - `/vault/<name>/mcp` — skip the picker; one assigned vault.
  *
- * Root `/mcp` is a convenience alias for NIP-98 and for a Bearer that
- * already has `aud=account`. OAuth discovery at root advertises vault
- * scopes only; a generic client that catalog-copies that list cannot
- * learn `account:vaults` (and must not be taught it there — combining
- * the two families is `invalid_scope`). Point OAuth clients at
- * `/account/mcp` for the house, `/vault/<name>/mcp` for one vault.
+ * `/account/mcp` stays the honest single-family discovery door (its PRM
+ * advertises `account:vaults` alone). Do not put it in human-facing
+ * onboarding copy — the picker at `/mcp` is the choice.
  */
 
 /** `<hub-origin>/vault/<name>/mcp` — one assigned vault. */
@@ -26,12 +26,22 @@ export function assignedVaultClaudeMcpAddCommand(trimmedOrigin: string, vaultNam
   )}`;
 }
 
-/** `<hub-origin>/account/mcp` — all assigned vaults. */
+/** `<hub-origin>/mcp` — picker chooses this vault or all assigned vaults. */
+export function rootMcpEndpoint(trimmedOrigin: string): string {
+  return `${trimmedOrigin}/mcp`;
+}
+
+/** OAuth `claude mcp add` for the hub root. Server name `parachute`. */
+export function rootClaudeMcpAddCommand(trimmedOrigin: string): string {
+  return `claude mcp add --transport http parachute ${rootMcpEndpoint(trimmedOrigin)}`;
+}
+
+/** `<hub-origin>/account/mcp` — honest single-family discovery door. */
 export function accountMcpEndpoint(trimmedOrigin: string): string {
   return `${trimmedOrigin}/account/mcp`;
 }
 
-/** OAuth `claude mcp add` for the whole house. Server name `parachute-account`. */
+/** OAuth `claude mcp add` for `/account/mcp`. Server name `parachute-account`. */
 export function accountClaudeMcpAddCommand(trimmedOrigin: string): string {
   return `claude mcp add --transport http parachute-account ${accountMcpEndpoint(trimmedOrigin)}`;
 }

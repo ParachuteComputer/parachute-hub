@@ -21,10 +21,10 @@
 import { WORDMARK_TEXT, brandMarkSvg } from "./brand.ts";
 import { renderCsrfHiddenInput } from "./csrf.ts";
 import {
-  accountClaudeMcpAddCommand,
-  accountMcpEndpoint,
   assignedVaultClaudeMcpAddCommand,
   assignedVaultMcpEndpoint,
+  rootClaudeMcpAddCommand,
+  rootMcpEndpoint,
 } from "./mcp-connect-commands.ts";
 import { escapeHtml } from "./oauth-ui.ts";
 import type { VaultVerb } from "./users.ts";
@@ -342,8 +342,8 @@ function renderOnboardingChecklist(opts: OnboardingChecklistOpts): string {
   const safeVault = escapeHtml(primaryVault);
   const vaultEndpoint = assignedVaultMcpEndpoint(trimmedOrigin, primaryVault);
   const vaultAddCmd = assignedVaultClaudeMcpAddCommand(trimmedOrigin, primaryVault);
-  const houseEndpoint = accountMcpEndpoint(trimmedOrigin);
-  const houseAddCmd = accountClaudeMcpAddCommand(trimmedOrigin);
+  const houseEndpoint = rootMcpEndpoint(trimmedOrigin);
+  const houseAddCmd = rootClaudeMcpAddCommand(trimmedOrigin);
   const safeVaultEndpoint = escapeHtml(vaultEndpoint);
   const safeVaultAddCmd = escapeHtml(vaultAddCmd);
   const safeHouseEndpoint = escapeHtml(houseEndpoint);
@@ -368,20 +368,20 @@ function renderOnboardingChecklist(opts: OnboardingChecklistOpts): string {
                       data-testid="copy-onboarding-add-command">Copy</button>
             </div>
             <div class="onboarding-house" data-testid="onboarding-house">
-              <p class="onboarding-house-label" data-testid="onboarding-house-label">All assigned vaults</p>
-              <p class="onboarding-step-sub">One connection covering every vault this account can
-                 access. Paste this instead if you want the whole house, not just
+              <p class="onboarding-house-label" data-testid="onboarding-house-label">This hub</p>
+              <p class="onboarding-step-sub">Paste this instead of the per-vault URL to pick at
+                 consent — this vault, or all assigned vaults, not just
                  <code>${safeVault}</code>:</p>
               <div class="copy-row">
-                <code data-testid="onboarding-account-mcp-endpoint">${safeHouseEndpoint}</code>
+                <code data-testid="onboarding-hub-mcp-endpoint">${safeHouseEndpoint}</code>
                 <button type="button" class="btn btn-copy" data-copy="${safeHouseEndpoint}"
-                        data-testid="copy-onboarding-account-endpoint">Copy</button>
+                        data-testid="copy-onboarding-hub-endpoint">Copy</button>
               </div>
               <p class="onboarding-method"><strong>Claude Code (terminal):</strong></p>
               <div class="copy-row">
-                <code data-testid="onboarding-account-mcp-add-command">${safeHouseAddCmd}</code>
+                <code data-testid="onboarding-hub-mcp-add-command">${safeHouseAddCmd}</code>
                 <button type="button" class="btn btn-copy" data-copy="${safeHouseAddCmd}"
-                        data-testid="copy-onboarding-account-add-command">Copy</button>
+                        data-testid="copy-onboarding-hub-add-command">Copy</button>
               </div>
             </div>`;
 
