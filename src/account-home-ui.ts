@@ -20,6 +20,12 @@
  */
 import { WORDMARK_TEXT, brandMarkSvg } from "./brand.ts";
 import { renderCsrfHiddenInput } from "./csrf.ts";
+import {
+  assignedVaultClaudeMcpAddCommand,
+  assignedVaultMcpEndpoint,
+  rootClaudeMcpAddCommand,
+  rootMcpEndpoint,
+} from "./mcp-connect-commands.ts";
 import { escapeHtml } from "./oauth-ui.ts";
 import type { VaultVerb } from "./users.ts";
 
@@ -316,10 +322,12 @@ interface OnboardingChecklistOpts {
  * person an obvious path:
  *
  *   ① Your account is ready  — always done (they're signed in, password set).
- *   ② Connect your AI        — the hero. Inline endpoint (`/vault/<name>/mcp`)
- *                              with a copy button + the two short connect
- *                              methods (Claude.ai connector, Claude Code
- *                              `claude mcp add`). Marked done when `connected`.
+ *   ② Connect your AI        — the hero. Per-vault endpoint (`/vault/<name>/mcp`)
+ *                              first (narrower OAuth option), then a clearly
+ *                              labeled "all assigned vaults" `/account/mcp`
+ *                              command. Claude.ai connector + Claude Code
+ *                              `claude mcp add` for each. Marked done when
+ *                              `connected`.
  *   ③ Set up your vault      — links the vault-setup starter prompt.
  *
  * When `connected` is true the whole thing condenses to a quiet "✓ You're
@@ -332,28 +340,49 @@ interface OnboardingChecklistOpts {
 function renderOnboardingChecklist(opts: OnboardingChecklistOpts): string {
   const { primaryVault, trimmedOrigin, connected } = opts;
   const safeVault = escapeHtml(primaryVault);
-  const endpoint = accountMcpEndpoint(trimmedOrigin, primaryVault);
-  const addCmd = accountClaudeMcpAddCommand(trimmedOrigin, primaryVault);
-  const safeEndpoint = escapeHtml(endpoint);
-  const safeAddCmd = escapeHtml(addCmd);
+  const vaultEndpoint = assignedVaultMcpEndpoint(trimmedOrigin, primaryVault);
+  const vaultAddCmd = assignedVaultClaudeMcpAddCommand(trimmedOrigin, primaryVault);
+  const houseEndpoint = rootMcpEndpoint(trimmedOrigin);
+  const houseAddCmd = rootClaudeMcpAddCommand(trimmedOrigin);
+  const safeVaultEndpoint = escapeHtml(vaultEndpoint);
+  const safeVaultAddCmd = escapeHtml(vaultAddCmd);
+  const safeHouseEndpoint = escapeHtml(houseEndpoint);
+  const safeHouseAddCmd = escapeHtml(houseAddCmd);
 
-  // The endpoint + both connect methods. Shared between the full checklist
-  // (step 2) and the condensed "Connect another AI" expander (hub#583) so a
-  // genuinely-connected user can still wire up a SECOND client without losing
-  // the instructions.
+  // Per-vault first (narrower OAuth option), then the whole-house door.
+  // Shared between the full checklist (step 2) and the condensed
+  // "Connect another AI" expander (hub#583) so a genuinely-connected
+  // user can still wire up a SECOND client without losing the instructions.
   const connectMethods = `
             <div class="copy-row">
-              <code data-testid="onboarding-mcp-endpoint">${safeEndpoint}</code>
-              <button type="button" class="btn btn-copy" data-copy="${safeEndpoint}"
+              <code data-testid="onboarding-mcp-endpoint">${safeVaultEndpoint}</code>
+              <button type="button" class="btn btn-copy" data-copy="${safeVaultEndpoint}"
                       data-testid="copy-onboarding-endpoint">Copy</button>
             </div>
             <p class="onboarding-method"><strong>Claude.ai (web):</strong> open
                Settings → Connectors → Add custom connector, and paste the address above.</p>
             <p class="onboarding-method"><strong>Claude Code (terminal):</strong> run this command:</p>
             <div class="copy-row">
-              <code data-testid="onboarding-mcp-add-command">${safeAddCmd}</code>
-              <button type="button" class="btn btn-copy" data-copy="${safeAddCmd}"
+              <code data-testid="onboarding-mcp-add-command">${safeVaultAddCmd}</code>
+              <button type="button" class="btn btn-copy" data-copy="${safeVaultAddCmd}"
                       data-testid="copy-onboarding-add-command">Copy</button>
+            </div>
+            <div class="onboarding-house" data-testid="onboarding-house">
+              <p class="onboarding-house-label" data-testid="onboarding-house-label">This hub</p>
+              <p class="onboarding-step-sub">Paste this instead of the per-vault URL to pick at
+                 consent — this vault, or all assigned vaults, not just
+                 <code>${safeVault}</code>:</p>
+              <div class="copy-row">
+                <code data-testid="onboarding-hub-mcp-endpoint">${safeHouseEndpoint}</code>
+                <button type="button" class="btn btn-copy" data-copy="${safeHouseEndpoint}"
+                        data-testid="copy-onboarding-hub-endpoint">Copy</button>
+              </div>
+              <p class="onboarding-method"><strong>Claude Code (terminal):</strong></p>
+              <div class="copy-row">
+                <code data-testid="onboarding-hub-mcp-add-command">${safeHouseAddCmd}</code>
+                <button type="button" class="btn btn-copy" data-copy="${safeHouseAddCmd}"
+                        data-testid="copy-onboarding-hub-add-command">Copy</button>
+              </div>
             </div>`;
 
   // Condensed state — they've connected, so the checklist shrinks to a quiet
@@ -372,8 +401,9 @@ function renderOnboardingChecklist(opts: OnboardingChecklistOpts): string {
       <details class="onboarding-connect-another" data-testid="onboarding-connect-another">
         <summary data-testid="onboarding-connect-another-summary">Connect another AI →</summary>
         <div class="onboarding-step-body">
-          <p class="onboarding-step-sub">Point another AI client at your vault using this
-             address — you'll sign in and approve the first time:</p>
+          <p class="onboarding-step-sub">Point another AI client at your vault — or at every
+             vault this account can access — using the addresses below. You'll sign in and
+             approve the first time:</p>
           ${connectMethods}
         </div>
       </details>
@@ -399,8 +429,10 @@ function renderOnboardingChecklist(opts: OnboardingChecklistOpts): string {
           <span class="onboarding-num" aria-hidden="true">2</span>
           <div class="onboarding-step-body">
             <p class="onboarding-step-title">Connect your AI</p>
-            <p class="onboarding-step-sub">Point Claude (or another AI) at your vault using this
-               address — no token to copy, you'll sign in and approve the first time:</p>
+            <p class="onboarding-step-sub">Point Claude (or another AI) at your
+               <code>${safeVault}</code> vault using this address — no token to copy, you'll
+               sign in and approve the first time. A second command below covers every
+               vault this account can access:</p>
             ${connectMethods}
           </div>
         </li>
@@ -474,32 +506,6 @@ interface VaultCardOpts {
   mirrorPushing: Record<string, boolean>;
   /** `vaultName` → is the backup state good (drives the ✓ vs ! glyph). Absent = healthy. */
   mirrorHealthy: Record<string, boolean>;
-}
-
-/**
- * Build `<hub-origin>/vault/<name>/mcp` — the MCP endpoint a client connects
- * to. Mirrors the SPA's `mcpEndpointFor` (McpConnectCard.tsx) and the
- * wizard's `renderMcpTile`. The friend's `/account/` tile is server-rendered
- * (no SPA), so we compute it here from the hub origin + vault name rather
- * than the vault's well-known `url`.
- *
- * Exported for direct unit testing.
- */
-export function accountMcpEndpoint(trimmedOrigin: string, vaultName: string): string {
-  return `${trimmedOrigin}/vault/${vaultName}/mcp`;
-}
-
-/**
- * The OAuth-path `claude mcp add` command — no token, triggers browser OAuth
- * on first use. Same `parachute-<name>` server name as the SPA card and the
- * wizard tile, so a friend and the operator end up with identically-named
- * MCP servers. Exported for direct unit testing.
- */
-export function accountClaudeMcpAddCommand(trimmedOrigin: string, vaultName: string): string {
-  return `claude mcp add --transport http parachute-${vaultName} ${accountMcpEndpoint(
-    trimmedOrigin,
-    vaultName,
-  )}`;
 }
 
 function renderVaultCard(opts: VaultCardOpts): string {
@@ -971,6 +977,17 @@ const STYLES = `
     margin: 0.5rem 0 0.3rem;
   }
   .onboarding-method strong { color: ${PALETTE.fg}; }
+  .onboarding-house {
+    margin: 0.75rem 0 0;
+    padding-top: 0.65rem;
+    border-top: 1px solid ${PALETTE.borderLight};
+  }
+  .onboarding-house-label {
+    font-weight: 600;
+    font-size: 0.85rem;
+    color: ${PALETTE.fg};
+    margin: 0 0 0.2rem;
+  }
   .onboarding-step .copy-row { margin: 0.35rem 0; }
   .onboarding-foot {
     font-size: 0.82rem;
@@ -1262,7 +1279,9 @@ const STYLES = `
     .onboarding-foot { color: #a8a29a; }
     .vault-name strong,
     .onboarding-step-title, .onboarding-method strong,
+    .onboarding-house-label,
     .onboarding-done-line { color: #f0ece4; }
+    .onboarding-house { border-top-color: #3a362f; }
     .onboarding-step-done .onboarding-step-title { color: #a8a29a; }
     code { background: #1f1c18; color: #e8e4dc; }
     .copy-row code { background: transparent; }

@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   type AuthorizeFormParams,
+  VAULT_PICK_ACCOUNT,
   escapeHtml,
   renderApprovePending,
   renderConsent,
@@ -319,8 +320,10 @@ describe("renderConsent", () => {
     expect(html).toContain("Pick a vault");
     expect(html).toContain('name="vault_pick" value="work"');
     expect(html).toContain('name="vault_pick" value="personal"');
-    // First option pre-checked so a single-vault host doesn't force a click.
-    expect(html).toMatch(/name="vault_pick" value="work" checked/);
+    expect(html).toContain(`name="vault_pick" value="${VAULT_PICK_ACCOUNT}"`);
+    // Whole-account is the free-picker default, not the first vault.
+    expect(html).toMatch(new RegExp(`name="vault_pick" value="${VAULT_PICK_ACCOUNT}" checked`));
+    expect(html).not.toMatch(/name="vault_pick" value="work" checked/);
   });
 
   test("escapes a hostile vault name in the picker", () => {
@@ -389,6 +392,22 @@ describe("renderConsent", () => {
       vaultPicker: { unnamedVerbs: ["read"], availableVaults: ["work"], lockedVault: "work" },
     });
     expect(html.match(/name="verb_select"/g) ?? []).toHaveLength(0);
+  });
+
+  test("locked picker defaults to the assigned vault and offers whole-account", () => {
+    const html = renderConsent({
+      params: { ...PARAMS, scope: "vault:read" },
+      csrfToken: CSRF,
+      clientId: "c",
+      clientName: "App",
+      scopes: ["vault:read"],
+      vaultPicker: { unnamedVerbs: ["read"], availableVaults: ["work"], lockedVault: "work" },
+    });
+    expect(html).toMatch(/name="vault_pick" value="work" checked/);
+    expect(html).toContain(`name="vault_pick" value="${VAULT_PICK_ACCOUNT}"`);
+    expect(html).toContain("All assigned vaults");
+    expect(html).not.toContain('<input type="hidden" name="vault_pick"');
+    expect(VAULT_PICK_ACCOUNT).toContain(":");
   });
 
   // hub#314 — same-hub vs external trust marker. The `.badge-trust-*` class

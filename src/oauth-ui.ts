@@ -178,6 +178,14 @@ export interface ConsentViewProps {
   sameHub?: boolean;
 }
 
+/**
+ * Radio value for "all assigned vaults". Colon is outside
+ * `VAULT_NAME_CHARSET_RE` (`[a-z0-9_-]+`), so this cannot collide with a
+ * vault name. Underscores alone would not be a safe sentinel — `__account__`
+ * is a legal vault name.
+ */
+export const VAULT_PICK_ACCOUNT = ":account:";
+
 export interface VaultPicker {
   /** Verbs (`read`, `write`, `admin`) requested in unnamed shape. */
   unnamedVerbs: string[];
@@ -491,31 +499,50 @@ export function renderConsent(props: ConsentViewProps): string {
   return baseDocument(`Approve ${clientName}`, body);
 }
 
+function renderAccountVaultOption(checked: boolean): string {
+  return `
+            <label class="vault-option vault-option-account">
+              <input type="radio" name="vault_pick" value="${escapeHtml(VAULT_PICK_ACCOUNT)}"${checked ? " checked" : ""} required data-testid="vault-pick-account" />
+              <span class="vault-option-name">All assigned vaults</span>
+            </label>`;
+}
+
+function renderVaultNameOption(name: string, checked: boolean): string {
+  return `
+            <label class="vault-option">
+              <input type="radio" name="vault_pick" value="${escapeHtml(name)}"${checked ? " checked" : ""} required />
+              <span class="vault-option-name"><code>${escapeHtml(name)}</code></span>
+            </label>`;
+}
+
 function renderVaultPicker(picker: VaultPicker): string {
   const verbList = picker.unnamedVerbs.map((v) => `<code>vault:${escapeHtml(v)}</code>`).join(", ");
 
-  // Multi-user Phase 1: non-admin users see the picker locked to their
-  // `assigned_vault`. The form still posts via `vault_pick` so the
-  // server-side defense in `handleConsentSubmit` sees the value — but the
-  // user can't change it through the UI. A small `<input type=hidden>` and
-  // a read-only label is the smallest diff that ships the lock without
-  // disabling the broader form flow (Approve / Deny still work).
+  // Multi-user Phase 1: non-admin users with exactly one assigned vault
+  // used to see a locked hidden input. The picker now also offers
+  // "All assigned vaults" (mints `account:vaults`); the assigned vault
+  // stays the default so a friend who just hits Approve still grants
+  // the narrower scope. The form still posts via `vault_pick`.
   if (picker.lockedVault !== undefined) {
     const locked = escapeHtml(picker.lockedVault);
     return `
         <section class="vault-picker vault-picker-locked">
           <h2 class="scopes-title">Vault</h2>
           <p class="picker-help">
-            ${verbList} apply to your assigned vault.
+            ${verbList} apply to the vault you select, or to all assigned vaults.
           </p>
-          <div class="vault-locked-row">
-            <code class="vault-locked-name">${locked}</code>
-            <span class="vault-locked-badge">Assigned</span>
+          <div class="vault-options">
+            <label class="vault-option">
+              <input type="radio" name="vault_pick" value="${locked}" checked required />
+              <span class="vault-option-name"><code>${locked}</code></span>
+              <span class="vault-locked-badge">Assigned</span>
+            </label>
+            ${renderAccountVaultOption(false)}
           </div>
           <p class="vault-locked-note">
-            Assigned vault — admin-managed; you can't change this here.
+            Assigned vault is the default (admin-managed). All assigned vaults
+            covers every vault this account can access.
           </p>
-          <input type="hidden" name="vault_pick" value="${locked}" />
         </section>`;
   }
 
@@ -536,20 +563,18 @@ function renderVaultPicker(picker: VaultPicker): string {
           </p>
         </section>`;
   }
-  const options = picker.availableVaults
-    .map(
-      (name, i) => `
-            <label class="vault-option">
-              <input type="radio" name="vault_pick" value="${escapeHtml(name)}"${i === 0 ? " checked" : ""} required />
-              <span class="vault-option-name"><code>${escapeHtml(name)}</code></span>
-            </label>`,
-    )
-    .join("");
+  // Free picker (admin, or friend with 2+ assigned vaults): whole-account
+  // is the default. Catalog-copy of root PRM still asks unnamed `vault:*`;
+  // the picker is the XOR, not a second advertised scope family.
+  const options = [
+    renderAccountVaultOption(true),
+    ...picker.availableVaults.map((name) => renderVaultNameOption(name, false)),
+  ].join("");
   return `
         <section class="vault-picker">
           <h2 class="scopes-title">Pick a vault</h2>
           <p class="picker-help">
-            ${verbList} apply to the vault you select below.
+            ${verbList} apply to the vault you select, or to all assigned vaults.
           </p>
           <div class="vault-options">${options}
           </div>
@@ -1529,6 +1554,10 @@ const STYLES = `
     font-size: 0.88rem;
     color: ${PALETTE.fg};
   }
+  .vault-option-account .vault-option-name {
+    font-weight: 600;
+  }
+  .vault-option .vault-locked-badge { margin-left: auto; }
   .vault-picker-empty .picker-help { color: ${PALETTE.danger}; }
   .vault-picker-empty .picker-help code { color: ${PALETTE.fg}; }
   .vault-picker-locked .picker-help { color: ${PALETTE.fgMuted}; }

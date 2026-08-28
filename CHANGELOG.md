@@ -6,6 +6,29 @@ All notable changes to `@openparachute/hub` are documented here. The format foll
 >
 > This backfill covers the 0.6.x line only. Two pre-existing gaps remain undocumented and are **not** addressed here: the `0.5.13` stable itself (the file's newest entry is `0.5.13-rc.48`, never the stable) and the entire `0.5.14-rc` chain (rc.1–rc.21 on npm), which never promoted to a `0.5.14` stable — its work folded forward into 0.6.0.
 
+## [0.7.18-rc.6] - 2026-08-28
+
+**Consent picker XOR at `/mcp`.** Two PRs on `next` after 0.7.18-rc.5.
+Version bump only; no new code in this commit. Merging this to `next`
+does not publish. The following next→main PR publishes `@rc`.
+
+- **Onboarding copy for `/account/mcp` (#900).** Wizard and friend
+  onboarding named the whole-house door. Helper rename
+  `accountMcpEndpoint(origin, vault)` → `assignedVaultMcpEndpoint`.
+  Root PRM stayed vault-only. RFC 9728 §3.3 nit tracked as #899.
+
+- **Consent picker XOR (#901).** Unnamed `vault:*` at `/mcp` now offers
+  this vault XOR all assigned vaults (`vault_pick=:account:`). Cap
+  admits `isRequestableAccountScope` for non-admins (4-part pre-narrow
+  dropped). Same-hub auto-trust does not silently upgrade. Skip-consent
+  after a prior `account:self:vaults` grant covers later unnamed-at-root.
+  Wizard and friend copy lead humans at `/mcp` again; `/account/mcp`
+  stays the honest single-family discovery door, not in human copy.
+  Root PRM still vault-only.
+
+Leaves #880, #881, and #899 open. Auto-provision still defaults off. Do
+not suffix-drop 0.7.18.
+
 ## [0.7.18-rc.5] - 2026-08-28
 
 **Account-MCP update-note.** One PR on `next` after 0.7.18-rc.4.

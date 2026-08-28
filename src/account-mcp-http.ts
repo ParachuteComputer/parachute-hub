@@ -124,6 +124,14 @@ function accountMcpResource(issuer: string): string {
 }
 
 function accountMcpChallenge(issuer: string): string {
+  // Always names the /account/mcp PRM. When handleAccountMcp answers a
+  // request that arrived at root /mcp (NIP-98 or the aud=account routing
+  // peek), RFC 9728 §3.3 wants resource_metadata to describe the URL the
+  // client requested — this PRM's `resource` is `/account/mcp`, so a
+  // strict client MUST discard the challenge. Valid-token dispatch at
+  // root is still the right alias. Tracked as hub#899. Do not "fix" by
+  // advertising `account:vaults` on the root PRM: catalog-copy +
+  // combine-refusal is a total `invalid_scope` bounce.
   const origin = issuer.replace(/\/$/, "");
   return `Bearer resource_metadata="${origin}/.well-known/oauth-protected-resource/account/mcp"`;
 }

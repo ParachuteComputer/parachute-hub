@@ -22,7 +22,11 @@
  * on presentation.
  */
 import type { Database } from "bun:sqlite";
-import { ACCOUNT_VAULTS_UNNARROWED, accountVaultsScope } from "@openparachute/door-contract";
+import {
+  ACCOUNT_VAULTS_UNNARROWED,
+  accountVaultsScope,
+  isRequestableAccountScope,
+} from "@openparachute/door-contract";
 import { AdminAuthError, adminAuthErrorResponse, requireScope } from "./admin-auth.ts";
 import { recordLoginUnlock } from "./admin-lock.ts";
 import { renderTotpChallenge } from "./admin-login-ui.ts";
@@ -48,7 +52,12 @@ import {
   verifyClientSecret,
 } from "./clients.ts";
 import { CSRF_FIELD_NAME, ensureCsrfToken, verifyCsrfToken } from "./csrf.ts";
-import { isCoveredByGrant, isCoveredByGrantForClientName, recordGrant } from "./grants.ts";
+import {
+  findGrant,
+  isCoveredByGrant,
+  isCoveredByGrantForClientName,
+  recordGrant,
+} from "./grants.ts";
 import { consumeFirstClientAutoApproveWindow } from "./hub-settings.ts";
 import { VAULT_VERBS, inferAudience } from "./jwt-audience.ts";
 import {
@@ -66,6 +75,7 @@ import {
 } from "./jwt-sign.ts";
 import {
   type AuthorizeFormParams,
+  VAULT_PICK_ACCOUNT,
   canonicalConsentScope,
   renderApprovePending,
   renderConsent,
@@ -148,6 +158,53 @@ function narrowVaultScopes(scopes: string[], pickedVault: string): string[] {
     }
     return s;
   });
+}
+
+function isUnnamedVaultScope(scope: string): boolean {
+  const parts = scope.split(":");
+  const verb = parts[1];
+  return parts.length === 2 && parts[0] === "vault" && !!verb && VAULT_VERBS.has(verb);
+}
+
+/**
+ * XOR rewrite: unnamed `vault:<verb>` becomes the account-MCP connection
+ * grant. Named vault scopes and everything else stay put — the mint
+ * choke-point still refuses mixing `account:vaults` with other families.
+ */
+function replaceUnnamedVaultScopesWithAccountVaults(scopes: readonly string[]): string[] {
+  const rest = scopes.filter((s) => !isUnnamedVaultScope(s));
+  return [...new Set([...rest, ACCOUNT_VAULTS_UNNARROWED])];
+}
+
+/**
+ * A prior `account:vaults` / `account:self:vaults` grant covers a later
+ * unnamed `vault:<verb>` request at root `/mcp`. Without this, skip-consent
+ * refuses unnamed verbs forever (they never match the stored bound form)
+ * and the picker re-prompts on every catalog-copy reconnect.
+ *
+ * Does NOT change `isCoveredByGrant` — that helper stays exact-match (plus
+ * the account-vaults equivalent pair) so trust-by-client_name cannot record
+ * unnamed verbs onto a fresh client_id.
+ */
+function accountGrantCoversUnnamedAtRoot(
+  db: Database,
+  userId: string,
+  clientId: string,
+  requestedScopes: readonly string[],
+): boolean {
+  if (unnamedVaultVerbs([...requestedScopes]).length === 0) return false;
+  const grant = findGrant(db, userId, clientId);
+  if (!grant) return false;
+  const granted = new Set(grant.scopes);
+  if (!granted.has(ACCOUNT_VAULTS_UNNARROWED) && !granted.has(accountVaultsScope("self"))) {
+    return false;
+  }
+  for (const s of requestedScopes) {
+    if (isUnnamedVaultScope(s)) continue;
+    if (s === ACCOUNT_VAULTS_UNNARROWED || s === accountVaultsScope("self")) continue;
+    if (!granted.has(s)) return false;
+  }
+  return true;
 }
 
 /**
@@ -1309,9 +1366,12 @@ export function handleAuthorizeGet(db: Database, req: Request, deps: OAuthDeps):
   // requested scope to this client, mint the auth code immediately. Three
   // important constraints:
   //   - Unnamed vault verbs (`vault:read`) need the picker even if a prior
-  //     grant exists, because the operator's vault choice isn't recorded
-  //     literally — grants store narrowed `vault:<name>:<verb>` scopes, so
-  //     a fresh unnamed request never matches. Force consent to re-pick.
+  //     *named-vault* grant exists, because the operator's vault choice isn't
+  //     recorded literally — grants store narrowed `vault:<name>:<verb>`
+  //     scopes, so a fresh unnamed request never matches. Exception: a prior
+  //     `account:self:vaults` grant covers unnamed-at-root (rewrite at skip
+  //     to the bound connection grant). Same-hub auto-trust does not get
+  //     that rewrite.
   //   - The grant covers `requestedScopes` exactly when every requested
   //     scope appears in the stored set. A strict superset (client wants
   //     something new) falls through to the consent screen.
@@ -1333,16 +1393,31 @@ export function handleAuthorizeGet(db: Database, req: Request, deps: OAuthDeps):
   //     `handleAuthorizeGet` after promoting the pending client.
   const hasUnnamedVault = unnamedVaultVerbs(requestedScopes).length > 0;
   const userHasVaultPosture = userIsAdmin || assignedVaults.length > 0;
+  // Unnamed `vault:<verb>` still needs the picker on first contact — except
+  // when a prior whole-account grant already covers this client. Then skip
+  // and mint `account:vaults` (bound at the choke-point) instead of
+  // re-prompting forever. Same-hub auto-trust below does NOT get this
+  // rewrite: silently upgrading unnamed `vault:read` to whole-account on
+  // first contact is the privilege-creep that path exists to prevent.
+  const unnamedCoveredByAccountGrant = accountGrantCoversUnnamedAtRoot(
+    db,
+    session.userId,
+    client.clientId,
+    requestedScopes,
+  );
   if (
     !hasStaleAssignment &&
-    !hasUnnamedVault &&
     userHasVaultPosture &&
-    isCoveredByGrant(db, session.userId, client.clientId, requestedScopes)
+    ((!hasUnnamedVault && isCoveredByGrant(db, session.userId, client.clientId, requestedScopes)) ||
+      unnamedCoveredByAccountGrant)
   ) {
+    const mintScopes = unnamedCoveredByAccountGrant
+      ? replaceUnnamedVaultScopesWithAccountVaults(requestedScopes)
+      : requestedScopes;
     console.log(
-      `consent skipped: existing grant covers requested scope client_id=${client.clientId} user_id=${session.userId} scopes=${requestedScopes.join(" ")}`,
+      `consent skipped: existing grant covers requested scope client_id=${client.clientId} user_id=${session.userId} scopes=${mintScopes.join(" ")}`,
     );
-    return issueAuthCodeRedirect(db, parsed, requestedScopes, session.userId, deps);
+    return issueAuthCodeRedirect(db, parsed, mintScopes, session.userId, deps);
   }
 
   // -------------------------------------------------------------------------
@@ -1541,7 +1616,21 @@ function capScopesToUserAuthority(
     // Admins are unaffected: they returned above, and on self-host the admin
     // IS the account holder, so they're delegating authority they actually
     // have.
-    if (s.toLowerCase().startsWith("account:")) return false;
+    // Account scopes are ACCOUNT-WIDE, and on self-host the account IS the
+    // box. `account:self:{read,write,admin}` must never be consentable by a
+    // non-owner. The one exception is the account-MCP connection grant —
+    // 2-part `account:vaults` or 3-part `account:<id>:vaults` — which
+    // account-MCP intersects with the caller's assignment (`resolveCoverage`).
+    // Reuse `isRequestableAccountScope` rather than re-deriving the shape:
+    // that helper deliberately excludes the 4-part consent-narrowed form
+    // (`account:<id>:vaults:<vault>`), so a client cannot pre-narrow itself
+    // by asking for it here.
+    //
+    // Exact-lowercase: casing variants (`Account:vaults`) fail closed, same
+    // as the door-contract. Detect the family case-insensitively so
+    // `ACCOUNT:self:admin` is still dropped rather than passing through to
+    // the vault-verb branch.
+    if (s.toLowerCase().startsWith("account:")) return isRequestableAccountScope(s);
     const parts = s.split(":");
     if (parts.length !== 3 || parts[0] !== "vault") return true; // non-named — pass through
     const name = parts[1];
@@ -1589,6 +1678,12 @@ export function grantableExtraScopes(
   opts: { userIsAdmin: boolean; requested: readonly string[]; vaultName?: string | undefined },
 ): string[] {
   const v = opts.vaultName;
+  // The picker is the only path to `account:vaults`. Offering it as an extra
+  // next to the client's vault scopes hits `accountVaultsCombinedWithOtherScopes`
+  // at mint — a checkbox that looks grantable and then bounces the whole
+  // authorize. The reverse landmine (requested `account:vaults`, extras offer
+  // vault verbs) is the same XOR: extras would combine-refuse, so offer none.
+  if (opts.requested.some(isAccountVaultsConnectionScope)) return [];
   const candidates = [
     ...(v
       ? [`vault:${v}:read`, `vault:${v}:write`, `vault:${v}:admin`]
@@ -1596,7 +1691,6 @@ export function grantableExtraScopes(
     ACCOUNT_SELF_READ_SCOPE,
     ACCOUNT_SELF_WRITE_SCOPE,
     ACCOUNT_SELF_ADMIN_SCOPE,
-    ACCOUNT_VAULTS_UNNARROWED,
   ];
 
   // Compare both naming shapes in one canonical key space. When an admin's
@@ -2085,67 +2179,82 @@ async function handleConsentSubmit(
         400,
       );
     }
-    const manifest = (deps.loadServicesManifest ?? readServicesManifest)();
-    const validNames = listVaultNames(manifest);
-    if (!validNames.includes(pickedVault)) {
-      // Stale-assignment branch (hub#284, generalized Phase 2 PR 2). The
-      // user is consenting via an assignment that points at a vault no
-      // longer in services.json. The new copy names the actual condition
-      // (assignment removed) and points at the admin remediation surface.
-      //
-      // The check fires when the picked vault is in the user's assigned
-      // list — narrows the special-case to the "user is consenting via
-      // a now-stale assignment" shape rather than swallowing every
-      // Unknown-vault. A hand-crafted POST naming a never-existed vault
-      // still hits the generic branch.
-      if (isPinned && assignedVaults.includes(pickedVault)) {
+    if (pickedVault === VAULT_PICK_ACCOUNT) {
+      // Whole-account sentinel. Not a vault name (colon is outside the
+      // charset). A zero-vault non-admin cannot mint this — they have
+      // nothing to cover. Friends with assignments can: account-MCP
+      // intersects Bearer coverage with assignment.
+      if (!userIsAdmin && assignedVaults.length === 0) {
         return htmlError(
-          "Assigned vault was removed",
-          `Your assigned vault "${pickedVault}" is no longer registered on this hub. Ask the hub admin to reassign you to an existing vault via /admin/users, then try again.`,
+          "No vaults assigned",
+          "vault_scope_mismatch: you have no assigned vaults on this hub yet, so you can't authorize an app for vault access. Ask the hub admin to assign you at least one vault via /admin/users, then try again.",
           400,
         );
       }
-      return htmlError(
-        "Unknown vault",
-        `vault "${pickedVault}" is not registered on this host.`,
-        400,
-      );
+      scopes = replaceUnnamedVaultScopesWithAccountVaults(scopes);
+    } else {
+      const manifest = (deps.loadServicesManifest ?? readServicesManifest)();
+      const validNames = listVaultNames(manifest);
+      if (!validNames.includes(pickedVault)) {
+        // Stale-assignment branch (hub#284, generalized Phase 2 PR 2). The
+        // user is consenting via an assignment that points at a vault no
+        // longer in services.json. The new copy names the actual condition
+        // (assignment removed) and points at the admin remediation surface.
+        //
+        // The check fires when the picked vault is in the user's assigned
+        // list — narrows the special-case to the "user is consenting via
+        // a now-stale assignment" shape rather than swallowing every
+        // Unknown-vault. A hand-crafted POST naming a never-existed vault
+        // still hits the generic branch.
+        if (isPinned && assignedVaults.includes(pickedVault)) {
+          return htmlError(
+            "Assigned vault was removed",
+            `Your assigned vault "${pickedVault}" is no longer registered on this hub. Ask the hub admin to reassign you to an existing vault via /admin/users, then try again.`,
+            400,
+          );
+        }
+        return htmlError(
+          "Unknown vault",
+          `vault "${pickedVault}" is not registered on this host.`,
+          400,
+        );
+      }
+      // Server-side defense: non-admin user submitted a vault that's not in
+      // their assigned list. The picker rendered as narrowed, so a UI-path
+      // user couldn't reach this — but a hand-crafted form bypassing the
+      // narrowed input lands here. Refuse the mint instead of silently
+      // overwriting; the explicit error tells the operator the assignment
+      // is load-bearing.
+      if (isPinned && !assignedVaults.includes(pickedVault)) {
+        return htmlError(
+          "Vault assignment mismatch",
+          `vault_scope_mismatch: the picked vault "${pickedVault}" is not in your vault assignment. Ask the hub admin to update your assignment, or pick a vault shown on the consent screen.`,
+          400,
+        );
+      }
+      // hub#689's owner verb-widening selector is GONE (retired 2026-07-30).
+      //
+      // It was one radio applied to every requested verb, so a multi-verb request
+      // could not survive it: `vault:read vault:write vault:admin` with the
+      // selector's admin default rewrote to `vault:admin` three times. Observed
+      // live by an external team — a read-only research agent was simply not
+      // expressible, because both agents got admin or neither ran.
+      //
+      // Worse, it now CONTRADICTS per-scope consent (#804): a user unchecks
+      // write and admin, and this block rewrote their surviving `vault:read`
+      // back to admin. The checkboxes said read-only; the token said admin.
+      //
+      // Both of the selector's jobs are covered elsewhere now:
+      //   - downgrade → uncheck the scope row (per-scope consent)
+      //   - upgrade   → tick it in the additional-access list, which
+      //                 `grantableExtraScopes` builds through the SAME cap the
+      //                 mint uses, so it can't offer more than the user holds
+      //
+      // A stale `verb_select` from a cached consent page is now simply ignored,
+      // which fails NARROWER — it mints what was requested and checked. That's
+      // the safe direction for an unread field.
+      scopes = narrowVaultScopes(scopes, pickedVault);
     }
-    // Server-side defense: non-admin user submitted a vault that's not in
-    // their assigned list. The picker rendered as narrowed, so a UI-path
-    // user couldn't reach this — but a hand-crafted form bypassing the
-    // narrowed input lands here. Refuse the mint instead of silently
-    // overwriting; the explicit error tells the operator the assignment
-    // is load-bearing.
-    if (isPinned && !assignedVaults.includes(pickedVault)) {
-      return htmlError(
-        "Vault assignment mismatch",
-        `vault_scope_mismatch: the picked vault "${pickedVault}" is not in your vault assignment. Ask the hub admin to update your assignment, or pick a vault shown on the consent screen.`,
-        400,
-      );
-    }
-    // hub#689's owner verb-widening selector is GONE (retired 2026-07-30).
-    //
-    // It was one radio applied to every requested verb, so a multi-verb request
-    // could not survive it: `vault:read vault:write vault:admin` with the
-    // selector's admin default rewrote to `vault:admin` three times. Observed
-    // live by an external team — a read-only research agent was simply not
-    // expressible, because both agents got admin or neither ran.
-    //
-    // Worse, it now CONTRADICTS per-scope consent (#804): a user unchecks
-    // write and admin, and this block rewrote their surviving `vault:read`
-    // back to admin. The checkboxes said read-only; the token said admin.
-    //
-    // Both of the selector's jobs are covered elsewhere now:
-    //   - downgrade → uncheck the scope row (per-scope consent)
-    //   - upgrade   → tick it in the additional-access list, which
-    //                 `grantableExtraScopes` builds through the SAME cap the
-    //                 mint uses, so it can't offer more than the user holds
-    //
-    // A stale `verb_select` from a cached consent page is now simply ignored,
-    // which fails NARROWER — it mints what was requested and checked. That's
-    // the safe direction for an unread field.
-    scopes = narrowVaultScopes(scopes, pickedVault);
   }
 
   // Server-side defense for named-vault scopes (`vault:<name>:<verb>`) too.
@@ -3353,16 +3462,11 @@ function consentProps(
   if (!hasStaleAssignment && remainingValidAssigned.length === 1) {
     const only = remainingValidAssigned[0];
     if (only !== undefined) displayVault = only;
-  } else if (
-    !hasStaleAssignment &&
-    assignedVaults.length === 0 &&
-    unnamedVerbs.length > 0 &&
-    vaultNames.length === 1
-  ) {
-    // Admin with a single vault on the hub: pre-check pattern from Phase 1.
-    const only = vaultNames[0];
-    if (only) displayVault = only;
   }
+  // Admin (free picker) defaults to whole-account, not the first vault —
+  // do not substitute unnamed rows as `vault:<that-vault>:<verb>` or the
+  // consent screen would lie about what Approve mints. Multi-vault already
+  // used the `<TBD>` placeholder; single-vault admin now does too.
   // Keep the first wire value for each display-normalized scope. Resource
   // narrowing can produce the same named value from distinct requested forms,
   // and the consent page should offer one row/checkbox for that permission.
