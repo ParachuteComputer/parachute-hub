@@ -1,5 +1,6 @@
-# Release workflow — triggered by a merge to `main` (hub#790), or by pushing a
-# semver tag.
+# Release workflow — triggered by a merge to `next` or `main` (hub#790, and
+# the `next` trigger added when the rc cut stopped needing a `next`→`main`
+# hop of its own), or by pushing a semver tag.
 #
 # This workflow publishes FOUR packages on different tag namespaces:
 #
@@ -26,16 +27,19 @@
 #                                    (door-contract-v0.6.0)
 #
 # Release flow (publish-on-merge — the tag path below still works, see `plan`):
-#   1. When ready to ship: open a release PR bumping `version` in the relevant
-#      package.json (root for hub, packages/scope-guard/ for scope-guard,
-#      packages/depcheck/ for depcheck, packages/door-contract/ for
-#      door-contract).
+#   1. Cutting an rc: open a release PR bumping `version` to an `-rc.N`
+#      shape, targeting `next` directly — no `next`→`main` hop needed just
+#      to publish an rc. Promoting to stable: same shape, but the PR targets
+#      `main` and drops the `-rc.N` suffix; `plan` refuses it unless npm
+#      already has that core version as an rc AND the diff from that rc tag
+#      is version/changelog/lockfile only (RELEASING.md).
 #   2. Merge it. That IS the release signal — `plan` compares each
 #      package.json against npm and publishes what's new.
 #   3. CI runs tests once (workspace-wide), then publishes whichever packages
 #      `plan` selected. Hub also publishes a container image to ghcr.io, tagged
 #      from the published VERSION (`:vX.Y.Z` + `:rc`/`:stable` + `:latest`) —
-#      not from the ref, which on a merge run is just `main` (hub#829).
+#      not from the ref, which on a merge run is just the branch name
+#      (`next` or `main`), never a version (hub#829).
 #   4. `tag-record` pushes `vX.Y.Z` afterwards as a RECORD of what shipped.
 #      Nothing needs to be tagged by hand.
 #
@@ -52,8 +56,26 @@ on:
     # hub#790: publish-on-merge. See the `plan` job for why the tag was
     # replaced as the release SIGNAL (it's still honoured, and still cut as a
     # record).
+    #
+    # `next` publishes rc's directly (no more next→main hop just to cut an
+    # rc) — `decidePublish` in release-plan.ts is already branch-agnostic
+    # (idempotent on an already-published version, refuses to move a
+    # dist-tag backwards, refuses a `latest` publish unless npm already has
+    # a matching `-rc.*` and the diff is a pure suffix-drop). `main` stays
+    # the only path that can actually promote to `@latest`, because a
+    # stable publish requires an existing rc AND a version/changelog-only
+    # diff from it — a fresh feature merge on `next` can never satisfy that
+    # gate. The `paths` filter below means an ordinary feature merge (no
+    # version bump) never even runs this workflow a second time —
+    # `pr-verify.yml` already tested it before merge.
     branches:
       - main
+      - next
+    paths:
+      - 'package.json'
+      - 'packages/scope-guard/package.json'
+      - 'packages/depcheck/package.json'
+      - 'packages/door-contract/package.json'
     tags:
       # Hub release tags
       - 'v[0-9]+.[0-9]+.[0-9]+'

@@ -282,7 +282,7 @@ export function unpublishedDrift(commitSubjects: readonly string[]): {
     drifted: true,
     count: commits.length,
     summary:
-      `${commits.length} commit(s) on main are NOT in any published version:\n` +
+      `${commits.length} commit(s) are NOT in any published version:\n` +
       commits.map((c) => `  - ${c}`).join("\n") +
       "\nOpen a release PR to ship them.",
   };
@@ -420,7 +420,7 @@ if (import.meta.main) {
           if (sum) {
             await Bun.write(
               sum,
-              `### Unpublished work on main\n\n\`\`\`\n${drift.summary}\n\`\`\`\n`,
+              `### Unpublished work\n\n\`\`\`\n${drift.summary}\n\`\`\`\n`,
               {
                 createPath: false,
               },
