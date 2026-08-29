@@ -534,6 +534,13 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v6
+        with:
+          # The "already exists" dedupe below rev-parses the tag; a shallow
+          # tagless clone can't see pre-existing remote tags, so the push gets
+          # rejected and swallowed by continue-on-error. Same fix as `plan`'s
+          # checkout (and surface#216).
+          fetch-depth: 0
+          fetch-tags: true
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.4
