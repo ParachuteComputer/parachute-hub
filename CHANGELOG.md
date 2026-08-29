@@ -6,6 +6,15 @@ All notable changes to `@openparachute/hub` are documented here. The format foll
 >
 > This backfill covers the 0.6.x line only. Two pre-existing gaps remain undocumented and are **not** addressed here: the `0.5.13` stable itself (the file's newest entry is `0.5.13-rc.48`, never the stable) and the entire `0.5.14-rc` chain (rc.1–rc.21 on npm), which never promoted to a `0.5.14` stable — its work folded forward into 0.6.0.
 
+## [Unreleased]
+
+**Account-MCP proxies vault MCP instead of cloning REST.** Hub-native tools
+stay (`list-vaults`, `create-vault`, grant/revoke/list-access). Vault-shaped
+tools are a live `tools/list` from one covered vault (highest verb, fallback
+if that vault is down) plus JSON-RPC `tools/call` to
+`/vault/<name>/mcp` with a 60s mint. `query-notes` without `vault` still
+fans out; the envelope is unchanged. Per-vault `/vault/<name>/mcp` stays.
+
 ## [0.7.18-rc.8] - 2026-08-28
 
 **Account-MCP query-notes sort + bodies.** One PR on `next` after

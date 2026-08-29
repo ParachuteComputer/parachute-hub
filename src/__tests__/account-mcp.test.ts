@@ -176,6 +176,123 @@ async function bearer(h: Harness, scopes: string[], sub?: string): Promise<strin
   return minted.token;
 }
 
+function jwtScope(req: Request): string {
+  const parts = (req.headers.get("authorization") ?? "").replace(/^Bearer\s+/i, "").split(".");
+  try {
+    const payload = JSON.parse(Buffer.from(parts[1] ?? "", "base64url").toString()) as {
+      scope?: string;
+    };
+    return payload.scope ?? "";
+  } catch {
+    return "";
+  }
+}
+
+function toolsForMintedScope(scope: string): Array<{
+  name: string;
+  description: string;
+  inputSchema: Record<string, unknown>;
+}> {
+  const verb = scope.includes(":admin") ? "admin" : scope.includes(":write") ? "write" : "read";
+  const read = [
+    "query-notes",
+    "list-tags",
+    "find-path",
+    "vault-info",
+    "doctor",
+    "request-attachment-download",
+    "read-attachment",
+  ];
+  const write = [...read, "create-note", "update-note", "delete-note", "request-attachment-upload"];
+  const admin = [
+    ...write,
+    "manage-token",
+    "update-tag",
+    "delete-tag",
+    "rename-tag",
+    "merge-tags",
+    "prune-schema",
+  ];
+  const names = verb === "admin" ? admin : verb === "write" ? write : read;
+  return names.map((name) => ({
+    name,
+    description: `${name} (vault MCP)`,
+    inputSchema: {
+      type: "object",
+      properties:
+        name === "query-notes"
+          ? {
+              search: { type: "string" },
+              sort: { type: "string" },
+              include_content: { type: "boolean" },
+              order_by: { type: "string" },
+              cursor: { type: "string" },
+            }
+          : {},
+    },
+  }));
+}
+
+function jsonRpcOk(value: unknown): Response {
+  return Response.json({ jsonrpc: "2.0", id: 1, result: value });
+}
+
+function mcpTextResult(payload: unknown): Response {
+  return jsonRpcOk({ content: [{ type: "text", text: JSON.stringify(payload, null, 2) }] });
+}
+
+interface VaultMcpCall {
+  url: string;
+  method: string;
+  rpc: { method?: string; params?: { name?: string; arguments?: Record<string, unknown> } };
+  scope: string;
+  vault: string;
+}
+
+async function routeVaultMcp(
+  input: string | URL | Request,
+  init: RequestInit | undefined,
+  hooks: {
+    onList?: (call: VaultMcpCall) => unknown | Response | Promise<unknown | Response>;
+    onCall?: (call: VaultMcpCall) => unknown | Response | Promise<unknown | Response>;
+    onRequest?: (call: VaultMcpCall) => void;
+  } = {},
+): Promise<Response> {
+  const req = input instanceof Request ? input : new Request(String(input), init);
+  const url = req.url;
+  let rpc: VaultMcpCall["rpc"] = {};
+  try {
+    rpc = JSON.parse(await req.text()) as VaultMcpCall["rpc"];
+  } catch {
+    rpc = {};
+  }
+  const call: VaultMcpCall = {
+    url,
+    method: req.method,
+    rpc,
+    scope: jwtScope(req),
+    vault: url.match(/\/vault\/([^/]+)\/mcp/)?.[1] ?? "",
+  };
+  hooks.onRequest?.(call);
+  if (rpc.method === "tools/list") {
+    const custom = await hooks.onList?.(call);
+    if (custom instanceof Response) return custom;
+    if (custom !== undefined) return jsonRpcOk(custom);
+    return jsonRpcOk({ tools: toolsForMintedScope(call.scope) });
+  }
+  if (rpc.method === "tools/call") {
+    const custom = await hooks.onCall?.(call);
+    if (custom instanceof Response) return custom;
+    if (custom !== undefined) {
+      if (custom && typeof custom === "object" && "content" in custom) return jsonRpcOk(custom);
+      return mcpTextResult(custom);
+    }
+    if (rpc.params?.name === "query-notes") return mcpTextResult([]);
+    return mcpTextResult({ ok: true });
+  }
+  return new Response("not mcp", { status: 404 });
+}
+
 function mcpDeps(
   h: Harness,
   extra: {
@@ -191,7 +308,7 @@ function mcpDeps(
     issuer: ISSUER,
     manifestPath: h.manifestPath,
     replay: h.replay,
-    ...(extra.fetchImpl ? { fetchImpl: extra.fetchImpl } : {}),
+    fetchImpl: extra.fetchImpl ?? ((input, init) => routeVaultMcp(input, init)),
     ...(extra.runCommand ? { runCommand: extra.runCommand } : {}),
   };
 }
@@ -426,26 +543,36 @@ describe("account MCP — initialize + tools", () => {
       );
       expect(init.status).toBe(200);
       const initBody = (await init.json()) as {
-        result: { serverInfo: { name: string }; protocolVersion: string };
+        result: { serverInfo: { name: string }; protocolVersion: string; instructions?: string };
       };
       expect(initBody.result.serverInfo.name).toBe("parachute-account");
       expect(initBody.result.protocolVersion).toBe("2025-11-25");
+      expect(initBody.result.instructions).toMatch(/union of what SOME covered vault/);
 
       const listed = await handleAccountMcp(bearerReq(token, rpc("tools/list")), mcpDeps(h));
-      const listBody = (await listed.json()) as { result: { tools: Array<{ name: string }> } };
-      expect(listBody.result.tools.map((t) => t.name)).toEqual(
-        ACCOUNT_MCP_TOOLS.map((t) => t.name),
-      );
-      expect(listBody.result.tools.map((t) => t.name)).toEqual([
-        "list-vaults",
-        "create-vault",
-        "query-notes",
-        "create-note",
-        "update-note",
-        "grant-access",
-        "revoke-access",
-        "list-access",
-      ]);
+      const listBody = (await listed.json()) as {
+        result: {
+          tools: Array<{
+            name: string;
+            description?: string;
+            inputSchema?: { properties?: Record<string, unknown>; required?: string[] };
+          }>;
+        };
+      };
+      const names = listBody.result.tools.map((t) => t.name);
+      for (const n of ACCOUNT_MCP_TOOLS.map((t) => t.name)) expect(names).toContain(n);
+      expect(names).toContain("query-notes");
+      expect(names).toContain("create-note");
+      expect(names).toContain("delete-note");
+      expect(names).toContain("list-tags");
+      expect(names).toContain("manage-token");
+      expect(names[0]).toBe("list-vaults");
+      const qn = listBody.result.tools.find((t) => t.name === "query-notes");
+      expect(qn?.inputSchema?.properties).toHaveProperty("vault");
+      expect(qn?.inputSchema?.required ?? []).not.toContain("vault");
+      expect(qn?.description).toMatch(/Catalog caveat/);
+      const del = listBody.result.tools.find((t) => t.name === "delete-note");
+      expect(del?.inputSchema?.required).toContain("vault");
     } finally {
       h.cleanup();
     }
@@ -662,18 +789,14 @@ describe("account MCP — query-notes", () => {
     const h = await makeHarness();
     try {
       const token = await bearer(h, [HOST_ADMIN_SCOPE]);
-      const fetchImpl = async (input: string | URL | Request) => {
-        const href =
-          typeof input === "string"
-            ? input
-            : input instanceof URL
-              ? input.href
-              : (input as Request).url;
-        if (href.includes("127.0.0.1:4101/vault/beta/")) {
-          return Response.json([{ id: "n-beta" }], { status: 200 });
-        }
-        throw new Error("personal is down");
-      };
+      const fetchImpl = (input: string | URL | Request, init?: RequestInit) =>
+        routeVaultMcp(input, init, {
+          onCall: ({ vault, rpc }) => {
+            if (rpc.params?.name !== "query-notes") return undefined;
+            if (vault === "personal") throw new Error("personal is down");
+            return [{ id: "n-beta" }];
+          },
+        });
       const res = await handleAccountMcp(
         bearerReq(
           token,
@@ -713,20 +836,21 @@ describe("account MCP — query-notes", () => {
     }
   });
 
-  test("forwards sort, include_content, order_by, offset to vault REST", async () => {
+  test("forwards sort/include_content/cursor as MCP arguments, not REST query params", async () => {
     const h = await makeHarness();
     try {
-      const seen: string[] = [];
-      const fetchImpl = async (input: string | URL | Request) => {
-        const href =
-          typeof input === "string"
-            ? input
-            : input instanceof URL
-              ? input.href
-              : (input as Request).url;
-        seen.push(href);
-        return Response.json([{ id: "n-beta" }], { status: 200 });
-      };
+      const seen: Array<Record<string, unknown> | undefined> = [];
+      const urls: string[] = [];
+      const fetchImpl = (input: string | URL | Request, init?: RequestInit) =>
+        routeVaultMcp(input, init, {
+          onRequest: ({ url, rpc }) => {
+            if (rpc.method === "tools/call") urls.push(url);
+          },
+          onCall: ({ rpc }) => {
+            seen.push(rpc.params?.arguments);
+            return [{ id: "n-beta" }];
+          },
+        });
       const res = await handleAccountMcp(
         nostrReq(
           FRIEND_SECRET,
@@ -739,38 +863,42 @@ describe("account MCP — query-notes", () => {
               order_by: "updated_at",
               offset: 2,
               limit: 3,
+              cursor: "",
             },
           }),
         ),
         mcpDeps(h, { fetchImpl }),
       );
       expect(res.status).toBe(200);
+      expect(urls).toHaveLength(1);
+      expect(urls[0]).toContain("/vault/beta/mcp");
+      expect(urls[0]).not.toContain("/api/notes");
       expect(seen).toHaveLength(1);
-      const u = new URL(seen[0]!);
-      expect(u.searchParams.get("sort")).toBe("desc");
-      expect(u.searchParams.get("include_content")).toBe("true");
-      expect(u.searchParams.get("order_by")).toBe("updated_at");
-      expect(u.searchParams.get("offset")).toBe("2");
-      expect(u.searchParams.get("limit")).toBe("3");
+      expect(seen[0]).toMatchObject({
+        sort: "desc",
+        include_content: true,
+        order_by: "updated_at",
+        offset: 2,
+        limit: 3,
+        cursor: "",
+      });
+      expect(seen[0]).not.toHaveProperty("vault");
     } finally {
       h.cleanup();
     }
   });
 
-  test("omits unknown sort rather than forwarding it", async () => {
+  test("does not allowlist sort — unknown values ride through to vault MCP", async () => {
     const h = await makeHarness();
     try {
-      const seen: string[] = [];
-      const fetchImpl = async (input: string | URL | Request) => {
-        const href =
-          typeof input === "string"
-            ? input
-            : input instanceof URL
-              ? input.href
-              : (input as Request).url;
-        seen.push(href);
-        return Response.json([], { status: 200 });
-      };
+      const seen: Array<Record<string, unknown> | undefined> = [];
+      const fetchImpl = (input: string | URL | Request, init?: RequestInit) =>
+        routeVaultMcp(input, init, {
+          onCall: ({ rpc }) => {
+            seen.push(rpc.params?.arguments);
+            return [];
+          },
+        });
       await handleAccountMcp(
         nostrReq(
           FRIEND_SECRET,
@@ -782,14 +910,13 @@ describe("account MCP — query-notes", () => {
         mcpDeps(h, { fetchImpl }),
       );
       expect(seen).toHaveLength(1);
-      const u = new URL(seen[0]!);
-      expect(u.searchParams.has("sort")).toBe(false);
+      expect(seen[0]?.sort).toBe("newest");
     } finally {
       h.cleanup();
     }
   });
 
-  test("tools/list advertises sort and include_content on query-notes", async () => {
+  test("tools/list advertises live query-notes schema plus injected vault", async () => {
     const h = await makeHarness();
     try {
       const token = await bearer(h, [HOST_ADMIN_SCOPE]);
@@ -799,7 +926,7 @@ describe("account MCP — query-notes", () => {
           tools: Array<{
             name: string;
             description?: string;
-            inputSchema?: { properties?: Record<string, unknown> };
+            inputSchema?: { properties?: Record<string, unknown>; required?: string[] };
           }>;
         };
       };
@@ -807,8 +934,9 @@ describe("account MCP — query-notes", () => {
       expect(qn?.inputSchema?.properties).toHaveProperty("sort");
       expect(qn?.inputSchema?.properties).toHaveProperty("include_content");
       expect(qn?.inputSchema?.properties).toHaveProperty("order_by");
-      expect(qn?.description).toMatch(/sort/);
-      expect(qn?.description).toMatch(/include_content/);
+      expect(qn?.inputSchema?.properties).toHaveProperty("vault");
+      expect(qn?.inputSchema?.required ?? []).not.toContain("vault");
+      expect(qn?.description).toMatch(/Catalog caveat/);
     } finally {
       h.cleanup();
     }
@@ -817,7 +945,8 @@ describe("account MCP — query-notes", () => {
   test("friend can query their assigned vault", async () => {
     const h = await makeHarness();
     try {
-      const fetchImpl = async () => Response.json([{ id: "n-beta" }], { status: 200 });
+      const fetchImpl = (input: string | URL | Request, init?: RequestInit) =>
+        routeVaultMcp(input, init, { onCall: () => [{ id: "n-beta" }] });
       const res = await handleAccountMcp(
         nostrReq(
           FRIEND_SECRET,
@@ -838,20 +967,17 @@ describe("account MCP — query-notes", () => {
 });
 
 describe("account MCP — create-note", () => {
-  test("owner posts to the named vault with a write-audience mint", async () => {
+  test("owner forwards JSON-RPC to the named vault with a write-or-higher mint", async () => {
     const h = await makeHarness();
     try {
-      const seen: Array<{ url: string; method: string; scope: string }> = [];
-      const fetchImpl = async (input: string | URL | Request, init?: RequestInit) => {
-        const req = input instanceof Request ? input : new Request(String(input), init);
-        const auth = req.headers.get("authorization") ?? "";
-        const parts = auth.replace(/^Bearer\s+/i, "").split(".");
-        const payload = JSON.parse(Buffer.from(parts[1] ?? "", "base64url").toString()) as {
-          scope?: string;
-        };
-        seen.push({ url: req.url, method: req.method, scope: payload.scope ?? "" });
-        return Response.json({ id: "n1", path: "Log/hello" }, { status: 201 });
-      };
+      const seen: Array<{ url: string; method: string; scope: string; args: unknown }> = [];
+      const fetchImpl = (input: string | URL | Request, init?: RequestInit) =>
+        routeVaultMcp(input, init, {
+          onCall: ({ url, method, scope, rpc }) => {
+            seen.push({ url, method, scope, args: rpc.params?.arguments });
+            return { id: "n1", path: "Log/hello" };
+          },
+        });
       const res = await handleAccountMcp(
         nostrReq(
           OWNER_SECRET,
@@ -864,23 +990,24 @@ describe("account MCP — create-note", () => {
       );
       const out = parseTool(
         (await res.json()) as { result: { content: Array<{ text: string }> } },
-      ) as { vault: string; note: { id: string } };
-      expect(out.vault).toBe("beta");
-      expect(out.note.id).toBe("n1");
+      ) as { id: string };
+      expect(out.id).toBe("n1");
       expect(seen).toHaveLength(1);
-      expect(seen[0]?.url).toContain("/vault/beta/api/notes");
+      expect(seen[0]?.url).toContain("/vault/beta/mcp");
+      expect(seen[0]?.url).not.toContain("/api/notes");
       expect(seen[0]?.method).toBe("POST");
-      expect(seen[0]?.scope).toBe("vault:beta:write");
+      expect(seen[0]?.scope).toMatch(/^vault:beta:(write|admin)$/);
+      expect(seen[0]?.args).toEqual({ path: "Log/hello", content: "hi" });
     } finally {
       h.cleanup();
     }
   });
 
-  test("read-role cannot create-note — write_not_granted, fetch never called", async () => {
+  test("read-role cannot create-note — Unknown tool, no tools/call", async () => {
     const h = await makeHarness();
     const readerSecret = hexToBytes("44".repeat(32));
     const readerPub = bytesToHex(schnorr.getPublicKey(readerSecret));
-    let fetched = 0;
+    const methods: string[] = [];
     try {
       const reader = await createUser(h.db, "reader", "correct-horse-battery-staple", {
         allowMulti: true,
@@ -905,10 +1032,10 @@ describe("account MCP — create-note", () => {
           }),
         ),
         mcpDeps(h, {
-          fetchImpl: async () => {
-            fetched += 1;
-            return Response.json({}, { status: 201 });
-          },
+          fetchImpl: (input, init) =>
+            routeVaultMcp(input, init, {
+              onRequest: ({ rpc }) => methods.push(rpc.method ?? ""),
+            }),
         }),
       );
       const body = (await res.json()) as {
@@ -916,7 +1043,7 @@ describe("account MCP — create-note", () => {
       };
       expect(body.result?.isError).toBe(true);
       expect(body.result?.content?.[0]?.text).toMatch(/Unknown tool: create-note/);
-      expect(fetched).toBe(0);
+      expect(methods).toEqual(["tools/list"]);
     } finally {
       h.cleanup();
     }
@@ -924,7 +1051,7 @@ describe("account MCP — create-note", () => {
 
   test("first-admin Bearer named beta:read cannot create-note on beta", async () => {
     const h = await makeHarness();
-    let fetched = 0;
+    const methods: string[] = [];
     try {
       const token = await bearer(h, ["account:self:vaults:beta:read"], h.ownerId);
       const res = await handleAccountMcp(
@@ -933,10 +1060,10 @@ describe("account MCP — create-note", () => {
           rpc("tools/call", { name: "create-note", arguments: { vault: "beta", content: "nope" } }),
         ),
         mcpDeps(h, {
-          fetchImpl: async () => {
-            fetched += 1;
-            return Response.json({}, { status: 201 });
-          },
+          fetchImpl: (input, init) =>
+            routeVaultMcp(input, init, {
+              onRequest: ({ rpc }) => methods.push(rpc.method ?? ""),
+            }),
         }),
       );
       const body = (await res.json()) as {
@@ -944,7 +1071,7 @@ describe("account MCP — create-note", () => {
       };
       expect(body.result?.isError).toBe(true);
       expect(body.result?.content?.[0]?.text).toMatch(/Unknown tool: create-note/);
-      expect(fetched).toBe(0);
+      expect(methods).toEqual(["tools/list"]);
     } finally {
       h.cleanup();
     }
@@ -952,7 +1079,7 @@ describe("account MCP — create-note", () => {
 
   test("friend Bearer named beta:read cannot create-note even with write assignment", async () => {
     const h = await makeHarness();
-    let fetched = 0;
+    const methods: string[] = [];
     try {
       const token = await bearer(h, ["account:self:vaults:beta:read"], h.friendId);
       const res = await handleAccountMcp(
@@ -961,10 +1088,10 @@ describe("account MCP — create-note", () => {
           rpc("tools/call", { name: "create-note", arguments: { vault: "beta", content: "nope" } }),
         ),
         mcpDeps(h, {
-          fetchImpl: async () => {
-            fetched += 1;
-            return Response.json({}, { status: 201 });
-          },
+          fetchImpl: (input, init) =>
+            routeVaultMcp(input, init, {
+              onRequest: ({ rpc }) => methods.push(rpc.method ?? ""),
+            }),
         }),
       );
       const body = (await res.json()) as {
@@ -972,7 +1099,7 @@ describe("account MCP — create-note", () => {
       };
       expect(body.result?.isError).toBe(true);
       expect(body.result?.content?.[0]?.text).toMatch(/Unknown tool: create-note/);
-      expect(fetched).toBe(0);
+      expect(methods).toEqual(["tools/list"]);
     } finally {
       h.cleanup();
     }
@@ -982,17 +1109,13 @@ describe("account MCP — create-note", () => {
     const h = await makeHarness();
     try {
       const seen: string[] = [];
-      const fetchImpl = async (input: string | URL | Request, init?: RequestInit) => {
-        const req = input instanceof Request ? input : new Request(String(input), init);
-        const parts = (req.headers.get("authorization") ?? "")
-          .replace(/^Bearer\s+/i, "")
-          .split(".");
-        const payload = JSON.parse(Buffer.from(parts[1] ?? "", "base64url").toString()) as {
-          scope?: string;
-        };
-        seen.push(payload.scope ?? "");
-        return Response.json({ id: "n-friend" }, { status: 201 });
-      };
+      const fetchImpl = (input: string | URL | Request, init?: RequestInit) =>
+        routeVaultMcp(input, init, {
+          onCall: ({ scope }) => {
+            seen.push(scope);
+            return { id: "n-friend" };
+          },
+        });
       const res = await handleAccountMcp(
         nostrReq(
           FRIEND_SECRET,
@@ -1005,10 +1128,9 @@ describe("account MCP — create-note", () => {
       );
       const out = parseTool(
         (await res.json()) as { result: { content: Array<{ text: string }> } },
-      ) as { vault: string; note: { id: string } };
-      expect(out.vault).toBe("beta");
-      expect(out.note.id).toBe("n-friend");
-      expect(seen).toEqual(["vault:beta:write"]);
+      ) as { id: string };
+      expect(out.id).toBe("n-friend");
+      expect(seen).toEqual(["vault:beta:admin"]);
     } finally {
       h.cleanup();
     }
@@ -1057,11 +1179,13 @@ describe("account MCP — create-note", () => {
       const names = (
         (await listed.json()) as { result: { tools: Array<{ name: string }> } }
       ).result.tools.map((t) => t.name);
-      expect(names).toEqual(["list-vaults", "query-notes"]);
+      expect(names).toContain("list-vaults");
+      expect(names).toContain("query-notes");
       expect(names).not.toContain("create-note");
       expect(names).not.toContain("update-note");
       expect(names).not.toContain("grant-access");
       expect(names).not.toContain("create-vault");
+      expect(names).not.toContain("manage-token");
     } finally {
       h.cleanup();
     }
@@ -1069,25 +1193,17 @@ describe("account MCP — create-note", () => {
 });
 
 describe("account MCP — update-note", () => {
-  test("owner PATCHes the named vault with a write-audience mint", async () => {
+  test("owner forwards JSON-RPC update-note with a write-or-higher mint", async () => {
     const h = await makeHarness();
     try {
-      const seen: Array<{ url: string; method: string; scope: string; body: unknown }> = [];
-      const fetchImpl = async (input: string | URL | Request, init?: RequestInit) => {
-        const req = input instanceof Request ? input : new Request(String(input), init);
-        const auth = req.headers.get("authorization") ?? "";
-        const parts = auth.replace(/^Bearer\s+/i, "").split(".");
-        const payload = JSON.parse(Buffer.from(parts[1] ?? "", "base64url").toString()) as {
-          scope?: string;
-        };
-        seen.push({
-          url: req.url,
-          method: req.method,
-          scope: payload.scope ?? "",
-          body: JSON.parse(await req.text()),
+      const seen: Array<{ url: string; method: string; scope: string; args: unknown }> = [];
+      const fetchImpl = (input: string | URL | Request, init?: RequestInit) =>
+        routeVaultMcp(input, init, {
+          onCall: ({ url, method, scope, rpc }) => {
+            seen.push({ url, method, scope, args: rpc.params?.arguments });
+            return { id: "n1", path: "Log/hello", content: "there" };
+          },
         });
-        return Response.json({ id: "n1", path: "Log/hello", content: "there" }, { status: 200 });
-      };
       const res = await handleAccountMcp(
         nostrReq(
           OWNER_SECRET,
@@ -1100,29 +1216,30 @@ describe("account MCP — update-note", () => {
       );
       const out = parseTool(
         (await res.json()) as { result: { content: Array<{ text: string }> } },
-      ) as { vault: string; note: { id: string; content: string } };
-      expect(out.vault).toBe("beta");
-      expect(out.note.id).toBe("n1");
-      expect(out.note.content).toBe("there");
+      ) as { id: string; content: string };
+      expect(out.id).toBe("n1");
+      expect(out.content).toBe("there");
       expect(seen).toHaveLength(1);
-      expect(seen[0]?.url).toContain("/vault/beta/api/notes/n1");
-      expect(seen[0]?.method).toBe("PATCH");
-      expect(seen[0]?.scope).toBe("vault:beta:write");
-      expect(seen[0]?.body).toEqual({ content: "there" });
+      expect(seen[0]?.url).toContain("/vault/beta/mcp");
+      expect(seen[0]?.method).toBe("POST");
+      expect(seen[0]?.scope).toMatch(/^vault:beta:(write|admin)$/);
+      expect(seen[0]?.args).toEqual({ id: "n1", content: "there" });
     } finally {
       h.cleanup();
     }
   });
 
-  test("path id is encoded on the PATCH URL", async () => {
+  test("path id stays in MCP arguments, not a REST URL", async () => {
     const h = await makeHarness();
     try {
-      const seen: string[] = [];
-      const fetchImpl = async (input: string | URL | Request, init?: RequestInit) => {
-        const req = input instanceof Request ? input : new Request(String(input), init);
-        seen.push(req.url);
-        return Response.json({ id: "n1", path: "Log/hello" }, { status: 200 });
-      };
+      const seen: Array<{ url: string; args: Record<string, unknown> | undefined }> = [];
+      const fetchImpl = (input: string | URL | Request, init?: RequestInit) =>
+        routeVaultMcp(input, init, {
+          onCall: ({ url, rpc }) => {
+            seen.push({ url, args: rpc.params?.arguments });
+            return { id: "n1", path: "Log/hello" };
+          },
+        });
       const res = await handleAccountMcp(
         nostrReq(
           OWNER_SECRET,
@@ -1135,18 +1252,19 @@ describe("account MCP — update-note", () => {
       );
       expect(res.status).toBe(200);
       expect(seen).toHaveLength(1);
-      expect(seen[0]).toContain("/vault/beta/api/notes/Log%2Fhello");
-      expect(seen[0]).not.toContain("/api/notes/Log/hello");
+      expect(seen[0]?.url).toContain("/vault/beta/mcp");
+      expect(seen[0]?.url).not.toContain("/api/notes");
+      expect(seen[0]?.args).toEqual({ id: "Log/hello", append: " more", force: true });
     } finally {
       h.cleanup();
     }
   });
 
-  test("read-role cannot update-note — Unknown tool, fetch never called", async () => {
+  test("read-role cannot update-note — Unknown tool, no tools/call", async () => {
     const h = await makeHarness();
     const readerSecret = hexToBytes("66".repeat(32));
     const readerPub = bytesToHex(schnorr.getPublicKey(readerSecret));
-    let fetched = 0;
+    const methods: string[] = [];
     try {
       const reader = await createUser(h.db, "reader3", "correct-horse-battery-staple", {
         allowMulti: true,
@@ -1171,10 +1289,10 @@ describe("account MCP — update-note", () => {
           }),
         ),
         mcpDeps(h, {
-          fetchImpl: async () => {
-            fetched += 1;
-            return Response.json({}, { status: 200 });
-          },
+          fetchImpl: (input, init) =>
+            routeVaultMcp(input, init, {
+              onRequest: ({ rpc }) => methods.push(rpc.method ?? ""),
+            }),
         }),
       );
       const body = (await res.json()) as {
@@ -1182,7 +1300,7 @@ describe("account MCP — update-note", () => {
       };
       expect(body.result?.isError).toBe(true);
       expect(body.result?.content?.[0]?.text).toMatch(/Unknown tool: update-note/);
-      expect(fetched).toBe(0);
+      expect(methods).toEqual(["tools/list"]);
     } finally {
       h.cleanup();
     }
@@ -1190,7 +1308,7 @@ describe("account MCP — update-note", () => {
 
   test("first-admin Bearer named beta:read cannot update-note on beta", async () => {
     const h = await makeHarness();
-    let fetched = 0;
+    const methods: string[] = [];
     try {
       const token = await bearer(h, ["account:self:vaults:beta:read"], h.ownerId);
       const res = await handleAccountMcp(
@@ -1202,10 +1320,10 @@ describe("account MCP — update-note", () => {
           }),
         ),
         mcpDeps(h, {
-          fetchImpl: async () => {
-            fetched += 1;
-            return Response.json({}, { status: 200 });
-          },
+          fetchImpl: (input, init) =>
+            routeVaultMcp(input, init, {
+              onRequest: ({ rpc }) => methods.push(rpc.method ?? ""),
+            }),
         }),
       );
       const body = (await res.json()) as {
@@ -1213,7 +1331,7 @@ describe("account MCP — update-note", () => {
       };
       expect(body.result?.isError).toBe(true);
       expect(body.result?.content?.[0]?.text).toMatch(/Unknown tool: update-note/);
-      expect(fetched).toBe(0);
+      expect(methods).toEqual(["tools/list"]);
     } finally {
       h.cleanup();
     }
@@ -1223,17 +1341,13 @@ describe("account MCP — update-note", () => {
     const h = await makeHarness();
     try {
       const seen: Array<{ method: string; scope: string }> = [];
-      const fetchImpl = async (input: string | URL | Request, init?: RequestInit) => {
-        const req = input instanceof Request ? input : new Request(String(input), init);
-        const parts = (req.headers.get("authorization") ?? "")
-          .replace(/^Bearer\s+/i, "")
-          .split(".");
-        const payload = JSON.parse(Buffer.from(parts[1] ?? "", "base64url").toString()) as {
-          scope?: string;
-        };
-        seen.push({ method: req.method, scope: payload.scope ?? "" });
-        return Response.json({ id: "n-friend", content: "edited" }, { status: 200 });
-      };
+      const fetchImpl = (input: string | URL | Request, init?: RequestInit) =>
+        routeVaultMcp(input, init, {
+          onCall: ({ method, scope }) => {
+            seen.push({ method, scope });
+            return { id: "n-friend", content: "edited" };
+          },
+        });
       const res = await handleAccountMcp(
         nostrReq(
           FRIEND_SECRET,
@@ -1246,27 +1360,9 @@ describe("account MCP — update-note", () => {
       );
       const out = parseTool(
         (await res.json()) as { result: { content: Array<{ text: string }> } },
-      ) as { vault: string; note: { id: string } };
-      expect(out.vault).toBe("beta");
-      expect(out.note.id).toBe("n-friend");
-      expect(seen).toEqual([{ method: "PATCH", scope: "vault:beta:write" }]);
-    } finally {
-      h.cleanup();
-    }
-  });
-
-  test("missing id is invalid_id", async () => {
-    const h = await makeHarness();
-    try {
-      const res = await handleAccountMcp(
-        nostrReq(
-          OWNER_SECRET,
-          rpc("tools/call", { name: "update-note", arguments: { vault: "beta", content: "x" } }),
-        ),
-        mcpDeps(h),
-      );
-      const body = (await res.json()) as { error?: { data?: { error_type?: string } } };
-      expect(body.error?.data?.error_type).toBe("invalid_id");
+      ) as { id: string };
+      expect(out.id).toBe("n-friend");
+      expect(seen).toEqual([{ method: "POST", scope: "vault:beta:admin" }]);
     } finally {
       h.cleanup();
     }
@@ -1287,6 +1383,199 @@ describe("account MCP — update-note", () => {
       );
       const body = (await res.json()) as { error?: { data?: { error_type?: string } } };
       expect(body.error?.data?.error_type).toBe("vault_not_covered");
+    } finally {
+      h.cleanup();
+    }
+  });
+});
+describe("account MCP — vault module proxy", () => {
+  test("schema-source is one tools/list POST to the highest-verb vault", async () => {
+    const h = await makeHarness();
+    try {
+      const token = await bearer(h, [HOST_ADMIN_SCOPE]);
+      const lists: string[] = [];
+      const fetchImpl = (input: string | URL | Request, init?: RequestInit) =>
+        routeVaultMcp(input, init, {
+          onRequest: ({ vault, rpc }) => {
+            if (rpc.method === "tools/list") lists.push(vault);
+          },
+        });
+      await handleAccountMcp(bearerReq(token, rpc("tools/list")), mcpDeps(h, { fetchImpl }));
+      expect(lists).toEqual(["beta"]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("schema-source falls back to the next covered vault when the highest-verb one is down", async () => {
+    const h = await makeHarness();
+    try {
+      const token = await bearer(h, [HOST_ADMIN_SCOPE]);
+      const lists: string[] = [];
+      const fetchImpl = (input: string | URL | Request, init?: RequestInit) =>
+        routeVaultMcp(input, init, {
+          onList: ({ vault }) => {
+            lists.push(vault);
+            if (vault === "beta") throw new Error("beta down");
+            return { tools: toolsForMintedScope("vault:personal:admin") };
+          },
+        });
+      const listed = await handleAccountMcp(
+        bearerReq(token, rpc("tools/list")),
+        mcpDeps(h, { fetchImpl }),
+      );
+      const names = (
+        (await listed.json()) as { result: { tools: Array<{ name: string }> } }
+      ).result.tools.map((t) => t.name);
+      expect(lists).toEqual(["beta", "personal"]);
+      expect(names).toContain("query-notes");
+      expect(names).toContain("manage-token");
+      expect(names).toContain("list-vaults");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("schema-source all down degrades to hub-native only", async () => {
+    const h = await makeHarness();
+    try {
+      const token = await bearer(h, [HOST_ADMIN_SCOPE]);
+      const fetchImpl = async () => {
+        throw new Error("all vaults down");
+      };
+      const listed = await handleAccountMcp(
+        bearerReq(token, rpc("tools/list")),
+        mcpDeps(h, { fetchImpl }),
+      );
+      expect(listed.status).toBe(200);
+      const names = (
+        (await listed.json()) as { result: { tools: Array<{ name: string }> } }
+      ).result.tools.map((t) => t.name);
+      expect(names).toEqual([
+        "list-vaults",
+        "create-vault",
+        "grant-access",
+        "revoke-access",
+        "list-access",
+      ]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("no vaults installed: hub-native only, no fetch", async () => {
+    const h = await makeHarness([]);
+    let fetched = 0;
+    try {
+      const token = await bearer(h, [HOST_ADMIN_SCOPE]);
+      const listed = await handleAccountMcp(
+        bearerReq(token, rpc("tools/list")),
+        mcpDeps(h, {
+          fetchImpl: async () => {
+            fetched += 1;
+            return new Response("nope", { status: 500 });
+          },
+        }),
+      );
+      const names = (
+        (await listed.json()) as { result: { tools: Array<{ name: string }> } }
+      ).result.tools.map((t) => t.name);
+      expect(names).toEqual(["list-vaults", "create-vault"]);
+      expect(fetched).toBe(0);
+      const queried = await handleAccountMcp(
+        bearerReq(token, rpc("tools/call", { name: "query-notes", arguments: {} })),
+        mcpDeps(h, {
+          fetchImpl: async () => {
+            fetched += 1;
+            return new Response("nope", { status: 500 });
+          },
+        }),
+      );
+      const body = (await queried.json()) as {
+        result?: { isError?: boolean; content?: Array<{ text?: string }> };
+      };
+      expect(body.result?.isError).toBe(true);
+      expect(body.result?.content?.[0]?.text).toMatch(/Unknown tool: query-notes/);
+      expect(fetched).toBe(0);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("list-tags and manage-token exist only because the live list included them", async () => {
+    const h = await makeHarness();
+    try {
+      const token = await bearer(h, [HOST_ADMIN_SCOPE]);
+      const listed = await handleAccountMcp(bearerReq(token, rpc("tools/list")), mcpDeps(h));
+      const names = (
+        (await listed.json()) as { result: { tools: Array<{ name: string }> } }
+      ).result.tools.map((t) => t.name);
+      expect(names).toContain("list-tags");
+      expect(names).toContain("manage-token");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("read-attachment image content is passed through, not stringified", async () => {
+    const h = await makeHarness();
+    try {
+      const image = {
+        content: [
+          { type: "image", data: "abc", mimeType: "image/png" },
+          { type: "text", text: '{"id":"att1"}' },
+        ],
+      };
+      const fetchImpl = (input: string | URL | Request, init?: RequestInit) =>
+        routeVaultMcp(input, init, {
+          onCall: ({ rpc }) => {
+            if (rpc.params?.name === "read-attachment") return image;
+            return undefined;
+          },
+        });
+      const res = await handleAccountMcp(
+        nostrReq(
+          OWNER_SECRET,
+          rpc("tools/call", {
+            name: "read-attachment",
+            arguments: { vault: "beta", attachment_id: "att1" },
+          }),
+        ),
+        mcpDeps(h, { fetchImpl }),
+      );
+      const body = (await res.json()) as {
+        result: { content: Array<{ type: string; data?: string; mimeType?: string }> };
+      };
+      expect(body.result.content[0]).toEqual({
+        type: "image",
+        data: "abc",
+        mimeType: "image/png",
+      });
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("delete-note forwards to vault MCP", async () => {
+    const h = await makeHarness();
+    try {
+      const seen: Array<{ name?: string; args?: Record<string, unknown> }> = [];
+      const fetchImpl = (input: string | URL | Request, init?: RequestInit) =>
+        routeVaultMcp(input, init, {
+          onCall: ({ rpc }) => {
+            seen.push({ name: rpc.params?.name, args: rpc.params?.arguments });
+            return { deleted: true };
+          },
+        });
+      const res = await handleAccountMcp(
+        nostrReq(
+          OWNER_SECRET,
+          rpc("tools/call", { name: "delete-note", arguments: { vault: "beta", id: "n1" } }),
+        ),
+        mcpDeps(h, { fetchImpl }),
+      );
+      expect(res.status).toBe(200);
+      expect(seen).toEqual([{ name: "delete-note", args: { id: "n1" } }]);
     } finally {
       h.cleanup();
     }
@@ -1453,7 +1742,8 @@ describe("account MCP — extra pins", () => {
         (await listed.json()) as { result: { content: Array<{ text: string }> } },
       ) as { vaults: Array<{ name: string }> };
       expect(payload.vaults.map((v) => v.name)).toEqual(["beta"]);
-      const fetchImpl = async () => Response.json([{ id: "n-beta" }], { status: 200 });
+      const fetchImpl = (input: string | URL | Request, init?: RequestInit) =>
+        routeVaultMcp(input, init, { onCall: () => [{ id: "n-beta" }] });
       const queried = await handleAccountMcp(
         nostrReq(
           readerSecret,
