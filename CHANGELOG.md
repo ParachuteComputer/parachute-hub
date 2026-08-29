@@ -6,6 +6,39 @@ All notable changes to `@openparachute/hub` are documented here. The format foll
 >
 > This backfill covers the 0.6.x line only. Two pre-existing gaps remain undocumented and are **not** addressed here: the `0.5.13` stable itself (the file's newest entry is `0.5.13-rc.48`, never the stable) and the entire `0.5.14-rc` chain (rc.1–rc.21 on npm), which never promoted to a `0.5.14` stable — its work folded forward into 0.6.0.
 
+## [0.7.18-rc.11] - 2026-08-29
+
+**Tag-record, canonical `/mcp` 401, and multiple hub admins.** Three PRs
+on `next` after 0.7.18-rc.10. Version bump only; no new code in this
+commit. Merging this to `next` publishes `@rc` (hub#911 — no next→main
+hop).
+
+- **Tag-record checkout fetches tags (#919).** Port of surface#216: the
+  already-tagged dedupe rev-parses the tag, but a shallow tagless clone
+  cannot see pre-existing remote tags, so the push is rejected and
+  swallowed by continue-on-error.
+
+- **401 challenge at `/mcp` names the root PRM (#920, closes #899).**
+  `handleAccountMcp` answers both `/mcp` and `/account/mcp`. The 401
+  `WWW-Authenticate` `resource_metadata` now follows the request URL:
+  `/mcp` → root PRM (vault-only scopes); `/account/mcp` → account PRM.
+  Root PRM stays vault-only — mixing `account:vaults` onto it would
+  make catalog-copy request both families and bounce as
+  `invalid_scope`.
+
+- **Multiple hub admins via `users.hub_role` (#921, closes #881).**
+  Persistent `admin`/`user` column; migration backfills the earliest
+  row. `isHubAdmin()` is privilege; `getFirstAdminId` stays the
+  undeletable first account plus empty-table bootstrap sentinels.
+  Promote-only (`POST /api/users/:id/promote-hub-admin`), refuses a
+  target with vault assignments (empty `user_vaults` means unrestricted
+  for an admin and no access for a friend). No demote in v1. Peer
+  rails extend to every admin. SPA reads `hub_role` instead of
+  `users[0]`.
+
+Leaves #880 open (link-ceremony UX, rides rc.12). Auto-provision still
+defaults off. Do not suffix-drop 0.7.18.
+
 ## [0.7.18-rc.10] - 2026-08-29
 
 **Two security/correctness fixes from tonight's release-automation hardening pass.** Version bump only; no new code in this commit. Merging this to `next` publishes `@rc` (hub#911 — no next→main hop).
