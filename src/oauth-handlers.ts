@@ -128,7 +128,7 @@ import { isTotpEnrolled } from "./two-factor-store.ts";
 import {
   getUserById,
   getUserByUsername,
-  isFirstAdmin,
+  isHubAdmin,
   vaultVerbsForUserVault,
   verifyPassword,
 } from "./users.ts";
@@ -218,8 +218,9 @@ function accountGrantCoversUnnamedAtRoot(
  *     user_id), but a delete-between-mint-and-now race shouldn't 500.
  *     Empty is the safe sentinel — the scope-bearing `scope` claim is
  *     still the gate.
- *   - First admin → `[]`. Admin posture is unrestricted by design (see
- *     `isFirstAdmin`). The consent picker is the source of truth and
+ *   - Hub admin → `[]`. Admin posture is unrestricted by design (see
+ *     `isHubAdmin`; ANY account with `hub_role = 'admin'`, not just the
+ *     first — hub#881). The consent picker is the source of truth and
  *     the scope-guard reads an empty `vault_scope` claim as "no
  *     narrowing" — first admin can request scope against any vault.
  *   - Non-admin user → the list of vault names from `user_vaults`. The
@@ -235,7 +236,7 @@ function accountGrantCoversUnnamedAtRoot(
  * unconditionally — readers don't have to distinguish "absent" from "empty."
  */
 export function vaultScopeForUser(db: Database, userId: string): string[] {
-  if (isFirstAdmin(db, userId)) return [];
+  if (isHubAdmin(db, userId)) return [];
   const user = getUserById(db, userId);
   if (!user) return [];
   return [...user.assignedVaults];
@@ -1343,7 +1344,7 @@ export function handleAuthorizeGet(db: Database, req: Request, deps: OAuthDeps):
   // closing the silent-mint-on-stale-vault gap; the read is one JSON parse
   // off-disk per /authorize.
   const user = getUserById(db, session.userId);
-  const userIsAdmin = isFirstAdmin(db, session.userId);
+  const userIsAdmin = isHubAdmin(db, session.userId);
   // Non-admin user's assigned vaults; admin posture (or no row) → empty.
   const assignedVaults: string[] = userIsAdmin ? [] : (user?.assignedVaults ?? []);
   const manifest = (deps.loadServicesManifest ?? readServicesManifest)();
@@ -1554,13 +1555,13 @@ export function handleAuthorizeGet(db: Database, req: Request, deps: OAuthDeps):
  * DROPPED. Non-vault scopes and unnamed `vault:<verb>` (which never reach
  * mint without picker-narrowing) pass through untouched.
  *
- * The owner (`isFirstAdmin`) bypasses the cap entirely — they hold admin on
+ * A hub admin (`isHubAdmin`) bypasses the cap entirely — they hold admin on
  * every vault by construction (admin posture is the unrestricted sentinel;
- * see `vaultScopeForUser`). Owner=isFirstAdmin is the Phase-1 definition of
+ * see `vaultScopeForUser`). Owner=isHubAdmin is the post-#881 definition of
  * "holds admin everywhere"; revisit when multi-admin lands.
  *
  * Security argument (documented at the call site too):
- *   - The authority source of truth today is `isFirstAdmin` for owner-wide
+ *   - The authority source of truth today is `isHubAdmin` for owner-wide
  *     authority and `user_vaults.role` (via `vaultVerbsForRole`) for assigned
  *     users.
  *   - `vaultVerbsForRole` maps write→[read,write,admin] (2026-05-30: any
@@ -1788,9 +1789,9 @@ function issueAuthCodeRedirect(
 ): Response {
   // Anti-privesc cap at the single choke-point. Runs AFTER any narrowing the
   // callers did (unnamed `vault:admin` → `vault:<picked>:admin`), so it sees
-  // the final named shapes. Owner (isFirstAdmin) bypasses — holds admin
+  // the final named shapes. Hub admin (isHubAdmin) bypasses — holds admin
   // everywhere by construction.
-  const userIsAdmin = isFirstAdmin(db, userId);
+  const userIsAdmin = isHubAdmin(db, userId);
   // RFC 9728 walk: PRM advertises un-narrowed `account:vaults`; the token
   // must carry the id-bound blanket `account:self:vaults`. Bind here at the
   // single mint choke-point so skip-consent and form-consent cannot diverge.
@@ -2157,7 +2158,7 @@ async function handleConsentSubmit(
   // submission disagrees, so a hand-crafted POST or a misbehaving SPA
   // can't bypass the narrowing. First admin (admin posture) keeps the
   // existing picker-as-source-of-truth behavior (empty `assignedVaults`).
-  const userIsAdmin = isFirstAdmin(db, session.userId);
+  const userIsAdmin = isHubAdmin(db, session.userId);
   const sessionUser = getUserById(db, session.userId);
   const assignedVaults: string[] = userIsAdmin ? [] : (sessionUser?.assignedVaults ?? []);
   const isPinned = assignedVaults.length > 0;

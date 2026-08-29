@@ -40,7 +40,7 @@ import {
   revokeAccess,
 } from "./grant-access.ts";
 import type { SignAccessTokenOpts } from "./jwt-sign.ts";
-import { getUserById, isFirstAdmin, vaultVerbsForUserVault } from "./users.ts";
+import { getUserById, isHubAdmin, vaultVerbsForUserVault } from "./users.ts";
 
 /** Hub account sentinel — account ≡ box. */
 export const HUB_ACCOUNT_ID = "self";
@@ -181,7 +181,7 @@ export function resolveCoverage(
   installed: AccountVaultMeta[],
 ): Coverage {
   if (principal.authKind === "nostr") {
-    if (principal.isHubAdmin || isFirstAdmin(db, principal.userId)) {
+    if (principal.isHubAdmin || isHubAdmin(db, principal.userId)) {
       return {
         covered: "all",
         vaults: installed,
@@ -196,7 +196,7 @@ export function resolveCoverage(
   const grant = principal.grant;
   const create = grant?.create === true;
   const owned =
-    principal.isHubAdmin || isFirstAdmin(db, principal.userId)
+    principal.isHubAdmin || isHubAdmin(db, principal.userId)
       ? installed
       : assignedReadable(db, principal.userId, installed);
 
@@ -213,7 +213,7 @@ export function installedVaults(ctx: AccountToolContext): AccountVaultMeta[] {
 }
 
 function isUnrestricted(db: Database, principal: AccountMcpPrincipal): boolean {
-  return principal.isHubAdmin || isFirstAdmin(db, principal.userId);
+  return principal.isHubAdmin || isHubAdmin(db, principal.userId);
 }
 
 /**

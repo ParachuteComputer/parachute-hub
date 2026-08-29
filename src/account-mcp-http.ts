@@ -44,7 +44,7 @@ import {
   authenticateNostrRequest,
   isNostrAuthorization,
 } from "./nostr-http-auth.ts";
-import { isFirstAdmin } from "./users.ts";
+import { isHubAdmin } from "./users.ts";
 
 const LATEST_PROTOCOL_VERSION = "2025-11-25";
 const SUPPORTED_PROTOCOL_VERSIONS = [
@@ -239,7 +239,7 @@ async function authenticateBearer(
     scopes,
     authKind: "bearer",
     clientId,
-    isHubAdmin: isFirstAdmin(db, sub) || hostAdmin,
+    isHubAdmin: isHubAdmin(db, sub) || hostAdmin,
     grant,
   };
 }

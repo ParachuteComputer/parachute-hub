@@ -459,7 +459,10 @@ export async function seedInitialAdminIfNeeded(
   // `password_changed=true`. Same treatment as the wizard's first admin.
   // `assignedVault` stays null — admin posture (no per-vault restriction).
   try {
-    await createUser(db, username, password, { passwordChanged: true });
+    // `hubRole: "admin"` — this branch only runs when `userCount(db) === 0`,
+    // so it IS the hub's first account. Explicit rather than relying on
+    // `createUser`'s empty-table default (hub#881, migration v20).
+    await createUser(db, username, password, { passwordChanged: true, hubRole: "admin" });
   } catch (err) {
     if (err instanceof InvalidUsernameError) {
       log(

@@ -139,6 +139,7 @@
  *   /api/users/vaults             (GET)        → vault-name list for assigned-vault picker (host:admin)
  *   /api/users/<id>               (DELETE)     → hard-delete user + revoke tokens (host:admin)
  *   /api/users/<id>/reset-password (POST)      → admin-initiated password reset (host:admin)
+ *   /api/users/<id>/promote-hub-admin (POST)   → promote a user to hub admin (host:admin)
  *   /api/vault-caps               (GET)        → list vaults + persisted storage caps (host:admin)
  *   /api/vault-caps/<name>        (PUT)        → set/update a vault's storage cap (host:admin)
  *   /login                        (GET + POST) → operator password login
@@ -316,6 +317,7 @@ import {
   handleDeleteUser,
   handleListUsers,
   handleListVaults,
+  handlePromoteHubAdmin,
   handleResetUserPassword,
   handleUpdateUserVaults,
 } from "./api-users.ts";
@@ -3907,6 +3909,27 @@ export function hubFetch(
             return new Response("not found", { status: 404 });
           }
           return handleUpdateUserVaults(req, id, {
+            db: getDb(),
+            issuer: oauthDeps(req).issuer,
+            knownIssuers: oauthDeps(req).hubBoundOrigins(),
+            manifestPath,
+          });
+        }
+      }
+      // hub#881 — `/api/users/:id/promote-hub-admin` (grant `hub_role =
+      // 'admin'`). Routed before the per-id DELETE catch-all so the trailing
+      // segment isn't mistaken for part of a user id. Same `host:admin`
+      // Bearer gate as the other /api/users surfaces. No demote counterpart
+      // by design — see `handlePromoteHubAdmin`.
+      {
+        const promoteMatch = pathname.match(/^\/api\/users\/([^/]+)\/promote-hub-admin$/);
+        if (promoteMatch) {
+          if (!getDb) return dbNotConfigured();
+          const id = decodeURIComponent(promoteMatch[1] ?? "");
+          if (!id) {
+            return new Response("not found", { status: 404 });
+          }
+          return handlePromoteHubAdmin(req, id, {
             db: getDb(),
             issuer: oauthDeps(req).issuer,
             knownIssuers: oauthDeps(req).hubBoundOrigins(),

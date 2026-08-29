@@ -19,8 +19,8 @@
  * already-built well-known doc — same source of truth the SPA's vault list
  * reads.
  *
- * Multi-user Phase 1 gate: the session must belong to the first admin (the
- * single hub admin under the Phase 1 model — see `users.ts:isFirstAdmin`).
+ * Admin gate: the session must belong to a hub admin (`users.hub_role =
+ * 'admin'` — see `users.ts:isHubAdmin`; a hub may have several since hub#881).
  * Friends pinned to a vault use the OAuth flow to get vault:<name>:read/write
  * for their assigned vault; they don't get vault admin via this endpoint.
  */
@@ -28,7 +28,7 @@ import type { Database } from "bun:sqlite";
 import { lockedResponse, requireUnlocked } from "./admin-lock.ts";
 import { signAccessToken } from "./jwt-sign.ts";
 import { findSession, parseSessionCookie } from "./sessions.ts";
-import { isFirstAdmin } from "./users.ts";
+import { isHubAdmin } from "./users.ts";
 import { VAULT_NAME_CHARSET_RE } from "./vault-name.ts";
 
 /** Short TTL — matches host-admin-token. SPA re-fetches on near-expiry. */
@@ -74,7 +74,7 @@ export async function handleVaultAdminToken(
   // is the per-vault operator scope used by the vault admin SPA — friends pinned
   // to a vault get vault:<name>:read/write via OAuth, never admin. Without this
   // gate, any signed-in friend can mint a vault admin token for any vault.
-  if (!isFirstAdmin(deps.db, session.userId)) {
+  if (!isHubAdmin(deps.db, session.userId)) {
     return jsonError(
       403,
       "not_admin",

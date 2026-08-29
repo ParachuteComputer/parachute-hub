@@ -64,7 +64,7 @@ import {
   UserNotFoundError,
   type VaultVerb,
   getUserById,
-  isFirstAdmin,
+  isHubAdmin,
   validatePassword,
   vaultVerbsForUserVault,
   verifyPassword,
@@ -252,7 +252,7 @@ export async function handleAccountChangePasswordPost(
   // without this fix the user briefly sees the admin shell.)
   const rawNext = safeNext(String(form.get("next") ?? ""));
   const next =
-    !isFirstAdmin(deps.db, user.id) && (rawNext === "/admin" || rawNext.startsWith("/admin/"))
+    !isHubAdmin(deps.db, user.id) && (rawNext === "/admin" || rawNext.startsWith("/admin/"))
       ? "/account/"
       : rawNext;
   const mode = modeFor(user.passwordChanged);
@@ -524,7 +524,7 @@ export async function handleAccountHomeGet(req: Request, deps: AccountHomeDeps):
     // the orphaned session row will time out on its own.
     return redirect("/login");
   }
-  const adminFlag = isFirstAdmin(deps.db, user.id);
+  const adminFlag = isHubAdmin(deps.db, user.id);
   const csrf = ensureCsrfToken(req);
   const extra: Record<string, string> = csrf.setCookie ? { "set-cookie": csrf.setCookie } : {};
   // Per-vault mintable verbs for the "mint an access token" affordance on each
@@ -625,7 +625,7 @@ export async function handleAccountHomeGet(req: Request, deps: AccountHomeDeps):
       assignedVaults: user.assignedVaults,
       passwordChanged: user.passwordChanged,
       hubOrigin: deps.hubOrigin,
-      isFirstAdmin: adminFlag,
+      isHubAdmin: adminFlag,
       csrfToken: csrf.token,
       twoFactorEnabled: isTotpEnrolled(deps.db, user.id),
       mintableVerbs,

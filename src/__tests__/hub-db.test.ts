@@ -513,3 +513,99 @@ describe("openHubDb + migrate", () => {
     }
   });
 });
+
+describe("migration v20 — users.hub_role (hub#881)", () => {
+  test("adds hub_role, backfills the earliest user to admin, leaves later users 'user'", () => {
+    const h = makeHarness();
+    try {
+      const db = openHubDb(h.dbPath);
+      try {
+        // Stand up a pre-v20 `users` shape: drop the column, mark v20
+        // unapplied, seed three rows in known created_at order. Same
+        // rebuild-the-old-shape pattern as the v8 / v10 fixtures above.
+        db.exec("ALTER TABLE users DROP COLUMN hub_role");
+        db.exec("DELETE FROM schema_version WHERE version = 20");
+        db.exec(`
+          INSERT INTO users (id, username, password_hash, created_at, updated_at, password_changed)
+          VALUES
+            ('u-owner', 'owner', 'h', '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z', 1),
+            ('u-alice', 'alice', 'h', '2026-01-02T00:00:00.000Z', '2026-01-02T00:00:00.000Z', 1),
+            ('u-bob',   'bob',   'h', '2026-01-03T00:00:00.000Z', '2026-01-03T00:00:00.000Z', 1);
+        `);
+        migrate(db);
+
+        const cols = db
+          .query<{ name: string }, []>("SELECT name FROM pragma_table_info('users')")
+          .all()
+          .map((c) => c.name);
+        expect(cols).toContain("hub_role");
+
+        // The backfill must reproduce the pre-v20 definition of "the
+        // admin" exactly — `getFirstAdminId`'s earliest-created row — so
+        // an already-bootstrapped hub keeps the admin it had.
+        const roles = db
+          .query<{ id: string; hub_role: string }, []>(
+            "SELECT id, hub_role FROM users ORDER BY created_at ASC",
+          )
+          .all();
+        expect(roles).toEqual([
+          { id: "u-owner", hub_role: "admin" },
+          { id: "u-alice", hub_role: "user" },
+          { id: "u-bob", hub_role: "user" },
+        ]);
+
+        const versions = db
+          .query<{ version: number }, []>("SELECT version FROM schema_version")
+          .all()
+          .map((r) => r.version);
+        expect(versions).toContain(20);
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("a row inserted without hub_role lands as 'user' (fail-closed DEFAULT)", () => {
+    const h = makeHarness();
+    try {
+      const db = openHubDb(h.dbPath);
+      try {
+        // Code that doesn't know about the column must produce a
+        // NON-admin, never an admin.
+        db.prepare(
+          "INSERT INTO users (id, username, password_hash, created_at, updated_at, password_changed) VALUES (?, ?, ?, ?, ?, ?)",
+        ).run("u1", "alice", "h", "2026-05-01", "2026-05-01", 1);
+        const row = db
+          .query<{ hub_role: string }, [string]>("SELECT hub_role FROM users WHERE id = ?")
+          .get("u1");
+        expect(row?.hub_role).toBe("user");
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("v20 on an empty users table applies cleanly and creates no admin", () => {
+    const h = makeHarness();
+    try {
+      const db = openHubDb(h.dbPath);
+      try {
+        db.exec("ALTER TABLE users DROP COLUMN hub_role");
+        db.exec("DELETE FROM schema_version WHERE version = 20");
+        expect(() => migrate(db)).not.toThrow();
+        const n = db
+          .query<{ n: number }, []>("SELECT COUNT(*) AS n FROM users WHERE hub_role = 'admin'")
+          .get();
+        expect(n?.n).toBe(0);
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+});

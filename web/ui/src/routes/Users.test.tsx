@@ -3,7 +3,9 @@
  * empty state, create-form happy path + client-side validation,
  * delete confirm flow, first-admin Delete + Reset disabled with
  * tooltips, admin password reset happy path + cancel + client/server
- * validation, load error.
+ * validation, load error, and the hub#881 multi-admin rails
+ * (`hub_role`-driven badges, promoted-admin control states, promote
+ * button visibility / disabled / confirm flow).
  */
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
@@ -22,6 +24,7 @@ vi.mock("../lib/api.ts", async (orig) => {
     deleteUser: vi.fn(),
     resetUserPassword: vi.fn(),
     updateUserVaults: vi.fn(),
+    promoteHubAdmin: vi.fn(),
     getHubOriginSetting: vi.fn(),
     listVaultCaps: vi.fn(),
     setVaultCap: vi.fn(),
@@ -66,8 +69,22 @@ function user(username: string, overrides: Partial<api.UserListing> = {}): api.U
     email: null,
     assigned_vaults: [],
     created_at: "2026-05-01T12:00:00.000Z",
+    // Default to a friend account. Since hub#881 the SPA reads `hub_role`
+    // rather than inferring admin from list position, so a fixture that
+    // wants an admin must say so — `adminUser` below.
+    hub_role: "user",
     ...overrides,
   };
+}
+
+/**
+ * A hub admin fixture (`hub_role: "admin"`). Used for `operator`, which
+ * every list fixture puts first — it stands in for the wizard-created
+ * first admin. Pass it explicitly for a SECOND admin to exercise the
+ * promoted-admin rails (deletable, but no vault edit / password reset).
+ */
+function adminUser(username: string, overrides: Partial<api.UserListing> = {}): api.UserListing {
+  return user(username, { hub_role: "admin", ...overrides });
 }
 
 describe("Users — list rendering", () => {
@@ -87,7 +104,7 @@ describe("Users — list rendering", () => {
 
   it("renders one row per user with assigned vault + password status", async () => {
     vi.mocked(api.listUsers).mockResolvedValue([
-      user("operator", { password_changed: true, assigned_vaults: [] }),
+      adminUser("operator", { password_changed: true, assigned_vaults: [] }),
       user("alice", { password_changed: false, assigned_vaults: ["home"] }),
     ]);
     vi.mocked(api.listUserVaults).mockResolvedValue(["home"]);
@@ -119,7 +136,7 @@ describe("Users — list rendering", () => {
 
 describe("Users — first-admin protection", () => {
   it("disables the Delete button for the first admin and surfaces a tooltip", async () => {
-    vi.mocked(api.listUsers).mockResolvedValue([user("operator"), user("alice")]);
+    vi.mocked(api.listUsers).mockResolvedValue([adminUser("operator"), user("alice")]);
     vi.mocked(api.listUserVaults).mockResolvedValue([]);
     renderRoute();
     const operatorBtn = await screen.findByRole("button", { name: /delete operator/i });
@@ -141,7 +158,7 @@ describe("Users — first-admin protection", () => {
   });
 
   it("disables the Reset password button for the first admin with a /account/change-password tooltip", async () => {
-    vi.mocked(api.listUsers).mockResolvedValue([user("operator"), user("alice")]);
+    vi.mocked(api.listUsers).mockResolvedValue([adminUser("operator"), user("alice")]);
     vi.mocked(api.listUserVaults).mockResolvedValue([]);
     renderRoute();
     const operatorReset = await screen.findByRole("button", {
@@ -150,10 +167,12 @@ describe("Users — first-admin protection", () => {
     expect(operatorReset).toBeDisabled();
     expect(operatorReset).toHaveAttribute("title", expect.stringMatching(/change-password/i));
     const describedById = operatorReset.getAttribute("aria-describedby");
-    expect(describedById).toMatch(/^first-admin-reset-tooltip-/);
+    // hub#881: the rail fans out to EVERY admin, so the tooltip id is
+    // `admin-reset-tooltip-` rather than the old `first-admin-` spelling.
+    expect(describedById).toMatch(/^admin-reset-tooltip-/);
     const tooltipSpan = describedById ? document.getElementById(describedById) : null;
     expect(tooltipSpan?.className).toContain("sr-only");
-    expect(tooltipSpan?.textContent).toMatch(/change-password directly/i);
+    expect(tooltipSpan?.textContent).toMatch(/self-rotate/i);
     // Non-first user Reset password is enabled.
     const aliceReset = screen.getByRole("button", { name: /reset password for alice/i });
     expect(aliceReset).not.toBeDisabled();
@@ -163,7 +182,7 @@ describe("Users — first-admin protection", () => {
 
 describe("Users — delete confirm flow", () => {
   it("clicking Delete opens a confirm dialog; cancel returns to list without DELETE", async () => {
-    vi.mocked(api.listUsers).mockResolvedValue([user("operator"), user("alice")]);
+    vi.mocked(api.listUsers).mockResolvedValue([adminUser("operator"), user("alice")]);
     vi.mocked(api.listUserVaults).mockResolvedValue([]);
     renderRoute();
     fireEvent.click(await screen.findByRole("button", { name: /delete alice/i }));
@@ -177,8 +196,8 @@ describe("Users — delete confirm flow", () => {
 
   it("confirm Delete calls deleteUser, refreshes the list, and shows the revocation-lag banner", async () => {
     const listMock = vi.mocked(api.listUsers);
-    listMock.mockResolvedValueOnce([user("operator"), user("alice")]);
-    listMock.mockResolvedValueOnce([user("operator")]);
+    listMock.mockResolvedValueOnce([adminUser("operator"), user("alice")]);
+    listMock.mockResolvedValueOnce([adminUser("operator")]);
     vi.mocked(api.listUserVaults).mockResolvedValue([]);
     vi.mocked(api.deleteUser).mockResolvedValue({ revocationLagSeconds: 60 });
     renderRoute();
@@ -197,7 +216,7 @@ describe("Users — delete confirm flow", () => {
   });
 
   it("surfaces a per-row error banner when delete fails", async () => {
-    vi.mocked(api.listUsers).mockResolvedValue([user("operator"), user("alice")]);
+    vi.mocked(api.listUsers).mockResolvedValue([adminUser("operator"), user("alice")]);
     vi.mocked(api.listUserVaults).mockResolvedValue([]);
     vi.mocked(api.deleteUser).mockRejectedValue(new api.HttpError(500, "boom"));
     renderRoute();
@@ -212,7 +231,7 @@ describe("Users — delete confirm flow", () => {
 
 describe("Users — admin password reset (Phase 2 PR 1)", () => {
   it("clicking Reset password reveals an inline form scoped to that row", async () => {
-    vi.mocked(api.listUsers).mockResolvedValue([user("operator"), user("alice")]);
+    vi.mocked(api.listUsers).mockResolvedValue([adminUser("operator"), user("alice")]);
     vi.mocked(api.listUserVaults).mockResolvedValue([]);
     renderRoute();
     fireEvent.click(await screen.findByRole("button", { name: /reset password for alice/i }));
@@ -223,10 +242,13 @@ describe("Users — admin password reset (Phase 2 PR 1)", () => {
 
   it("happy path — POSTs new password, shows success banner, refreshes the list", async () => {
     const listMock = vi.mocked(api.listUsers);
-    listMock.mockResolvedValueOnce([user("operator"), user("alice")]);
+    listMock.mockResolvedValueOnce([adminUser("operator"), user("alice")]);
     // After the reset the row flips back to password_changed=false (the
     // server flips it and the SPA re-reads). Round-trip through the mock.
-    listMock.mockResolvedValueOnce([user("operator"), user("alice", { password_changed: false })]);
+    listMock.mockResolvedValueOnce([
+      adminUser("operator"),
+      user("alice", { password_changed: false }),
+    ]);
     vi.mocked(api.listUserVaults).mockResolvedValue([]);
     vi.mocked(api.resetUserPassword).mockResolvedValue({ revocationLagSeconds: 60 });
     renderRoute();
@@ -252,7 +274,7 @@ describe("Users — admin password reset (Phase 2 PR 1)", () => {
   });
 
   it("client-side rejects a too-short password before calling the API", async () => {
-    vi.mocked(api.listUsers).mockResolvedValue([user("operator"), user("alice")]);
+    vi.mocked(api.listUsers).mockResolvedValue([adminUser("operator"), user("alice")]);
     vi.mocked(api.listUserVaults).mockResolvedValue([]);
     renderRoute();
     fireEvent.click(await screen.findByRole("button", { name: /reset password for alice/i }));
@@ -269,7 +291,7 @@ describe("Users — admin password reset (Phase 2 PR 1)", () => {
     // but if the server's 403 surfaces anyway (e.g. the operator hits a
     // race or someone POSTs from curl), the error banner should render
     // verbatim in the row.
-    vi.mocked(api.listUsers).mockResolvedValue([user("operator"), user("alice")]);
+    vi.mocked(api.listUsers).mockResolvedValue([adminUser("operator"), user("alice")]);
     vi.mocked(api.listUserVaults).mockResolvedValue([]);
     vi.mocked(api.resetUserPassword).mockRejectedValue(
       new api.HttpError(403, "the first admin must use /account/change-password directly"),
@@ -284,7 +306,7 @@ describe("Users — admin password reset (Phase 2 PR 1)", () => {
   });
 
   it("Cancel closes the inline form without posting", async () => {
-    vi.mocked(api.listUsers).mockResolvedValue([user("operator"), user("alice")]);
+    vi.mocked(api.listUsers).mockResolvedValue([adminUser("operator"), user("alice")]);
     vi.mocked(api.listUserVaults).mockResolvedValue([]);
     renderRoute();
     fireEvent.click(await screen.findByRole("button", { name: /reset password for alice/i }));
@@ -302,7 +324,7 @@ describe("Users — admin password reset (Phase 2 PR 1)", () => {
 
 describe("Users — create form", () => {
   it("hides the form behind a Create User button by default", async () => {
-    vi.mocked(api.listUsers).mockResolvedValue([user("operator")]);
+    vi.mocked(api.listUsers).mockResolvedValue([adminUser("operator")]);
     vi.mocked(api.listUserVaults).mockResolvedValue(["home"]);
     renderRoute();
     expect(await screen.findByRole("button", { name: /create user/i })).toBeInTheDocument();
@@ -310,7 +332,7 @@ describe("Users — create form", () => {
   });
 
   it("clicking Create User reveals the form with multi-select vault listing", async () => {
-    vi.mocked(api.listUsers).mockResolvedValue([user("operator")]);
+    vi.mocked(api.listUsers).mockResolvedValue([adminUser("operator")]);
     vi.mocked(api.listUserVaults).mockResolvedValue(["home", "work"]);
     renderRoute();
     fireEvent.click(await screen.findByRole("button", { name: /create user/i }));
@@ -327,9 +349,9 @@ describe("Users — create form", () => {
 
   it("submits createUser with the assigned vaults and refreshes the list on success", async () => {
     const listMock = vi.mocked(api.listUsers);
-    listMock.mockResolvedValueOnce([user("operator")]);
+    listMock.mockResolvedValueOnce([adminUser("operator")]);
     listMock.mockResolvedValueOnce([
-      user("operator"),
+      adminUser("operator"),
       user("alice", { password_changed: false, assigned_vaults: ["home"] }),
     ]);
     vi.mocked(api.listUserVaults).mockResolvedValue(["home"]);
@@ -369,7 +391,7 @@ describe("Users — create form", () => {
   });
 
   it("client-side rejects password shorter than 12 chars before calling the API", async () => {
-    vi.mocked(api.listUsers).mockResolvedValue([user("operator")]);
+    vi.mocked(api.listUsers).mockResolvedValue([adminUser("operator")]);
     vi.mocked(api.listUserVaults).mockResolvedValue([]);
     renderRoute();
     fireEvent.click(await screen.findByRole("button", { name: /create user/i }));
@@ -388,7 +410,7 @@ describe("Users — create form", () => {
   });
 
   it("surfaces server error_description from a 409 conflict", async () => {
-    vi.mocked(api.listUsers).mockResolvedValue([user("operator")]);
+    vi.mocked(api.listUsers).mockResolvedValue([adminUser("operator")]);
     vi.mocked(api.listUserVaults).mockResolvedValue(["home"]);
     vi.mocked(api.createUser).mockRejectedValue(
       new api.HttpError(409, 'username "alice" is already in use'),
@@ -409,7 +431,7 @@ describe("Users — create form", () => {
 describe("Users — multi-vault membership (Phase 2 PR 2)", () => {
   it("renders multiple assigned vaults as separate code chips in the row", async () => {
     vi.mocked(api.listUsers).mockResolvedValue([
-      user("operator"),
+      adminUser("operator"),
       user("alice", { assigned_vaults: ["personal", "family"] }),
     ]);
     vi.mocked(api.listUserVaults).mockResolvedValue(["personal", "family"]);
@@ -423,7 +445,7 @@ describe("Users — multi-vault membership (Phase 2 PR 2)", () => {
   });
 
   it("disables Edit vaults for the first admin with a /design/ tooltip", async () => {
-    vi.mocked(api.listUsers).mockResolvedValue([user("operator"), user("alice")]);
+    vi.mocked(api.listUsers).mockResolvedValue([adminUser("operator"), user("alice")]);
     vi.mocked(api.listUserVaults).mockResolvedValue(["home"]);
     renderRoute();
     const operatorBtn = await screen.findByRole("button", { name: /edit vaults for operator/i });
@@ -435,7 +457,7 @@ describe("Users — multi-vault membership (Phase 2 PR 2)", () => {
 
   it("clicking Edit vaults reveals an inline multi-select pre-populated with current vaults", async () => {
     vi.mocked(api.listUsers).mockResolvedValue([
-      user("operator"),
+      adminUser("operator"),
       user("alice", { assigned_vaults: ["home"] }),
     ]);
     vi.mocked(api.listUserVaults).mockResolvedValue(["home", "work"]);
@@ -455,11 +477,11 @@ describe("Users — multi-vault membership (Phase 2 PR 2)", () => {
   it("happy path — PATCHes new vault list, shows success banner, refreshes the list", async () => {
     const listMock = vi.mocked(api.listUsers);
     listMock.mockResolvedValueOnce([
-      user("operator"),
+      adminUser("operator"),
       user("alice", { assigned_vaults: ["home"] }),
     ]);
     listMock.mockResolvedValueOnce([
-      user("operator"),
+      adminUser("operator"),
       user("alice", { assigned_vaults: ["home", "work"] }),
     ]);
     vi.mocked(api.listUserVaults).mockResolvedValue(["home", "work"]);
@@ -487,7 +509,7 @@ describe("Users — multi-vault membership (Phase 2 PR 2)", () => {
 
   it("surfaces server error_description from a 400 assigned_vault_not_found", async () => {
     vi.mocked(api.listUsers).mockResolvedValue([
-      user("operator"),
+      adminUser("operator"),
       user("alice", { assigned_vaults: ["home"] }),
     ]);
     vi.mocked(api.listUserVaults).mockResolvedValue(["home", "work"]);
@@ -504,7 +526,7 @@ describe("Users — multi-vault membership (Phase 2 PR 2)", () => {
   });
 
   it("Cancel closes the inline edit form without posting", async () => {
-    vi.mocked(api.listUsers).mockResolvedValue([user("operator"), user("alice")]);
+    vi.mocked(api.listUsers).mockResolvedValue([adminUser("operator"), user("alice")]);
     vi.mocked(api.listUserVaults).mockResolvedValue(["home"]);
     renderRoute();
     fireEvent.click(await screen.findByRole("button", { name: /edit vaults for alice/i }));
@@ -519,9 +541,9 @@ describe("Users — multi-vault membership (Phase 2 PR 2)", () => {
 describe("Users — sign-in handoff URL (onboarding discoverability)", () => {
   it("create-user success banner surfaces <hub-origin>/login with the username", async () => {
     const listMock = vi.mocked(api.listUsers);
-    listMock.mockResolvedValueOnce([user("operator")]);
+    listMock.mockResolvedValueOnce([adminUser("operator")]);
     listMock.mockResolvedValueOnce([
-      user("operator"),
+      adminUser("operator"),
       user("alice", { password_changed: false, assigned_vaults: ["home"] }),
     ]);
     vi.mocked(api.listUserVaults).mockResolvedValue(["home"]);
@@ -558,8 +580,11 @@ describe("Users — sign-in handoff URL (onboarding discoverability)", () => {
 
   it("reset-password success banner surfaces <hub-origin>/login with the username", async () => {
     const listMock = vi.mocked(api.listUsers);
-    listMock.mockResolvedValueOnce([user("operator"), user("alice")]);
-    listMock.mockResolvedValueOnce([user("operator"), user("alice", { password_changed: false })]);
+    listMock.mockResolvedValueOnce([adminUser("operator"), user("alice")]);
+    listMock.mockResolvedValueOnce([
+      adminUser("operator"),
+      user("alice", { password_changed: false }),
+    ]);
     vi.mocked(api.listUserVaults).mockResolvedValue([]);
     vi.mocked(api.getHubOriginSetting).mockResolvedValue({
       hub_origin: null,
@@ -585,8 +610,11 @@ describe("Users — sign-in handoff URL (onboarding discoverability)", () => {
 
   it("trims a trailing slash from resolved_issuer before building the login URL", async () => {
     const listMock = vi.mocked(api.listUsers);
-    listMock.mockResolvedValueOnce([user("operator")]);
-    listMock.mockResolvedValueOnce([user("operator"), user("alice", { password_changed: false })]);
+    listMock.mockResolvedValueOnce([adminUser("operator")]);
+    listMock.mockResolvedValueOnce([
+      adminUser("operator"),
+      user("alice", { password_changed: false }),
+    ]);
     vi.mocked(api.listUserVaults).mockResolvedValue([]);
     vi.mocked(api.getHubOriginSetting).mockResolvedValue({
       hub_origin: "https://hub.example.com/",
@@ -615,7 +643,7 @@ describe("Users — sign-in handoff URL (onboarding discoverability)", () => {
 describe("Users — email + role columns (B5)", () => {
   it("renders the captured email as a mailto link and admin/member roles", async () => {
     vi.mocked(api.listUsers).mockResolvedValue([
-      user("operator", { email: null }),
+      adminUser("operator", { email: null }),
       user("alice", { email: "alice@example.com" }),
     ]);
     vi.mocked(api.listUserVaults).mockResolvedValue([]);
@@ -632,7 +660,7 @@ describe("Users — email + role columns (B5)", () => {
 
 describe("Users — vault caps section (B5)", () => {
   it("lists vaults with human-readable caps + uncapped placeholder", async () => {
-    vi.mocked(api.listUsers).mockResolvedValue([user("operator")]);
+    vi.mocked(api.listUsers).mockResolvedValue([adminUser("operator")]);
     vi.mocked(api.listUserVaults).mockResolvedValue([]);
     vi.mocked(api.listVaultCaps).mockResolvedValue([
       {
@@ -656,7 +684,7 @@ describe("Users — vault caps section (B5)", () => {
   });
 
   it("edits a cap → PUTs bytes and reloads", async () => {
-    vi.mocked(api.listUsers).mockResolvedValue([user("operator")]);
+    vi.mocked(api.listUsers).mockResolvedValue([adminUser("operator")]);
     vi.mocked(api.listUserVaults).mockResolvedValue([]);
     vi.mocked(api.listVaultCaps).mockResolvedValue([
       { vault_name: "beta", cap_bytes: null, created_at: null, updated_at: null },
@@ -679,7 +707,7 @@ describe("Users — vault caps section (B5)", () => {
   });
 
   it("rejects a non-positive cap client-side without calling the API", async () => {
-    vi.mocked(api.listUsers).mockResolvedValue([user("operator")]);
+    vi.mocked(api.listUsers).mockResolvedValue([adminUser("operator")]);
     vi.mocked(api.listUserVaults).mockResolvedValue([]);
     vi.mocked(api.listVaultCaps).mockResolvedValue([
       { vault_name: "beta", cap_bytes: null, created_at: null, updated_at: null },
@@ -694,5 +722,133 @@ describe("Users — vault caps section (B5)", () => {
       expect(screen.getByText(/cap must be a positive number/i)).toBeInTheDocument(),
     );
     expect(api.setVaultCap).not.toHaveBeenCalled();
+  });
+});
+
+describe("Users — multi-admin roles (hub#881)", () => {
+  it("shows an admin badge for a PROMOTED admin, not just the first row", async () => {
+    vi.mocked(api.listUsers).mockResolvedValue([
+      adminUser("operator"),
+      adminUser("bob"),
+      user("alice"),
+    ]);
+    vi.mocked(api.listUserVaults).mockResolvedValue([]);
+    renderRoute();
+    await screen.findByText("bob");
+    // Two "admin" role cells (operator + bob), one "member" (alice).
+    expect(screen.getAllByText("admin")).toHaveLength(2);
+    expect(screen.getAllByText("member")).toHaveLength(1);
+    // The positional badge stays exclusive to the first row; the promoted
+    // admin gets the "hub admin" badge instead.
+    expect(screen.getAllByText("first admin")).toHaveLength(1);
+    expect(screen.getAllByText("hub admin")).toHaveLength(1);
+  });
+
+  it("a promoted admin stays DELETABLE while the first admin does not", async () => {
+    vi.mocked(api.listUsers).mockResolvedValue([adminUser("operator"), adminUser("bob")]);
+    vi.mocked(api.listUserVaults).mockResolvedValue([]);
+    renderRoute();
+    // The delete rail is the one that stays positional — it is what
+    // guarantees the hub keeps at least one admin.
+    const first = await screen.findByRole("button", { name: /delete operator/i });
+    expect(first).toBeDisabled();
+    expect(screen.getByRole("button", { name: /delete bob/i })).not.toBeDisabled();
+  });
+
+  it("disables Reset password and Edit vaults for a promoted admin too", async () => {
+    vi.mocked(api.listUsers).mockResolvedValue([adminUser("operator"), adminUser("bob")]);
+    vi.mocked(api.listUserVaults).mockResolvedValue([]);
+    renderRoute();
+    const reset = await screen.findByRole("button", { name: /reset password for bob/i });
+    expect(reset).toBeDisabled();
+    expect(reset).toHaveAttribute("title", expect.stringMatching(/self-rotate/i));
+    expect(reset.getAttribute("aria-describedby")).toMatch(/^admin-reset-tooltip-/);
+    const editVaults = screen.getByRole("button", { name: /edit vaults for bob/i });
+    expect(editVaults).toBeDisabled();
+    expect(editVaults.getAttribute("aria-describedby")).toMatch(/^admin-vaults-tooltip-/);
+  });
+
+  it("offers Promote only on non-admin rows", async () => {
+    vi.mocked(api.listUsers).mockResolvedValue([
+      adminUser("operator"),
+      adminUser("bob"),
+      user("alice"),
+    ]);
+    vi.mocked(api.listUserVaults).mockResolvedValue([]);
+    renderRoute();
+    expect(
+      await screen.findByRole("button", { name: /promote alice to hub admin/i }),
+    ).not.toBeDisabled();
+    // No demote endpoint exists, so admin rows carry no role control.
+    expect(screen.queryByRole("button", { name: /promote operator to hub admin/i })).toBeNull();
+    expect(screen.queryByRole("button", { name: /promote bob to hub admin/i })).toBeNull();
+  });
+
+  it("disables Promote with a revoke-first tooltip when the user holds vault assignments", async () => {
+    vi.mocked(api.listUsers).mockResolvedValue([
+      adminUser("operator"),
+      user("alice", { assigned_vaults: ["home"] }),
+    ]);
+    vi.mocked(api.listUserVaults).mockResolvedValue(["home"]);
+    renderRoute();
+    const btn = await screen.findByRole("button", { name: /promote alice to hub admin/i });
+    expect(btn).toBeDisabled();
+    expect(btn).toHaveAttribute("title", expect.stringMatching(/revoke/i));
+    // a11y: same visually-hidden describedby shape the other disabled
+    // row controls use — `title` is unreliable on a disabled button.
+    const describedById = btn.getAttribute("aria-describedby");
+    expect(describedById).toMatch(/^promote-assignments-tooltip-/);
+    const span = describedById ? document.getElementById(describedById) : null;
+    expect(span?.className).toContain("sr-only");
+    expect(span?.textContent).toMatch(/unrestricted/i);
+  });
+
+  it("Promote confirms before calling, and cancel makes no request", async () => {
+    vi.mocked(api.listUsers).mockResolvedValue([adminUser("operator"), user("alice")]);
+    vi.mocked(api.listUserVaults).mockResolvedValue([]);
+    renderRoute();
+    fireEvent.click(await screen.findByRole("button", { name: /promote alice to hub admin/i }));
+    const dialog = screen.getByRole("dialog", { name: /confirm promote alice/i });
+    // The confirm copy must say the action is one-way — there is no
+    // demote endpoint, so this is the operator's only warning.
+    expect(dialog.textContent).toMatch(/cannot be undone/i);
+    fireEvent.click(within(dialog).getByRole("button", { name: /^cancel$/i }));
+    await waitFor(() =>
+      expect(screen.queryByRole("dialog", { name: /confirm promote alice/i })).toBeNull(),
+    );
+    expect(api.promoteHubAdmin).not.toHaveBeenCalled();
+  });
+
+  it("confirming Promote calls the API and refreshes the list", async () => {
+    const listMock = vi.mocked(api.listUsers);
+    listMock.mockResolvedValueOnce([adminUser("operator"), user("alice")]);
+    listMock.mockResolvedValueOnce([adminUser("operator"), adminUser("alice")]);
+    vi.mocked(api.listUserVaults).mockResolvedValue([]);
+    vi.mocked(api.promoteHubAdmin).mockResolvedValue(adminUser("alice"));
+    renderRoute();
+    fireEvent.click(await screen.findByRole("button", { name: /promote alice to hub admin/i }));
+    const dialog = screen.getByRole("dialog", { name: /confirm promote alice/i });
+    fireEvent.click(within(dialog).getByRole("button", { name: /promote to admin/i }));
+    await waitFor(() => expect(api.promoteHubAdmin).toHaveBeenCalledWith("id-alice"));
+    // Refetched list shows alice as an admin, so her Promote button is gone.
+    await waitFor(() =>
+      expect(screen.queryByRole("button", { name: /promote alice to hub admin/i })).toBeNull(),
+    );
+    expect(screen.getByTestId("promote-done-banner").textContent).toMatch(/now a hub admin/i);
+  });
+
+  it("surfaces a has_vault_assignments 403 in a row-scoped error banner", async () => {
+    vi.mocked(api.listUsers).mockResolvedValue([adminUser("operator"), user("alice")]);
+    vi.mocked(api.listUserVaults).mockResolvedValue([]);
+    vi.mocked(api.promoteHubAdmin).mockRejectedValue(
+      new api.HttpError(403, 'user "alice" is assigned to vault(s) "home"; revoke those first'),
+    );
+    renderRoute();
+    fireEvent.click(await screen.findByRole("button", { name: /promote alice to hub admin/i }));
+    const dialog = screen.getByRole("dialog", { name: /confirm promote alice/i });
+    fireEvent.click(within(dialog).getByRole("button", { name: /promote to admin/i }));
+    // The server's error_description is the operator-actionable part —
+    // surface it verbatim rather than a generic failure string.
+    expect(await screen.findByText(/revoke those first/i)).toBeInTheDocument();
   });
 });
