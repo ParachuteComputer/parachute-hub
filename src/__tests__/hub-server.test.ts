@@ -7358,7 +7358,7 @@ describe("hubFetch root /mcp forwarding (vault 0.7.3 canonical root MCP)", () =>
     });
   }
 
-  test("NIP-98 POST /mcp does not reach the daemon — same 401 shape as /account/mcp", async () => {
+  test("NIP-98 POST /mcp 401 names the root PRM, not /account/mcp (hub#899)", async () => {
     const h = makeHarness();
     const upstream = startRecordingUpstream();
     const db = openHubDb(hubDbPath(h.dir));
@@ -7377,7 +7377,49 @@ describe("hubFetch root /mcp forwarding (vault 0.7.3 canonical root MCP)", () =>
       expect(body.error_description).toBe("Nostr pubkey is not linked to a hub user");
       const challenge = res.headers.get("www-authenticate") ?? "";
       expect(challenge).toContain("resource_metadata=");
-      expect(challenge).toContain("/.well-known/oauth-protected-resource/account/mcp");
+      // RFC 9728 §3.3: WWW-Authenticate metadata must describe the URL the
+      // client requested. Root PRM stays vault-only; do not mix families.
+      expect(challenge).toContain("/.well-known/oauth-protected-resource/mcp");
+      expect(challenge).not.toContain("/.well-known/oauth-protected-resource/account/mcp");
+      expect(upstream.requests().length).toBe(0);
+    } finally {
+      db.close();
+      upstream.stop();
+      h.cleanup();
+    }
+  });
+
+  test("invalid aud=account Bearer POST /mcp 401 names the root PRM (hub#899)", async () => {
+    const h = makeHarness();
+    const upstream = startRecordingUpstream();
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      writeManifest({ services: [canonicalVaultRow(upstream.port)] }, h.manifestPath);
+      await createUser(db, "owner", "pw", { passwordChanged: true });
+      const fetcher = hubFetch(h.dir, { getDb: () => db, manifestPath: h.manifestPath });
+      // Peekable aud=account (decodeJwt, no verify) so dispatch hands this
+      // to handleAccountMcp; authenticate then 401s.
+      const peekable = [
+        Buffer.from(JSON.stringify({ alg: "RS256", typ: "JWT" })).toString("base64url"),
+        Buffer.from(JSON.stringify({ aud: "account", sub: "nobody" })).toString("base64url"),
+        "sig",
+      ].join(".");
+      const res = await fetcher(
+        new Request("http://hub.example.com/mcp", {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${peekable}`,
+            accept: BOTH_ACCEPT,
+            "content-type": "application/json",
+            host: "hub.example.com",
+          },
+          body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize" }),
+        }),
+      );
+      expect(res.status).toBe(401);
+      const challenge = res.headers.get("www-authenticate") ?? "";
+      expect(challenge).toContain("/.well-known/oauth-protected-resource/mcp");
+      expect(challenge).not.toContain("/.well-known/oauth-protected-resource/account/mcp");
       expect(upstream.requests().length).toBe(0);
     } finally {
       db.close();
