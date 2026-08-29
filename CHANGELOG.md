@@ -6,6 +6,13 @@ All notable changes to `@openparachute/hub` are documented here. The format foll
 >
 > This backfill covers the 0.6.x line only. Two pre-existing gaps remain undocumented and are **not** addressed here: the `0.5.13` stable itself (the file's newest entry is `0.5.13-rc.48`, never the stable) and the entire `0.5.14-rc` chain (rc.1–rc.21 on npm), which never promoted to a `0.5.14` stable — its work folded forward into 0.6.0.
 
+## [0.7.18-rc.10] - 2026-08-29
+
+**Two security/correctness fixes from tonight's release-automation hardening pass.** Version bump only; no new code in this commit. Merging this to `next` publishes `@rc` (hub#911 — no next→main hop).
+
+- **Stables publish from `main` only — not `next`, not a tag push (#913).** `decidePublish()` previously had no branch check, only "does a matching rc already exist on npm." With an rc already published, an ordinary version/changelog-only PR merged to `next` could have published straight to `@latest`, bypassing `main`'s branch protection entirely (branch protection never covered `next` or tags). Checked first now, before any other rule.
+- **NIP-98 `u` tag honors `X-Forwarded-Proto` behind a TLS-terminating reverse proxy (#914).** Tailscale Serve (and cloudflared, and Render) terminate TLS and forward plain HTTP; hub saw `http://…` while a client correctly signed `https://…`, so every NIP-98 request through such a proxy 401'd with `url_mismatch`. Reuses `isHttpsRequest()`, the same helper `resolveIssuer` already trusts for the cookie-`Secure` decision — not new trust surface. Host/path stay bound to `req.url`, not `X-Forwarded-Host`, so loopback NIP-98 stays loopback.
+
 ## [0.7.18-rc.9] - 2026-08-29
 
 **Account-MCP proxies vault MCP.** Two PRs on `next` after
