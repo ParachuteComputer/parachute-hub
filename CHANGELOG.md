@@ -6,14 +6,26 @@ All notable changes to `@openparachute/hub` are documented here. The format foll
 >
 > This backfill covers the 0.6.x line only. Two pre-existing gaps remain undocumented and are **not** addressed here: the `0.5.13` stable itself (the file's newest entry is `0.5.13-rc.48`, never the stable) and the entire `0.5.14-rc` chain (rc.1–rc.21 on npm), which never promoted to a `0.5.14` stable — its work folded forward into 0.6.0.
 
-## [Unreleased]
+## [0.7.18-rc.9] - 2026-08-29
 
-**Account-MCP proxies vault MCP instead of cloning REST.** Hub-native tools
-stay (`list-vaults`, `create-vault`, grant/revoke/list-access). Vault-shaped
-tools are a live `tools/list` from one covered vault (highest verb, fallback
-if that vault is down) plus JSON-RPC `tools/call` to
-`/vault/<name>/mcp` with a 60s mint. `query-notes` without `vault` still
-fans out; the envelope is unchanged. Per-vault `/vault/<name>/mcp` stays.
+**Account-MCP proxies vault MCP.** Two PRs on `next` after
+0.7.18-rc.8. Version bump only; no new code in this commit. Merging
+this to `next` publishes `@rc` (hub#911 — no next→main hop).
+
+- **Account-MCP proxies vault MCP instead of cloning REST (#910).**
+  Hub-native tools stay (`list-vaults`, `create-vault`,
+  grant/revoke/list-access). Vault-shaped tools are a live `tools/list`
+  from one covered vault (highest verb, fallback if that vault is down)
+  plus JSON-RPC `tools/call` to `/vault/<name>/mcp` with a 60s mint.
+  `query-notes` without `vault` still fans out; the envelope is
+  unchanged. Per-vault `/vault/<name>/mcp` stays.
+
+- **Rc cuts publish from `next` (#911).** `release.yml` now triggers
+  on `next` as well as `main`, with a `paths` filter on the four
+  package.json files. This is the first rc that uses that path.
+
+Leaves #880, #881, and #899 open. Auto-provision still defaults off. Do
+not suffix-drop 0.7.18.
 
 ## [0.7.18-rc.8] - 2026-08-28
 
