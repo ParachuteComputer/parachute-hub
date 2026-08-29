@@ -15,8 +15,8 @@
  * unchanged. This path never asks for a password: the signature *is* the
  * possession proof.
  */
-import { createHash, randomBytes } from "node:crypto";
 import type { Database } from "bun:sqlite";
+import { createHash, randomBytes } from "node:crypto";
 import {
   NOSTR_AUTH_KIND,
   type NostrEvent,
@@ -25,6 +25,7 @@ import {
   verifyNostrEvent,
 } from "./nostr-event.ts";
 import { bindPubkeyFromHttpAuth, findPubkeyLink } from "./pubkey-links.ts";
+import { isHttpsRequest } from "./request-protocol.ts";
 import {
   createUser,
   getFirstAdminId,
@@ -124,7 +125,25 @@ export function extractNostrEvent(req: Request): NostrEvent {
   return parsed.event;
 }
 
+/**
+ * Absolute URL the NIP-98 `u` tag must equal.
+ *
+ * Hub binds 127.0.0.1:1939 over plain HTTP. Tailscale Serve, cloudflared,
+ * and Render terminate TLS at the edge and forward HTTP, so `req.url` is
+ * `http://<public-host>/…` while the client POSTed — and signed —
+ * `https://<public-host>/…`. Same reconstruction as `resolveIssuer`'s
+ * request fallback: upgrade the scheme when `isHttpsRequest` is true
+ * (URL protocol or `X-Forwarded-Proto: https`). Host, path, and query
+ * stay on `req.url`. We do not honor `X-Forwarded-Host` here, and we do
+ * not substitute stored `hub_origin` — loopback NIP-98 stays bound to
+ * loopback.
+ */
 export function requestAbsoluteUrl(req: Request): string {
+  const url = new URL(req.url);
+  if (isHttpsRequest(req) && url.protocol === "http:") {
+    url.protocol = "https:";
+    return url.href;
+  }
   return req.url;
 }
 
@@ -166,7 +185,11 @@ export function verifyNostrHttpEvent(
   const createdAtMs = event.created_at * 1000;
   const skewMs = NIP98_MAX_SKEW_SECONDS * 1000;
   if (Math.abs(now.getTime() - createdAtMs) > skewMs) {
-    throw new NostrHttpAuthError(401, "expired", "Nostr event created_at is outside the 60s window");
+    throw new NostrHttpAuthError(
+      401,
+      "expired",
+      "Nostr event created_at is outside the 60s window",
+    );
   }
 
   if (replay.consume(event.id, now.getTime())) {
@@ -176,7 +199,11 @@ export function verifyNostrHttpEvent(
   const u = tagValue(event, "u");
   const expectedUrl = requestAbsoluteUrl(req);
   if (u !== expectedUrl) {
-    throw new NostrHttpAuthError(401, "url_mismatch", "Nostr event u tag must equal this request URL");
+    throw new NostrHttpAuthError(
+      401,
+      "url_mismatch",
+      "Nostr event u tag must equal this request URL",
+    );
   }
   const method = tagValue(event, "method");
   if (!method || method.toUpperCase() !== req.method.toUpperCase()) {
@@ -250,11 +277,7 @@ export async function resolveNostrPrincipal(
     return principalFromUser(db, user.id, user.username, event.pubkey, false);
   }
   if (!opts.autoProvision) {
-    throw new NostrHttpAuthError(
-      401,
-      "unknown_pubkey",
-      "Nostr pubkey is not linked to a hub user",
-    );
+    throw new NostrHttpAuthError(401, "unknown_pubkey", "Nostr pubkey is not linked to a hub user");
   }
   if (getFirstAdminId(db) === null) {
     throw new NostrHttpAuthError(
@@ -297,7 +320,11 @@ export async function resolveNostrPrincipal(
     now,
   });
   if (!bound.ok) {
-    throw new NostrHttpAuthError(401, "pubkey_taken", "Nostr pubkey is already bound to another user");
+    throw new NostrHttpAuthError(
+      401,
+      "pubkey_taken",
+      "Nostr pubkey is already bound to another user",
+    );
   }
   return principalFromUser(db, user.id, user.username, event.pubkey, true);
 }

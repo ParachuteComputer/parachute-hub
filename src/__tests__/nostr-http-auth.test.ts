@@ -4,26 +4,27 @@
  * Watch-fail: these tests signed against an unpatched verify (no replay
  * cache, no u/method bind) before the implementation landed.
  */
+import type { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { schnorr } from "@noble/curves/secp256k1.js";
+import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createHash } from "node:crypto";
+import { schnorr } from "@noble/curves/secp256k1.js";
+import { requireScope } from "../admin-auth.ts";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
-import type { Database } from "bun:sqlite";
 import { NOSTR_AUTH_KIND, type NostrEvent, nostrEventId } from "../nostr-event.ts";
 import {
   NIP98_MAX_SKEW_SECONDS,
   NostrReplayCache,
   authenticateNostrRequest,
   extractNostrEvent,
+  requestAbsoluteUrl,
   verifyNostrHttpEvent,
 } from "../nostr-http-auth.ts";
-import { requireScope } from "../admin-auth.ts";
-import { createUser } from "../users.ts";
 import { bindPubkeyFromHttpAuth, findPubkeyLink } from "../pubkey-links.ts";
 import { issuePubkeyChallenge, linkPubkey } from "../pubkey-links.ts";
+import { createUser } from "../users.ts";
 
 const hexToBytes = (hex: string): Uint8Array => Uint8Array.from(Buffer.from(hex, "hex"));
 const bytesToHex = (bytes: Uint8Array): string => Buffer.from(bytes).toString("hex");
@@ -57,12 +58,14 @@ function reqFor(
   method: string,
   event: NostrEvent,
   body?: string,
+  extraHeaders?: Record<string, string>,
 ): Request {
   return new Request(url, {
     method,
     headers: {
       authorization: nostrHeader(event),
       ...(body !== undefined ? { "content-type": "application/json" } : {}),
+      ...extraHeaders,
     },
     ...(body !== undefined ? { body } : {}),
   });
@@ -88,17 +91,60 @@ describe("extractNostrEvent", () => {
   });
 });
 
+describe("requestAbsoluteUrl", () => {
+  test("loopback http is unchanged — no stored origin, no header rewrite", () => {
+    const req = new Request("http://127.0.0.1:1939/mcp", { method: "POST" });
+    expect(requestAbsoluteUrl(req)).toBe("http://127.0.0.1:1939/mcp");
+  });
+
+  test("X-Forwarded-Proto https upgrades the scheme on an http request URL", () => {
+    // Tonight's hole: Tailscale Serve terminates TLS and forwards HTTP.
+    // Hub sees http://uni.taildf9ce2.ts.net/mcp; the client signed https.
+    const req = new Request("http://uni.taildf9ce2.ts.net/mcp", {
+      method: "POST",
+      headers: { "x-forwarded-proto": "https" },
+    });
+    expect(requestAbsoluteUrl(req)).toBe("https://uni.taildf9ce2.ts.net/mcp");
+  });
+
+  test("keeps host/path/query from req.url — not X-Forwarded-Host", () => {
+    const req = new Request("http://uni.taildf9ce2.ts.net/mcp?x=1", {
+      method: "POST",
+      headers: {
+        "x-forwarded-proto": "https",
+        "x-forwarded-host": "evil.example",
+      },
+    });
+    expect(requestAbsoluteUrl(req)).toBe("https://uni.taildf9ce2.ts.net/mcp?x=1");
+  });
+
+  test("direct https req.url is a no-op even without X-Forwarded-Proto", () => {
+    const req = new Request("https://uni.taildf9ce2.ts.net/mcp", { method: "POST" });
+    expect(requestAbsoluteUrl(req)).toBe("https://uni.taildf9ce2.ts.net/mcp");
+  });
+});
+
 describe("verifyNostrHttpEvent", () => {
   test("accepts a fresh GET with matching u and method", () => {
     const url = "http://127.0.0.1:1939/api/me";
-    const event = signEvent({ tags: [["u", url], ["method", "GET"]] });
+    const event = signEvent({
+      tags: [
+        ["u", url],
+        ["method", "GET"],
+      ],
+    });
     const replay = new NostrReplayCache();
     verifyNostrHttpEvent(reqFor(url, "GET", event), event, { replay });
   });
 
   test("rejects a replayed event id", () => {
     const url = "http://127.0.0.1:1939/api/me";
-    const event = signEvent({ tags: [["u", url], ["method", "GET"]] });
+    const event = signEvent({
+      tags: [
+        ["u", url],
+        ["method", "GET"],
+      ],
+    });
     const replay = new NostrReplayCache();
     verifyNostrHttpEvent(reqFor(url, "GET", event), event, { replay });
     expect(() => verifyNostrHttpEvent(reqFor(url, "GET", event), event, { replay })).toThrow(
@@ -114,8 +160,39 @@ describe("verifyNostrHttpEvent", () => {
       ],
     });
     expect(() =>
+      verifyNostrHttpEvent(reqFor("http://127.0.0.1:1939/api/me", "GET", event), event, {
+        replay: new NostrReplayCache(),
+      }),
+    ).toThrow(/u tag/);
+  });
+
+  test("accepts https u-tag when X-Forwarded-Proto says the client used TLS — tonight's hole", () => {
+    const publicUrl = "https://uni.taildf9ce2.ts.net/mcp";
+    const behindTls = "http://uni.taildf9ce2.ts.net/mcp";
+    const event = signEvent({
+      tags: [
+        ["u", publicUrl],
+        ["method", "POST"],
+      ],
+    });
+    verifyNostrHttpEvent(
+      reqFor(behindTls, "POST", event, undefined, { "x-forwarded-proto": "https" }),
+      event,
+      { replay: new NostrReplayCache() },
+    );
+  });
+
+  test("rejects the internal http u-tag on a TLS-terminated request", () => {
+    const behindTls = "http://uni.taildf9ce2.ts.net/mcp";
+    const event = signEvent({
+      tags: [
+        ["u", behindTls],
+        ["method", "POST"],
+      ],
+    });
+    expect(() =>
       verifyNostrHttpEvent(
-        reqFor("http://127.0.0.1:1939/api/me", "GET", event),
+        reqFor(behindTls, "POST", event, undefined, { "x-forwarded-proto": "https" }),
         event,
         { replay: new NostrReplayCache() },
       ),
@@ -124,7 +201,12 @@ describe("verifyNostrHttpEvent", () => {
 
   test("rejects method mismatch", () => {
     const url = "http://127.0.0.1:1939/api/me";
-    const event = signEvent({ tags: [["u", url], ["method", "POST"]] });
+    const event = signEvent({
+      tags: [
+        ["u", url],
+        ["method", "POST"],
+      ],
+    });
     expect(() =>
       verifyNostrHttpEvent(reqFor(url, "GET", event), event, { replay: new NostrReplayCache() }),
     ).toThrow(/method tag/);
@@ -134,7 +216,10 @@ describe("verifyNostrHttpEvent", () => {
     const url = "http://127.0.0.1:1939/api/me";
     const event = signEvent({
       created_at: Math.floor(Date.now() / 1000) - (NIP98_MAX_SKEW_SECONDS + 5),
-      tags: [["u", url], ["method", "GET"]],
+      tags: [
+        ["u", url],
+        ["method", "GET"],
+      ],
     });
     expect(() =>
       verifyNostrHttpEvent(reqFor(url, "GET", event), event, { replay: new NostrReplayCache() }),
@@ -192,7 +277,12 @@ describe("authenticateNostrRequest", () => {
       passwordChanged: true,
     });
     const url = "http://127.0.0.1:1939/api/me";
-    const event = signEvent({ tags: [["u", url], ["method", "GET"]] });
+    const event = signEvent({
+      tags: [
+        ["u", url],
+        ["method", "GET"],
+      ],
+    });
     await expect(
       authenticateNostrRequest(db, reqFor(url, "GET", event), {
         autoProvision: false,
@@ -222,7 +312,12 @@ describe("authenticateNostrRequest", () => {
     expect(linked.ok).toBe(true);
 
     const url = "http://127.0.0.1:1939/api/me";
-    const event = signEvent({ tags: [["u", url], ["method", "GET"]] });
+    const event = signEvent({
+      tags: [
+        ["u", url],
+        ["method", "GET"],
+      ],
+    });
     const principal = await authenticateNostrRequest(db, reqFor(url, "GET", event), {
       autoProvision: false,
       replay: new NostrReplayCache(),
@@ -240,7 +335,12 @@ describe("authenticateNostrRequest", () => {
       passwordChanged: true,
     });
     const url = "http://127.0.0.1:1939/api/me";
-    const event = signEvent({ tags: [["u", url], ["method", "GET"]] });
+    const event = signEvent({
+      tags: [
+        ["u", url],
+        ["method", "GET"],
+      ],
+    });
     const principal = await authenticateNostrRequest(db, reqFor(url, "GET", event), {
       autoProvision: true,
       replay: new NostrReplayCache(),
@@ -255,7 +355,12 @@ describe("authenticateNostrRequest", () => {
 
   test("auto-provision refuses when the hub has no owner yet", async () => {
     const url = "http://127.0.0.1:1939/api/me";
-    const event = signEvent({ tags: [["u", url], ["method", "GET"]] });
+    const event = signEvent({
+      tags: [
+        ["u", url],
+        ["method", "GET"],
+      ],
+    });
     await expect(
       authenticateNostrRequest(db, reqFor(url, "GET", event), {
         autoProvision: true,
@@ -286,7 +391,12 @@ describe("authenticateNostrRequest", () => {
       }).ok,
     ).toBe(true);
     const url = "http://127.0.0.1:1939/api/me";
-    const event = signEvent({ tags: [["u", url], ["method", "GET"]] });
+    const event = signEvent({
+      tags: [
+        ["u", url],
+        ["method", "GET"],
+      ],
+    });
     const principal = await authenticateNostrRequest(db, reqFor(url, "GET", event), {
       autoProvision: false,
       replay: new NostrReplayCache(),
@@ -299,11 +409,21 @@ describe("authenticateNostrRequest", () => {
       passwordChanged: true,
     });
     const url = "http://127.0.0.1:1939/api/users";
-    const event = signEvent({ tags: [["u", url], ["method", "GET"]] });
+    const event = signEvent({
+      tags: [
+        ["u", url],
+        ["method", "GET"],
+      ],
+    });
     process.env.PARACHUTE_NOSTR_AUTO_PROVISION = "1";
     try {
       await expect(
-        requireScope(db, reqFor(url, "GET", event), "parachute:host:admin", "http://127.0.0.1:1939"),
+        requireScope(
+          db,
+          reqFor(url, "GET", event),
+          "parachute:host:admin",
+          "http://127.0.0.1:1939",
+        ),
       ).rejects.toThrow(/parachute:host:admin/);
     } finally {
       delete process.env.PARACHUTE_NOSTR_AUTO_PROVISION;
