@@ -21,6 +21,7 @@
 import type { Database } from "bun:sqlite";
 import { ACCOUNT_VAULTS_UNNARROWED } from "@openparachute/door-contract";
 import type { AccountApiDeps } from "./account-api.ts";
+import { callVaultModuleTool, listVaultModuleTools } from "./account-mcp-backend.ts";
 import {
   type AccountMcpPrincipal,
   type AccountToolContext,
@@ -256,6 +257,12 @@ async function authenticate(
   return authenticateBearer(db, req, deps.knownIssuers ?? [deps.issuer]);
 }
 
+function isMcpToolResult(value: unknown): value is { content: unknown[] } {
+  return (
+    !!value && typeof value === "object" && Array.isArray((value as { content?: unknown }).content)
+  );
+}
+
 async function handleToolCall(
   id: JsonRpcId,
   params: Record<string, unknown> | undefined,
@@ -263,15 +270,35 @@ async function handleToolCall(
 ): Promise<JsonRpcMessage> {
   const name = typeof params?.name === "string" ? params.name : "";
   const args = (params?.arguments ?? {}) as Record<string, unknown>;
-  const tool = toolsForPrincipal(ctx).find((t) => t.name === name);
-  if (!tool) {
+  const hub = toolsForPrincipal(ctx).find((t) => t.name === name);
+  if (hub) {
+    try {
+      const out = await hub.execute(args, ctx);
+      return result(id, { content: [{ type: "text", text: JSON.stringify(out, null, 2) }] });
+    } catch (err) {
+      if (err instanceof AccountToolError) {
+        return rpcError(id, INVALID_PARAMS, err.message, {
+          error_type: err.errorType,
+          ...err.extra,
+        });
+      }
+      const message = err instanceof Error ? err.message : "Unknown error";
+      return result(id, { content: [{ type: "text", text: `Error: ${message}` }], isError: true });
+    }
+  }
+  const vaultTools = await listVaultModuleTools(ctx);
+  if (!vaultTools.some((t) => t.name === name)) {
     return result(id, {
       content: [{ type: "text", text: `Unknown tool: ${name}` }],
       isError: true,
     });
   }
   try {
-    const out = await tool.execute(args, ctx);
+    const out = await callVaultModuleTool(name, args, ctx);
+    if (name === "query-notes") {
+      return result(id, { content: [{ type: "text", text: JSON.stringify(out, null, 2) }] });
+    }
+    if (isMcpToolResult(out)) return result(id, out);
     return result(id, { content: [{ type: "text", text: JSON.stringify(out, null, 2) }] });
   } catch (err) {
     if (err instanceof AccountToolError) {
@@ -282,15 +309,27 @@ async function handleToolCall(
   }
 }
 
+async function listedTools(
+  ctx: AccountToolContext,
+): Promise<Array<{ name: string; description: string; inputSchema: Record<string, unknown> }>> {
+  const hub = toolsForPrincipal(ctx).map((t) => ({
+    name: t.name,
+    description: t.description,
+    inputSchema: t.inputSchema,
+  }));
+  const vault = await listVaultModuleTools(ctx);
+  return [...hub, ...vault];
+}
+
 function instructions(): string {
   return (
     "The Parachute hub account MCP — one connection across the vaults this key or token can use. " +
-    "Use list-vaults to see them, create-vault to add one (hub owner / account write), " +
-    "query-notes to search across them (omit `vault` to fan out, pass it to target one; " +
-    "default oldest-first preview — pass sort=desc and include_content=true for latest bodies), " +
-    "create-note / update-note to write in one vault (`vault` is required). " +
-    "grant-access / revoke-access / list-access give a Nostr pubkey a vault (role read|write) " +
-    "if you can admin that vault. tools/list hides tools you cannot call."
+    "Hub-native: list-vaults, create-vault (owner / account write), grant-access / revoke-access / " +
+    "list-access (if you can admin a vault). Everything else is the vault MCP catalog, live-listed, " +
+    "with a `vault` selector injected (omit on query-notes to fan out; required on every other vault tool). " +
+    "The vault-shaped catalog is a union of what SOME covered vault supports at the highest verb this " +
+    "connection holds — a listed tool may be Unknown against a different vault where this connection " +
+    "holds a lower verb. tools/list hides tools you cannot call on any covered vault."
   );
 }
 
@@ -311,13 +350,7 @@ async function handleOne(m: JsonRpcMessage, ctx: AccountToolContext): Promise<Js
         });
       }
       case "tools/list":
-        return result(id, {
-          tools: toolsForPrincipal(ctx).map((t) => ({
-            name: t.name,
-            description: t.description,
-            inputSchema: t.inputSchema,
-          })),
-        });
+        return result(id, { tools: await listedTools(ctx) });
       case "tools/call":
         return await handleToolCall(id, params, ctx);
       case "ping":
