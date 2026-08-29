@@ -6,6 +6,26 @@ All notable changes to `@openparachute/hub` are documented here. The format foll
 >
 > This backfill covers the 0.6.x line only. Two pre-existing gaps remain undocumented and are **not** addressed here: the `0.5.13` stable itself (the file's newest entry is `0.5.13-rc.48`, never the stable) and the entire `0.5.14-rc` chain (rc.1–rc.21 on npm), which never promoted to a `0.5.14` stable — its work folded forward into 0.6.0.
 
+## [0.7.18] - 2026-08-29
+
+**Stable promotion of 0.7.18-rc.10.** No new code. Suffix-drop only. npm `@rc`
+is 0.7.18-rc.10; this is the matching `@latest`.
+
+The 0.7.18 line (rc.1-rc.10) ships key-as-account: a Nostr key is now a
+first-class hub identity. NIP-98 request auth (#882) and the account-MCP
+door (#883); NIP-98 accepted at root `/mcp` plus grant-vault-access by
+pubkey (#888, #889); OAuth `account:vaults` and account-MCP at root `/mcp`
+(#892) with create-note / update-note / query-notes forwarding (#893, #896,
+#907); the consent-picker XOR (#901) and `account:self:*` extras minting
+alongside `account:vaults` (#904); account-MCP proxies vault MCP instead of
+cloning REST (#910); NIP-98 `u`-tag honors `X-Forwarded-Proto` behind a
+TLS-terminating proxy (#914). Also in this line: person-mint `users.id`,
+Account SPA, leftover CAS (#872, #874, #875); rc cuts publish directly from
+`next` (#911) and stables publish from `main` only (#913).
+
+Auto-provision stays off by default: an unlinked key gets nothing unless
+granted or `PARACHUTE_NOSTR_AUTO_PROVISION=1`. Leaves #880, #881, #899 open.
+
 ## [0.7.18-rc.10] - 2026-08-29
 
 **Two security/correctness fixes from tonight's release-automation hardening pass.** Version bump only; no new code in this commit. Merging this to `next` publishes `@rc` (hub#911 — no next→main hop).
