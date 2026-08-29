@@ -95,7 +95,7 @@ import {
   type ModuleManifest,
 } from "./module-manifest.ts";
 import { findSession, parseSessionCookie } from "./sessions.ts";
-import { isFirstAdmin } from "./users.ts";
+import { isHubAdmin } from "./users.ts";
 import { VAULT_NAME_CHARSET_RE } from "./vault-name.ts";
 
 /** Short TTL — provisioning calls use these immediately. */
@@ -1773,7 +1773,7 @@ function operatorGate(req: Request, deps: ConnectionsDeps): Response | null {
   if (!session) {
     return jsonError(401, "unauthenticated", "no admin session — sign in at /login first");
   }
-  if (!isFirstAdmin(deps.db, session.userId)) {
+  if (!isHubAdmin(deps.db, session.userId)) {
     return jsonError(
       403,
       "not_admin",

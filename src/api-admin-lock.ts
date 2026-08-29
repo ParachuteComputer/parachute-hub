@@ -1,8 +1,8 @@
 /**
  * Admin screen-lock management API (hub admin-lock feature).
  *
- * All endpoints are session-cookie-gated to the first admin — the same gate
- * the admin-token mints use (`isFirstAdmin`). These manage the lock itself, so
+ * All endpoints are session-cookie-gated to a hub admin — the same gate
+ * the admin-token mints use (`isHubAdmin`). These manage the lock itself, so
  * they are NOT behind the lock gate (you must be able to unlock + set the PIN
  * even when the surface is locked).
  *
@@ -44,7 +44,7 @@ import {
 } from "./admin-lock.ts";
 import { verifyCsrfToken } from "./csrf.ts";
 import { findSession, parseSessionCookie } from "./sessions.ts";
-import { isFirstAdmin } from "./users.ts";
+import { isHubAdmin } from "./users.ts";
 
 export interface AdminLockDeps {
   db: Database;
@@ -80,7 +80,7 @@ function requireAdminSession(
       res: err(401, "unauthenticated", "no admin session — sign in at /login first"),
     };
   }
-  if (!isFirstAdmin(db, session.userId)) {
+  if (!isHubAdmin(db, session.userId)) {
     return {
       ok: false,
       res: err(

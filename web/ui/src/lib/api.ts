@@ -1037,6 +1037,19 @@ export interface UserListing {
   email: string | null;
   assigned_vaults: string[];
   created_at: string;
+  /**
+   * Hub-wide role — `"admin"` or `"user"` (hub#881, migration v20).
+   * Replaces the SPA's old `users[0].id` first-admin oracle: a hub can
+   * now hold several admins, so "is this row an admin" is a property of
+   * the row, not of its position in the list. The FIRST row is still
+   * special for the delete rail alone (undeletable), and that one stays
+   * positional because it is genuinely a statement about position.
+   *
+   * Optional so a SPA build served by a pre-v20 hub degrades to "no
+   * admins" rather than crashing; `Users.tsx` treats a missing value as
+   * `"user"`.
+   */
+  hub_role?: string;
 }
 
 /** Body shape for `POST /api/users`. */
@@ -1200,6 +1213,42 @@ export async function updateUserVaults(userId: string, assignedVaults: string[])
     throw new HttpError(res.status, await readError(res));
   }
   if (!res.ok) throw new HttpError(res.status, await readError(res));
+}
+
+/**
+ * POST /api/users/:id/promote-hub-admin — grant a user `hub_role =
+ * "admin"` (hub#881). One-way: there is no demote endpoint, so the UI
+ * confirms before calling.
+ *
+ * The server refuses a target that holds any vault assignments (403
+ * `has_vault_assignments`) — an admin's vault access is unrestricted, so
+ * carrying per-vault rows would leave stale grants that reactivate if the
+ * role were ever removed. Revoke the assignments first. Also refuses an
+ * account that is already an admin (409 `already_hub_admin`).
+ *
+ * Same `host:admin` Bearer pattern as `resetUserPassword`, INCLUDING its
+ * 403 treatment: 403 here is usually a policy refusal rather than an auth
+ * failure, so we do not clear the cached bearer (re-minting wouldn't help
+ * and would log the operator out of every other admin surface).
+ *
+ * Returns the updated row so the caller can patch its list in place.
+ */
+export async function promoteHubAdmin(userId: string): Promise<UserListing> {
+  const bearer = await getHostAdminToken();
+  const res = await fetch(`/api/users/${encodeURIComponent(userId)}/promote-hub-admin`, {
+    method: "POST",
+    headers: {
+      accept: "application/json",
+      authorization: `Bearer ${bearer}`,
+    },
+  });
+  if (res.status === 401 || res.status === 403) {
+    if (res.status === 401) clearCachedToken();
+    throw new HttpError(res.status, await readError(res));
+  }
+  if (!res.ok) throw new HttpError(res.status, await readError(res));
+  const body = (await res.json()) as { user: UserListing };
+  return body.user;
 }
 
 /**

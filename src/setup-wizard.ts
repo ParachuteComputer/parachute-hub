@@ -1843,7 +1843,14 @@ export async function handleSetupAccountPost(
     // `password_changed=true`. `assignedVault` stays null — admin posture
     // (the wizard never asks the first admin to pin themselves to a
     // single vault; that's a non-admin user pattern).
-    const user = await createUser(deps.db, username, password, { passwordChanged: true });
+    // `hubRole: "admin"` — the wizard's account-step is gated on
+    // `userCount(deps.db) === 0` above, so this is the hub's first account
+    // and its administrator (hub#881, migration v20). Explicit rather than
+    // leaning on `createUser`'s empty-table default.
+    const user = await createUser(deps.db, username, password, {
+      passwordChanged: true,
+      hubRole: "admin",
+    });
     // Consume the bootstrap token AFTER the admin row is committed.
     // Doing it before would let a `createUser` exception (UNIQUE-collision,
     // disk full, anything) leave the token un-consumed but the admin row

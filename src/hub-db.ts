@@ -710,6 +710,40 @@ const MIGRATIONS: readonly Migration[] = [
          AND EXISTS (SELECT 1 FROM users WHERE id = tokens.subject);
     `,
   },
+  {
+    version: 20,
+    sql: `
+      -- Multi-admin hub roles (hub#881). Until now "hub admin" was a
+      -- POSITION, not a property: \`getFirstAdminId\` = the earliest
+      -- \`users\` row by created_at. That made the admin unique by
+      -- construction and unpromotable. One column on \`users\` lifts it
+      -- into a stored role:
+      --
+      --   * hub_role (TEXT NOT NULL DEFAULT 'user') — 'admin' | 'user'.
+      --     'admin' means hub-wide administrator: unrestricted vault
+      --     posture (\`vaultScopeForUser\` returns \`[]\`), may mint the
+      --     host-admin bearer, may reach /admin/*. TEXT rather than an
+      --     INTEGER flag so a third role can land without a migration.
+      --     No CHECK constraint: \`isHubAdmin\` fails closed on any
+      --     value it doesn't recognise, which is the same defense
+      --     \`vaultVerbsForRole\` already applies to user_vaults.role.
+      --
+      -- Backfill: exactly the pre-v20 definition of "the admin" — the
+      -- earliest-created row — so every already-bootstrapped hub keeps
+      -- the same single admin it had before this migration, and every
+      -- other existing account keeps the 'user' default. An empty users
+      -- table (pre-wizard) updates zero rows; \`createUser\` stamps
+      -- 'admin' on the first account it creates.
+      --
+      -- NOT NULL DEFAULT 'user' is the fail-closed direction: a row
+      -- written by code that doesn't know about this column lands as a
+      -- non-admin rather than as an administrator.
+      ALTER TABLE users ADD COLUMN hub_role TEXT NOT NULL DEFAULT 'user';
+      UPDATE users
+         SET hub_role = 'admin'
+       WHERE id = (SELECT id FROM users ORDER BY created_at ASC LIMIT 1);
+    `,
+  },
 ];
 
 export function openHubDb(path: string = hubDbPath()): Database {

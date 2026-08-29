@@ -32,7 +32,7 @@ import {
   createUser,
   deleteUser,
   getFirstAdminId,
-  isFirstAdmin,
+  isHubAdmin,
   removeUserVault,
   upsertUserVault,
   vaultVerbsForUserVault,
@@ -143,7 +143,7 @@ function bearerCoversVaultForGrant(
 /**
  * True when the caller may grant/revoke/list this vault.
  *
- * NIP-98 first-admin is unrestricted across installed vaults. Bearer
+ * NIP-98 hub admins are unrestricted across installed vaults. Bearer
  * `parachute:host:admin` (wildcard `admin`) is too. A Bearer that names a
  * vault subset cannot grant outside it; a named composed verb must satisfy
  * `admin`. Everyone else needs the `admin` verb on the vault
@@ -155,11 +155,11 @@ export function callerCanAdminVault(db: Database, caller: GrantCaller, vaultName
     if (!grant) return false;
     if (!bearerCoversVaultForGrant(grant, vaultName)) return false;
     if (grant.wildcard === "admin") return true;
-    if (isFirstAdmin(db, caller.userId)) return true;
+    if (isHubAdmin(db, caller.userId)) return true;
     const verbs = vaultVerbsForUserVault(db, caller.userId, vaultName);
     return verbs?.includes("admin") === true;
   }
-  if (caller.isHubAdmin || isFirstAdmin(db, caller.userId)) return true;
+  if (caller.isHubAdmin || isHubAdmin(db, caller.userId)) return true;
   const verbs = vaultVerbsForUserVault(db, caller.userId, vaultName);
   return verbs?.includes("admin") === true;
 }
@@ -178,6 +178,18 @@ async function ensureUserForPubkey(
     };
   }
 
+  // Bootstrap sentinel, NOT an admin check: `getFirstAdminId(db) === null`
+  // is true exactly when the users table is empty. Auto-provisioning a
+  // pubkey into an empty hub would make an anonymous NIP-98 caller the
+  // hub's first account, so refuse until an owner exists.
+  //
+  // Deliberately left as "no accounts at all" rather than the arguably
+  // truer `countHubAdmins(db) === 0` (hub#881). The two differ only for a
+  // hub whose accounts all have `hub_role = 'user'` — unreachable today,
+  // since `createUser` stamps 'admin' on the first account and migration
+  // v20 backfills the earliest row. Behavior is therefore identical; the
+  // narrower spelling avoids changing a bootstrap gate in a PR that isn't
+  // about bootstrap. Revisit if a demote path ever lands.
   if (getFirstAdminId(db) === null) {
     throw new GrantError(
       "no_hub_owner",
@@ -269,7 +281,7 @@ export async function grantAccess(
   }
 
   const target = await ensureUserForPubkey(db, pubkey, now);
-  if (isFirstAdmin(db, target.userId)) {
+  if (isHubAdmin(db, target.userId)) {
     return {
       pubkey,
       vault,
@@ -314,10 +326,10 @@ export function revokeAccess(
   if (!link) {
     throw new GrantError("unknown_pubkey", "No hub user is linked to that pubkey.");
   }
-  if (isFirstAdmin(db, link.userId)) {
+  if (isHubAdmin(db, link.userId)) {
     throw new GrantError(
       "target_is_hub_admin",
-      "The hub owner is unrestricted; vault grants on that account cannot be revoked this way.",
+      "A hub admin is unrestricted; vault grants on that account cannot be revoked this way.",
     );
   }
   const revoked = removeUserVault(db, link.userId, vault);

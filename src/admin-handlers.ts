@@ -44,7 +44,7 @@ import {
   type User,
   getUserById,
   getUserByUsername,
-  isFirstAdmin,
+  isHubAdmin,
   verifyPassword,
 } from "./users.ts";
 
@@ -136,7 +136,7 @@ export function loginRedirectTarget(db: Database, user: User, next: string): str
   // already normalized to a leading-`/` same-origin path, so a plain
   // string prefix check is sufficient (no `//admin.evil.com/` shape can
   // reach here).
-  if (!isFirstAdmin(db, user.id) && (next === "/admin" || next.startsWith("/admin/"))) {
+  if (!isHubAdmin(db, user.id) && (next === "/admin" || next.startsWith("/admin/"))) {
     return "/account/";
   }
   return next;

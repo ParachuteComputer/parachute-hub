@@ -30,7 +30,7 @@ import {
   createUser,
   getFirstAdminId,
   getUserById,
-  isFirstAdmin,
+  isHubAdmin,
   vaultVerbsForUserVault,
 } from "./users.ts";
 
@@ -279,6 +279,11 @@ export async function resolveNostrPrincipal(
   if (!opts.autoProvision) {
     throw new NostrHttpAuthError(401, "unknown_pubkey", "Nostr pubkey is not linked to a hub user");
   }
+  // Bootstrap sentinel, NOT an admin check — true exactly when the users
+  // table is empty. Auto-provision must never mint the hub's FIRST account
+  // (that account would be its administrator). Kept as "no accounts at all"
+  // rather than `countHubAdmins(db) === 0`; the two are equivalent today and
+  // the narrower spelling preserves behavior. Same note as `grant-access.ts`.
   if (getFirstAdminId(db) === null) {
     throw new NostrHttpAuthError(
       401,
@@ -336,7 +341,7 @@ function principalFromUser(
   pubkey: string,
   provisioned: boolean,
 ): NostrPrincipal {
-  const admin = isFirstAdmin(db, userId);
+  const admin = isHubAdmin(db, userId);
   const user = getUserById(db, userId);
   const scopes: string[] = [];
   if (!admin && user) {

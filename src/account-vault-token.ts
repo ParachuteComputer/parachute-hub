@@ -75,7 +75,7 @@ import { TokenMintPrincipalGoneError, recordTokenMint, signAccessToken } from ".
 import { vaultTokenMintRateLimiter } from "./rate-limit.ts";
 import { findActiveSession } from "./sessions.ts";
 import { isTotpEnrolled } from "./two-factor-store.ts";
-import { type VaultVerb, getUserById, isFirstAdmin, vaultVerbsForUserVault } from "./users.ts";
+import { type VaultVerb, getUserById, isHubAdmin, vaultVerbsForUserVault } from "./users.ts";
 import { VAULT_NAME_CHARSET_RE } from "./vault-name.ts";
 
 /**
@@ -184,14 +184,14 @@ export async function handleAccountVaultTokenPost(
     const setCookie: Record<string, string> = csrf.setCookie
       ? { "set-cookie": csrf.setCookie }
       : {};
-    const adminFlag = isFirstAdmin(deps.db, user.id);
+    const adminFlag = isHubAdmin(deps.db, user.id);
     return htmlResponse(
       renderAccountHome({
         username: user.username,
         assignedVaults: user.assignedVaults,
         passwordChanged: user.passwordChanged,
         hubOrigin: deps.hubOrigin,
-        isFirstAdmin: adminFlag,
+        isHubAdmin: adminFlag,
         csrfToken: csrf.token,
         twoFactorEnabled: isTotpEnrolled(deps.db, user.id),
         mintableVerbs: buildMintableVerbs(deps.db, user.id, user.assignedVaults),

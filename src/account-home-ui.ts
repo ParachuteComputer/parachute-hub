@@ -86,7 +86,7 @@ export interface RenderAccountHomeOpts {
   username: string;
   /**
    * Vault instance names this user has access to (multi-user Phase 2
-   * PR 2). Empty `[]` for admin posture (combined with `isFirstAdmin:
+   * PR 2). Empty `[]` for admin posture (combined with `isHubAdmin:
    * true` this is the hub administrator's account, whose vault access
    * is unrestricted). One or more entries for non-admin users — the
    * page renders one Notes-CTA tile per vault.
@@ -109,7 +109,7 @@ export interface RenderAccountHomeOpts {
    * `assignedVault: null`, friends always have one set) see a
    * defensive "ask the operator" message.
    */
-  isFirstAdmin: boolean;
+  isHubAdmin: boolean;
   /**
    * CSRF token for the sign-out form. Same pattern as
    * `account-change-password-ui.ts` — POSTs to `/logout` are CSRF-gated
@@ -225,7 +225,7 @@ export interface MintedTokenView {
 export const ACCOUNT_VAULT_TOKEN_TTL_SECONDS = 90 * 24 * 60 * 60;
 
 export function renderAccountHome(opts: RenderAccountHomeOpts): string {
-  const { username, assignedVaults, hubOrigin, isFirstAdmin, csrfToken } = opts;
+  const { username, assignedVaults, hubOrigin, isHubAdmin, csrfToken } = opts;
   const safeUsername = escapeHtml(username);
   // Origin is already canonicalized by the handler (trailing slash stripped),
   // but defensively re-trim so a stray slash here doesn't break the CTA href.
@@ -241,10 +241,10 @@ export function renderAccountHome(opts: RenderAccountHomeOpts): string {
   // Suppress the "Get started with your AI" card on the no-vault branch:
   // that branch tells the user "You don't have a vault yet" + "ask the operator
   // to assign you one," so a do-the-thing card alongside reads as contradictory
-  // (do-this vs you-lack-the-prerequisite). The admin (isFirstAdmin) and
+  // (do-this vs you-lack-the-prerequisite). The admin (isHubAdmin) and
   // assigned-vault branches both have a vault to act against, so the card
   // belongs there.
-  const hasNoVault = !isFirstAdmin && assignedVaults.length === 0;
+  const hasNoVault = !isHubAdmin && assignedVaults.length === 0;
   const startedCard = hasNoVault ? "" : renderGetStartedCard();
 
   // First-run onboarding checklist — the lead surface for a friend with at
@@ -271,7 +271,7 @@ export function renderAccountHome(opts: RenderAccountHomeOpts): string {
   const vaultCard = renderVaultCard({
     assignedVaults,
     trimmedOrigin,
-    isFirstAdmin,
+    isHubAdmin,
     csrfToken,
     mintableVerbs: opts.mintableVerbs ?? {},
     usageStats: opts.usageStats ?? {},
@@ -495,7 +495,7 @@ function renderGetStartedCard(): string {
 interface VaultCardOpts {
   assignedVaults: string[];
   trimmedOrigin: string;
-  isFirstAdmin: boolean;
+  isHubAdmin: boolean;
   csrfToken: string;
   mintableVerbs: Record<string, VaultVerb[]>;
   /** `vaultName` → pre-formatted usage stat ("X notes · Y MB"). */
@@ -509,8 +509,7 @@ interface VaultCardOpts {
 }
 
 function renderVaultCard(opts: VaultCardOpts): string {
-  const { assignedVaults, trimmedOrigin, isFirstAdmin, csrfToken, mintableVerbs, usageStats } =
-    opts;
+  const { assignedVaults, trimmedOrigin, isHubAdmin, csrfToken, mintableVerbs, usageStats } = opts;
   const { mirrorLines, mirrorPushing, mirrorHealthy } = opts;
 
   if (assignedVaults.length > 0) {
@@ -590,7 +589,7 @@ function renderVaultCard(opts: VaultCardOpts): string {
         </div>
       </section>`;
   }
-  if (isFirstAdmin) {
+  if (isHubAdmin) {
     return `
       <section class="section" data-testid="admin-card">
         <h2>Your vault</h2>

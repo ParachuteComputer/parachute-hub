@@ -27,7 +27,7 @@
  *   - `GET /admin/vault-admin-token/<name>`(per-vault admin SPA)
  *   - `GET /admin/module-token/<short>`    (generic module config UI Bearer)
  *
- * All three share the exact `parseSessionCookie → findSession → [isFirstAdmin]
+ * All three share the exact `parseSessionCookie → findSession → [isHubAdmin]
  * → signAccessToken` shape. Inserting {@link requireUnlocked} into each makes
  * the lock cascade to EVERY admin surface with no per-module changes: when
  * locked, the mint returns 423 and the relevant UI shows the lock screen / its
