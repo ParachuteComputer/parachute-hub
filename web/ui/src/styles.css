@@ -1557,3 +1557,250 @@ a.btn:hover {
   font-size: 0.95rem;
   letter-spacing: 0.02em;
 }
+
+/* ---------------------------------------------------------------------------
+ * /admin/account — summary-first disclosure cards + the key-link stepper
+ * (hub#880).
+ *
+ * Before this the page was four full-weight `<section>`s stacked into one long
+ * settings dump: password, 2FA, a paginated token list, keys. The card shell
+ * below collapses each to a single row — title on the left, one-line status on
+ * the right — so the whole account posture reads at a glance and only the
+ * section you're actually working in is expanded.
+ *
+ * Everything here is built from the existing tokens (`--accent`, `--bg-soft`,
+ * `--border`, …). No new palette; these surfaces stay continuous with the
+ * server-rendered login/consent flow.
+ * ------------------------------------------------------------------------- */
+.account-page > .muted {
+  margin-bottom: 1.5rem;
+}
+
+.account-cards {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.account-card {
+  background: var(--card-bg);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: hidden;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+.account-card.is-open {
+  border-color: var(--accent);
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.04);
+}
+
+/* The heading is a real <h2> so heading navigation still lands on each
+   section; the button inside it carries the disclosure semantics. Reset the
+   global h2 margins/size — the card header is a control, not a title block. */
+.account-card-heading {
+  margin: 0;
+  font-size: 1rem;
+  font-weight: 500;
+}
+.account-card-toggle {
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+  width: 100%;
+  background: transparent;
+  color: var(--fg);
+  border: 0;
+  border-radius: 0;
+  padding: 0.9rem 1.25rem;
+  text-align: left;
+  font: inherit;
+  cursor: pointer;
+}
+.account-card-toggle:hover {
+  background: var(--bg-soft);
+}
+.account-card-toggle:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+.account-card-chevron {
+  flex: 0 0 auto;
+  color: var(--fg-dim);
+  font-size: 0.8rem;
+  line-height: 1;
+  width: 0.8rem;
+}
+.account-card-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 1.05rem;
+  font-weight: 600;
+}
+/* The one-line status: "3 API tokens", "1 linked key", or a status pill. */
+.account-card-summary {
+  flex: 0 0 auto;
+  color: var(--fg-muted);
+  font-size: 0.86rem;
+  font-weight: 400;
+  text-align: right;
+}
+.account-card-body {
+  padding: 1rem 1.25rem 1.25rem;
+  border-top: 1px solid var(--border-light);
+}
+.account-card-body > p:first-child {
+  margin-top: 0;
+}
+.account-card-body h3 {
+  margin: 0 0 0.5rem;
+  font-size: 1rem;
+  font-weight: 600;
+}
+
+/* Stacked form fields inside a card. `form label` is already block-level with
+   a muted caption; this just gives the fields breathing room and keeps text
+   inputs from running the full 880px page width. */
+.account-form {
+  display: flex;
+  flex-direction: column;
+  gap: 0.85rem;
+  max-width: 30rem;
+  margin-top: 0.75rem;
+}
+.account-form label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  margin-bottom: 0;
+}
+.account-form .actions {
+  margin-top: 0.25rem;
+}
+.account-event-input {
+  width: 100%;
+  font-family: var(--font-mono);
+  font-size: 0.85rem;
+}
+
+/* Secondary disclosure inside a card — the token mint form, the
+   "paste manually" path. Styled as a quiet text toggle, not a button, so it
+   doesn't compete with the primary action beside it. */
+.account-subsection {
+  margin: 1rem 0;
+}
+button.account-disclosure {
+  background: transparent;
+  border: 0;
+  padding: 0.2rem 0;
+  color: var(--accent);
+  font-size: 0.9rem;
+  font-weight: 500;
+  border-radius: 4px;
+}
+button.account-disclosure:hover {
+  background: transparent;
+  color: var(--accent-hover);
+  text-decoration: underline;
+}
+button.account-disclosure:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* -------------------------------------------------------------------------
+ * Nostr key-link stepper.
+ *
+ * Three numbered steps — get the statement, sign it, confirm — so the
+ * ceremony reads as a guided flow rather than a developer form with a JSON
+ * textarea. The indicator is an <ol> (the steps are genuinely ordered) and the
+ * active step carries `aria-current="step"`.
+ * ----------------------------------------------------------------------- */
+.link-flow {
+  margin: 1rem 0;
+}
+.link-steps {
+  list-style: none;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem 1.1rem;
+  margin: 0 0 1rem;
+  padding: 0;
+}
+.link-step {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  font-size: 0.86rem;
+  color: var(--fg-dim);
+}
+.link-step-num {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.4rem;
+  height: 1.4rem;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--bg-soft);
+  color: var(--fg-dim);
+  font-size: 0.78rem;
+  font-weight: 600;
+}
+.link-step-done {
+  color: var(--fg-muted);
+}
+.link-step-done .link-step-num {
+  background: var(--success-soft);
+  border-color: var(--success);
+  color: var(--success);
+}
+.link-step-current {
+  color: var(--fg);
+  font-weight: 600;
+}
+.link-step-current .link-step-num {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: white;
+}
+
+.link-panel {
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 1.1rem 1.25rem;
+}
+.link-panel > p:first-of-type {
+  margin-top: 0;
+}
+
+/* The hub's one-time challenge sentence. Deliberately prominent — it is the
+   thing the operator is being asked to vouch for, and a signer that shows
+   event content will show them exactly this text. */
+.statement-box {
+  margin: 0.85rem 0;
+  padding: 0.85rem 1rem;
+  background: var(--card-bg);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  border-radius: 6px;
+  font-family: var(--font-serif);
+  font-size: 1rem;
+  line-height: 1.5;
+  color: var(--fg);
+}
+.statement-box code {
+  background: transparent;
+  padding: 0;
+  font-family: inherit;
+  font-size: inherit;
+}
+
+/* Inline form / action error. Every SPA route already emits
+   `<div className="error">` (Account, Settings, Modules) but no rule ever
+   backed it, so failures rendered as plain body text. */
+.error {
+  margin-top: 0.6rem;
+  color: var(--error);
+  font-size: 0.9rem;
+}
