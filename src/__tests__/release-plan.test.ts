@@ -72,7 +72,7 @@ describe("decidePublish", () => {
   });
 
   test("first-ever release of a package publishes", () => {
-    const d = decidePublish("0.1.0", { versionExists: false });
+    const d = decidePublish("0.1.0", { versionExists: false }, { branch: "main" });
     expect(d).toMatchObject({ publish: true });
   });
 
@@ -102,12 +102,12 @@ describe("decidePublish", () => {
   test("an ambiguous registry REFUSES rather than guessing", () => {
     // A false "not published" double-publishes; a false "published" drops a
     // release. Guessing is worse than failing loudly.
-    const d = decidePublish("0.7.9", { ambiguous: true });
+    const d = decidePublish("0.7.9", { ambiguous: true }, { branch: "main" });
     expect(d).toMatchObject({ refuse: true });
     expect("refuse" in d && d.reason).toMatch(/refusing to guess/);
   });
 
-  test("an explicit tag push overrides every check — a human said release this", () => {
+  test("an explicit rc tag push overrides the registry checks — a human said release this rc", () => {
     const d = decidePublish(
       "0.7.0-rc.1",
       {
@@ -119,53 +119,69 @@ describe("decidePublish", () => {
     expect(d).toMatchObject({ publish: true });
   });
 
-  test("a tag push even overrides ambiguity", () => {
-    const d = decidePublish("0.7.9", { ambiguous: true }, { isTagPush: true });
+  test("an rc tag push even overrides ambiguity", () => {
+    const d = decidePublish("0.7.9-rc.1", { ambiguous: true }, { isTagPush: true });
     expect(d).toMatchObject({ publish: true });
   });
 
   test("a stable without a matching rc is refused — 0.7.13 through 0.7.16 skipped this", () => {
     // Cutting @latest with new code and no rc of the same X.Y.Z is how
     // 0.7.13–0.7.16 shipped. Stable is a suffix-drop, never a skip.
-    const d = decidePublish("0.7.17", {
-      versionExists: false,
-      currentDistTagVersion: "0.7.16",
-      publishedVersions: ["0.7.16", "0.7.12-rc.2"],
-    });
+    const d = decidePublish(
+      "0.7.17",
+      {
+        versionExists: false,
+        currentDistTagVersion: "0.7.16",
+        publishedVersions: ["0.7.16", "0.7.12-rc.2"],
+      },
+      { branch: "main" },
+    );
     expect(d).toMatchObject({ refuse: true });
     expect("refuse" in d && d.reason).toMatch(/0\.7\.17-rc/);
     expect("refuse" in d && d.reason).toMatch(/suffix-drop|Cut an rc first/i);
   });
 
   test("a stable whose only published rcs are a different X.Y.Z is still refused", () => {
-    const d = decidePublish("0.7.17", {
-      versionExists: false,
-      currentDistTagVersion: "0.7.16",
-      publishedVersions: ["0.7.16", "0.7.16-rc.1"],
-    });
+    const d = decidePublish(
+      "0.7.17",
+      {
+        versionExists: false,
+        currentDistTagVersion: "0.7.16",
+        publishedVersions: ["0.7.16", "0.7.16-rc.1"],
+      },
+      { branch: "main" },
+    );
     expect(d).toMatchObject({ refuse: true });
   });
 
-  test("a stable with a matching rc publishes — suffix-drop is the only legal stable", () => {
-    const d = decidePublish("0.7.17", {
-      versionExists: false,
-      currentDistTagVersion: "0.7.16",
-      publishedVersions: ["0.7.16", "0.7.17-rc.1"],
-    });
+  test("a stable with a matching rc publishes from main — suffix-drop is the only legal stable", () => {
+    const d = decidePublish(
+      "0.7.17",
+      {
+        versionExists: false,
+        currentDistTagVersion: "0.7.16",
+        publishedVersions: ["0.7.16", "0.7.17-rc.1"],
+      },
+      { branch: "main" },
+    );
     expect(d).toMatchObject({ publish: true });
   });
 
   test("omitted publishedVersions still refuses a stable when latest already exists", () => {
     // Callers that forget to plumb the version list must not silently skip
     // the gate — that's how 0.7.13–0.7.16 would keep shipping.
-    const d = decidePublish("0.7.17", {
-      versionExists: false,
-      currentDistTagVersion: "0.7.16",
-    });
+    const d = decidePublish(
+      "0.7.17",
+      {
+        versionExists: false,
+        currentDistTagVersion: "0.7.16",
+      },
+      { branch: "main" },
+    );
     expect(d).toMatchObject({ refuse: true });
   });
 
-  test("tag-push still overrides the rc-required check", () => {
+  test("a tag push of a stable does NOT override the matching-rc check — stables publish from main only", () => {
     const d = decidePublish(
       "0.7.17",
       {
@@ -175,7 +191,46 @@ describe("decidePublish", () => {
       },
       { isTagPush: true },
     );
+    expect(d).toMatchObject({ publish: false });
+    expect("reason" in d && d.reason).toMatch(/from main only/);
+  });
+
+  test("next skips a stable even when a matching rc exists — tonight's hole", () => {
+    // After 0.7.18-rc.9, next HEAD *is* that rc. A suffix-drop PR targeting
+    // next would pass matching-rc + the version/changelog-only diff. This
+    // gate is what stops it from publishing @latest.
+    const d = decidePublish(
+      "0.7.18",
+      {
+        versionExists: false,
+        currentDistTagVersion: "0.7.17",
+        publishedVersions: ["0.7.17", "0.7.18-rc.9"],
+      },
+      { branch: "next" },
+    );
+    expect(d).toMatchObject({ publish: false });
+    expect("reason" in d && d.reason).toMatch(/from main only/);
+  });
+
+  test("next still publishes an rc", () => {
+    const d = decidePublish(
+      "0.7.18-rc.9",
+      {
+        versionExists: false,
+        currentDistTagVersion: "0.7.18-rc.8",
+      },
+      { branch: "next" },
+    );
     expect(d).toMatchObject({ publish: true });
+  });
+
+  test("a stable with no branch is refused — fail closed, don't guess the trigger", () => {
+    const d = decidePublish("0.7.18", {
+      versionExists: false,
+      publishedVersions: ["0.7.18-rc.9"],
+    });
+    expect(d).toMatchObject({ publish: false });
+    expect("reason" in d && d.reason).toMatch(/from main only/);
   });
 });
 
@@ -483,14 +538,16 @@ describe("release.yml image tags (hub#829)", () => {
 });
 
 /**
- * The tag-push override (hub#841).
+ * The rc tag-push override (hub#841).
  *
- * `decidePublish`'s `isTagPush` short-circuit is unit-tested above, but
- * unreachable unless the workflow actually passes `--tag-push` on a tag
- * push. That was the bug: the `plan` steps never passed it, so the flag path
- * was dead code and a stale comment claimed otherwise. Assert the wiring
- * directly on the YAML, same rationale as the hub#829 block below — a
- * `run:` string is otherwise only exercised by shipping a release.
+ * `decidePublish`'s `isTagPush` short-circuit (rc versions only) is
+ * unit-tested above, but unreachable unless the workflow actually passes
+ * `--tag-push` on a tag push. That was the bug: the `plan` steps never
+ * passed it, so the flag path was dead code and a stale comment claimed
+ * otherwise. Assert the wiring directly on the YAML, same rationale as the
+ * hub#829 block below — a `run:` string is otherwise only exercised by
+ * shipping a release. Stables are refused even with this flag; the wiring
+ * is still required so an rc tag-push reaches the short-circuit.
  */
 describe("release.yml tag-push override (hub#841)", () => {
   const workflow = readFileSync(
@@ -508,6 +565,20 @@ describe("release.yml tag-push override (hub#841)", () => {
     ]) {
       expect(workflow).toContain(`${cmd} ${flag}`);
     }
+  });
+
+  test("publish jobs consult plan even on a tag push — a tag is not a bypass of the stable-from-main gate", () => {
+    // The hole: `github.ref_type == 'tag' && <prefix>` without consulting
+    // plan published a stable from a write-token tag push. Both npm and
+    // ghcr used that shape.
+    const oldBypass =
+      "(github.ref_type == 'tag' && (!startsWith(github.ref_name, 'scope-guard-') && !startsWith(github.ref_name, 'depcheck-') && !startsWith(github.ref_name, 'door-contract-'))) || (github.ref_type != 'tag' && needs.plan.outputs.hub == 'true')";
+    expect(workflow).not.toContain(oldBypass);
+    const gated =
+      "needs.plan.outputs.hub == 'true' && (github.ref_type != 'tag' || (!startsWith(github.ref_name, 'scope-guard-') && !startsWith(github.ref_name, 'depcheck-') && !startsWith(github.ref_name, 'door-contract-')))";
+    expect(workflow).toContain(gated);
+    // Two jobs share it: publish-hub-npm and publish-image.
+    expect(workflow.split(gated).length - 1).toBe(2);
   });
 });
 

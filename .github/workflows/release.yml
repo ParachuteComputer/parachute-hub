@@ -58,16 +58,15 @@ on:
     # record).
     #
     # `next` publishes rc's directly (no more next→main hop just to cut an
-    # rc) — `decidePublish` in release-plan.ts is already branch-agnostic
-    # (idempotent on an already-published version, refuses to move a
-    # dist-tag backwards, refuses a `latest` publish unless npm already has
-    # a matching `-rc.*` and the diff is a pure suffix-drop). `main` stays
-    # the only path that can actually promote to `@latest`, because a
-    # stable publish requires an existing rc AND a version/changelog-only
-    # diff from it — a fresh feature merge on `next` can never satisfy that
-    # gate. The `paths` filter below means an ordinary feature merge (no
-    # version bump) never even runs this workflow a second time —
-    # `pr-verify.yml` already tested it before merge.
+    # rc). `decidePublish` is idempotent on an already-published version,
+    # refuses to move a dist-tag backwards, refuses a `latest` publish unless
+    # npm already has a matching `-rc.*` and the diff is a pure suffix-drop,
+    # AND refuses a stable unless the trigger is a branch push of `main`.
+    # Matching-rc + suffix-drop alone is not enough: after an rc lands on
+    # `next`, a version/changelog-only promotion PR targeting `next` would
+    # pass those two and publish `@latest`. The `paths` filter below means
+    # an ordinary feature merge (no version bump) never even runs this
+    # workflow a second time — `pr-verify.yml` already tested it before merge.
     branches:
       - main
       - next
@@ -110,10 +109,12 @@ jobs:
   # `scripts/release-plan.ts` (unit-tested — release logic that can
   # double-publish or drop a release shouldn't be untested shell in a `run:`).
   #
-  # Note the tag-push path: an explicit tag still publishes, and passes
-  # `--tag-push` so `decidePublish`'s tag short-circuit overrides every
-  # refuse-guard (an ambiguous registry response, an older-than-published
-  # version) — because a tag is a human saying "release this". hub#841.
+  # Note the tag-push path: an explicit **rc** tag still publishes, and
+  # passes `--tag-push` so `decidePublish`'s tag short-circuit overrides the
+  # registry refuse-guards (an ambiguous registry response, an
+  # older-than-published rc) — because an rc tag is a human saying "release
+  # this rc". hub#841. A tag push of a stable is refused; stables publish
+  # from `main` only. A write token can push a tag; it cannot merge to `main`.
   # ---------------------------------------------------------------------------
   plan:
     name: plan
@@ -202,7 +203,10 @@ jobs:
     name: publish hub to npm
     needs: [plan, test]
     # Hub-only: skip on scope-guard / depcheck / door-contract tags (a `v*` tag is hub's).
-    if: ${{ (github.ref_type == 'tag' && (!startsWith(github.ref_name, 'scope-guard-') && !startsWith(github.ref_name, 'depcheck-') && !startsWith(github.ref_name, 'door-contract-'))) || (github.ref_type != 'tag' && needs.plan.outputs.hub == 'true') }}
+    # Plan is consulted on tag pushes too — a tag is not a bypass of the
+    # stable-from-main gate. The prefix clause still stops a scope-guard
+    # tag from also publishing hub (all four plan steps run --tag-push).
+    if: ${{ needs.plan.outputs.hub == 'true' && (github.ref_type != 'tag' || (!startsWith(github.ref_name, 'scope-guard-') && !startsWith(github.ref_name, 'depcheck-') && !startsWith(github.ref_name, 'door-contract-'))) }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -264,8 +268,9 @@ jobs:
   publish-scope-guard-npm:
     name: publish scope-guard to npm
     needs: [plan, test]
-    # scope-guard-only: skip on hub (`v*`) tags.
-    if: ${{ (github.ref_type == 'tag' && (startsWith(github.ref_name, 'scope-guard-'))) || (github.ref_type != 'tag' && needs.plan.outputs.scope_guard == 'true') }}
+    # scope-guard-only: skip on hub (`v*`) tags. Plan is consulted on tag
+    # pushes too — a tag is not a bypass of the stable-from-main gate.
+    if: ${{ needs.plan.outputs.scope_guard == 'true' && (github.ref_type != 'tag' || startsWith(github.ref_name, 'scope-guard-')) }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -322,8 +327,9 @@ jobs:
   publish-depcheck-npm:
     name: publish depcheck to npm
     needs: [plan, test]
-    # depcheck-only: skip on hub (`v*`) + scope-guard tags.
-    if: ${{ (github.ref_type == 'tag' && (startsWith(github.ref_name, 'depcheck-'))) || (github.ref_type != 'tag' && needs.plan.outputs.depcheck == 'true') }}
+    # depcheck-only: skip on hub (`v*`) + scope-guard tags. Plan is consulted
+    # on tag pushes too — a tag is not a bypass of the stable-from-main gate.
+    if: ${{ needs.plan.outputs.depcheck == 'true' && (github.ref_type != 'tag' || startsWith(github.ref_name, 'depcheck-')) }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -381,7 +387,9 @@ jobs:
     name: publish door-contract to npm
     needs: [plan, test]
     # door-contract-only: skip on hub (`v*`) + scope-guard + depcheck tags.
-    if: ${{ (github.ref_type == 'tag' && (startsWith(github.ref_name, 'door-contract-'))) || (github.ref_type != 'tag' && needs.plan.outputs.door_contract == 'true') }}
+    # Plan is consulted on tag pushes too — a tag is not a bypass of the
+    # stable-from-main gate.
+    if: ${{ needs.plan.outputs.door_contract == 'true' && (github.ref_type != 'tag' || startsWith(github.ref_name, 'door-contract-')) }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -439,7 +447,9 @@ jobs:
     name: publish to ghcr.io
     needs: [plan, test]
     # Hub-only: scope-guard / depcheck / door-contract don't ship a container image.
-    if: ${{ (github.ref_type == 'tag' && (!startsWith(github.ref_name, 'scope-guard-') && !startsWith(github.ref_name, 'depcheck-') && !startsWith(github.ref_name, 'door-contract-'))) || (github.ref_type != 'tag' && needs.plan.outputs.hub == 'true') }}
+    # Plan is consulted on tag pushes too — a tag is not a bypass of the
+    # stable-from-main gate (same shape as publish-hub-npm).
+    if: ${{ needs.plan.outputs.hub == 'true' && (github.ref_type != 'tag' || (!startsWith(github.ref_name, 'scope-guard-') && !startsWith(github.ref_name, 'depcheck-') && !startsWith(github.ref_name, 'door-contract-'))) }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
