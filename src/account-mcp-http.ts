@@ -124,17 +124,28 @@ function accountMcpResource(issuer: string): string {
   return `${issuer.replace(/\/$/, "")}/account/mcp`;
 }
 
-function accountMcpChallenge(issuer: string): string {
-  // Always names the /account/mcp PRM. When handleAccountMcp answers a
-  // request that arrived at root /mcp (NIP-98 or the aud=account routing
-  // peek), RFC 9728 §3.3 wants resource_metadata to describe the URL the
-  // client requested — this PRM's `resource` is `/account/mcp`, so a
-  // strict client MUST discard the challenge. Valid-token dispatch at
-  // root is still the right alias. Tracked as hub#899. Do not "fix" by
-  // advertising `account:vaults` on the root PRM: catalog-copy +
-  // combine-refusal is a total `invalid_scope` bounce.
+/**
+ * RFC 9728 §3.3: WWW-Authenticate `resource_metadata` must describe the
+ * requested URL. handleAccountMcp answers both `/mcp` (root dispatch) and
+ * `/account/mcp`. Do not advertise `account:vaults` on the root PRM —
+ * catalog-copy + combine-refusal is a total `invalid_scope` bounce.
+ */
+export function challengePrmPath(req: Request): string {
+  let pathname = "";
+  try {
+    pathname = new URL(req.url).pathname;
+  } catch {
+    pathname = "";
+  }
+  if (pathname === "/mcp" || pathname.startsWith("/mcp/")) {
+    return "/.well-known/oauth-protected-resource/mcp";
+  }
+  return "/.well-known/oauth-protected-resource/account/mcp";
+}
+
+function accountMcpChallenge(issuer: string, req: Request): string {
   const origin = issuer.replace(/\/$/, "");
-  return `Bearer resource_metadata="${origin}/.well-known/oauth-protected-resource/account/mcp"`;
+  return `Bearer resource_metadata="${origin}${challengePrmPath(req)}"`;
 }
 
 /** RFC 9728 PRM for `/account/mcp`. Public + wildcard CORS. */
@@ -167,10 +178,11 @@ function authFailure(
   error: string,
   message: string,
   issuer: string,
+  req: Request,
   scope?: string,
 ): Response {
   const challenge = [
-    accountMcpChallenge(issuer),
+    accountMcpChallenge(issuer, req),
     `error="${error}"`,
     `error_description="${message.replace(/"/g, "'")}"`,
   ];
@@ -363,16 +375,16 @@ async function handleOne(m: JsonRpcMessage, ctx: AccountToolContext): Promise<Js
   }
 }
 
-function translateAuthError(err: unknown, issuer: string): Response {
+function translateAuthError(err: unknown, issuer: string, req: Request): Response {
   if (err instanceof NostrHttpAuthError) {
-    return authFailure(err.status === 403 ? 403 : 401, "invalid_token", err.message, issuer);
+    return authFailure(err.status === 403 ? 403 : 401, "invalid_token", err.message, issuer, req);
   }
   if (err instanceof AdminAuthError) {
     const res = adminAuthErrorResponse(err);
-    const challenge = res.headers.get("www-authenticate") ?? accountMcpChallenge(issuer);
+    const challenge = res.headers.get("www-authenticate") ?? accountMcpChallenge(issuer, req);
     const withMeta = challenge.includes("resource_metadata=")
       ? challenge
-      : `${accountMcpChallenge(issuer)}, ${challenge}`;
+      : `${accountMcpChallenge(issuer, req)}, ${challenge}`;
     const headers = new Headers(res.headers);
     headers.set("www-authenticate", withMeta);
     headers.set("access-control-allow-origin", "*");
@@ -380,7 +392,7 @@ function translateAuthError(err: unknown, issuer: string): Response {
     return new Response(res.body, { status: res.status, headers });
   }
   const message = err instanceof Error ? err.message : "unauthorized";
-  return authFailure(401, "invalid_token", message, issuer);
+  return authFailure(401, "invalid_token", message, issuer, req);
 }
 
 /**
@@ -400,7 +412,7 @@ export async function handleAccountMcp(req: Request, deps: AccountMcpDeps): Prom
   try {
     principal = await authenticate(deps.db, req, deps, body);
   } catch (err) {
-    return translateAuthError(err, deps.issuer);
+    return translateAuthError(err, deps.issuer, req);
   }
 
   if (req.method === "DELETE") return withMcpCors(new Response(null, { status: 200 }));

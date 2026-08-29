@@ -26,7 +26,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { schnorr } from "@noble/curves/secp256k1.js";
 import { handleAccountCapabilities } from "../account-api.ts";
-import { accountMcpProtectedResource, handleAccountMcp } from "../account-mcp-http.ts";
+import {
+  accountMcpProtectedResource,
+  challengePrmPath,
+  handleAccountMcp,
+} from "../account-mcp-http.ts";
 import { ACCOUNT_MCP_TOOLS } from "../account-mcp.ts";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
 import { signAccessToken } from "../jwt-sign.ts";
@@ -373,6 +377,41 @@ describe("account MCP — descriptor + PRM", () => {
       );
       const body = (await res.json()) as { account_mcp_endpoint: string };
       expect(body.account_mcp_endpoint).toBe(MCP_URL);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("challengePrmPath follows the request URL (hub#899)", () => {
+    expect(challengePrmPath(new Request("http://hub.example.com/mcp"))).toBe(
+      "/.well-known/oauth-protected-resource/mcp",
+    );
+    expect(challengePrmPath(new Request("http://hub.example.com/mcp/"))).toBe(
+      "/.well-known/oauth-protected-resource/mcp",
+    );
+    expect(challengePrmPath(new Request("http://hub.example.com/account/mcp"))).toBe(
+      "/.well-known/oauth-protected-resource/account/mcp",
+    );
+    expect(challengePrmPath(new Request("http://hub.example.com/account/mcp?x=1"))).toBe(
+      "/.well-known/oauth-protected-resource/account/mcp",
+    );
+  });
+
+  test("unauthed handleAccountMcp at /mcp names the root PRM (hub#899)", async () => {
+    const h = await makeHarness();
+    try {
+      const res = await handleAccountMcp(
+        new Request("http://hub.example.com/mcp", {
+          method: "POST",
+          headers: { accept: BOTH_ACCEPT, "content-type": "application/json" },
+          body: JSON.stringify(rpc("initialize")),
+        }),
+        mcpDeps(h),
+      );
+      expect(res.status).toBe(401);
+      const challenge = res.headers.get("www-authenticate") ?? "";
+      expect(challenge).toContain("/.well-known/oauth-protected-resource/mcp");
+      expect(challenge).not.toContain("/.well-known/oauth-protected-resource/account/mcp");
     } finally {
       h.cleanup();
     }
