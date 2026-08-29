@@ -21,15 +21,21 @@
  * version order. Merging rc.6 and then rc.5 would leave the `rc` dist-tag
  * pointing at rc.5 — older than what consumers already had — so an operator
  * installing `@rc` would silently DOWNGRADE. We refuse to move a dist-tag
- * backwards. (Re-publishing an older version deliberately is still possible
- * via an explicit tag push, which takes the tag branch below.)
+ * backwards. (Re-publishing an older **rc** deliberately is still possible
+ * via an explicit tag push, which takes the tag branch below. A tag push of
+ * a stable is refused — stables publish from `main` only.)
  *
  * **Stable that skipped rc.** 0.7.13 through 0.7.16 shipped `@latest` with
  * new code and no matching `X.Y.Z-rc.*`. Stable is a suffix-drop from an rc
  * of the same X.Y.Z, never a skip: `decidePublish` refuses a stable unless
  * npm already has that rc, and the CLI refuses again unless `git diff` from
  * the latest matching rc tag only touches version/changelog/lockfile paths.
- * An explicit tag push still overrides — a human saying "release this".
+ *
+ * **Stable from `next` or a tag push.** A write token can merge to `next`
+ * and can push tags; it cannot merge to `main`. So a stable version is
+ * published only when the trigger is a branch push of `main`. `isTagPush`
+ * still overrides the registry guards for **rc** versions (re-release, an
+ * older rc, an ambiguous registry). It does not override this gate.
  */
 
 import { appendFileSync } from "node:fs";
@@ -176,15 +182,28 @@ export function stablePromotionDiffArgs(rcTag: string): string[] {
 }
 
 /**
- * The decision. `isTagPush` short-circuits every check but the shape one — an
- * explicit tag is a human saying "release this", including a deliberate
- * re-release of something older.
+ * The decision. `isTagPush` short-circuits the registry guards for **rc**
+ * versions — an explicit rc tag is a human saying "release this", including
+ * a deliberate re-release of something older. It does **not** short-circuit
+ * the stable-from-main gate: a write token can push a tag, and that is not
+ * the same as merging to `main`.
  */
 export function decidePublish(
   version: string,
   registry: RegistryView | { ambiguous: true },
-  opts: { isTagPush?: boolean } = {},
+  opts: { isTagPush?: boolean; branch?: string } = {},
 ): PublishDecision {
+  // Stables publish from `main` only. Checked first so a tag push of
+  // `vX.Y.Z` (or a suffix-drop merged to `next`) cannot promote `@latest`.
+  if (distTagFor(version) !== "rc") {
+    const fromMain = !opts.isTagPush && opts.branch === "main";
+    if (!fromMain) {
+      return {
+        publish: false,
+        reason: `${version} is a stable version — stable promotions publish from main only (not next, not a tag push)`,
+      };
+    }
+  }
   if (opts.isTagPush) {
     return { publish: true, reason: `explicit tag push for ${version}` };
   }
@@ -346,6 +365,7 @@ if (import.meta.main) {
   const registry = await readRegistry(npmName, version);
   const decision = decidePublish(version, registry, {
     isTagPush: rest.includes("--tag-push"),
+    branch: process.env.GITHUB_REF_NAME,
   });
 
   if ("refuse" in decision) {
