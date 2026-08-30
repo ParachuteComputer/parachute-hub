@@ -26,6 +26,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { schnorr } from "@noble/curves/secp256k1.js";
 import { handleAccountCapabilities } from "../account-api.ts";
+import { ACCOUNT_MCP_HOP_TTL_ENV, _resetAccountMcpHopCacheForTests } from "../account-mcp-hop.ts";
 import {
   accountMcpProtectedResource,
   challengePrmPath,
@@ -2369,6 +2370,72 @@ describe("account MCP — grant-access", () => {
       ).toBe("username_taken");
       expect(findPubkeyLink(h.db, OTHER_PUBKEY)).toBeNull();
     } finally {
+      h.cleanup();
+    }
+  });
+});
+
+describe("account MCP — hop JWT reuse (hub#918)", () => {
+  function restoreHopEnv(prev: string | undefined): void {
+    if (prev === undefined) delete process.env[ACCOUNT_MCP_HOP_TTL_ENV];
+    else process.env[ACCOUNT_MCP_HOP_TTL_ENV] = prev;
+    _resetAccountMcpHopCacheForTests();
+  }
+
+  function countingFetch(): { bearers: Set<string>; fetchImpl: typeof fetch } {
+    const bearers = new Set<string>();
+    const fetchImpl = (input: string | URL | Request, init?: RequestInit) => {
+      const headers = input instanceof Request ? input.headers : new Headers(init?.headers);
+      const auth = headers.get("authorization");
+      if (auth) bearers.add(auth);
+      return routeVaultMcp(input, init);
+    };
+    return { bearers, fetchImpl: fetchImpl as typeof fetch };
+  }
+
+  test("default: two list-tags calls mint a fresh hop JWT per vault RPC", async () => {
+    const h = await makeHarness();
+    const prev = process.env[ACCOUNT_MCP_HOP_TTL_ENV];
+    delete process.env[ACCOUNT_MCP_HOP_TTL_ENV];
+    _resetAccountMcpHopCacheForTests();
+    const { bearers, fetchImpl } = countingFetch();
+    try {
+      const token = await bearer(h, [HOST_ADMIN_SCOPE]);
+      for (let i = 0; i < 2; i++) {
+        const res = await handleAccountMcp(
+          bearerReq(token, rpc("tools/call", { name: "list-tags", arguments: { vault: "beta" } })),
+          mcpDeps(h, { fetchImpl }),
+        );
+        expect(res.status).toBe(200);
+      }
+      // Each tools/call does tools/list (catalog) then tools/call — 4 RPCs,
+      // 4 unregistered 60s mints. That is today's hop, and why manage-token
+      // never sees a repeated principal.
+      expect(bearers.size).toBe(4);
+    } finally {
+      restoreHopEnv(prev);
+      h.cleanup();
+    }
+  });
+
+  test("TTL=300: two list-tags calls share one hop JWT", async () => {
+    const h = await makeHarness();
+    const prev = process.env[ACCOUNT_MCP_HOP_TTL_ENV];
+    process.env[ACCOUNT_MCP_HOP_TTL_ENV] = "300";
+    _resetAccountMcpHopCacheForTests();
+    const { bearers, fetchImpl } = countingFetch();
+    try {
+      const token = await bearer(h, [HOST_ADMIN_SCOPE]);
+      for (let i = 0; i < 2; i++) {
+        const res = await handleAccountMcp(
+          bearerReq(token, rpc("tools/call", { name: "list-tags", arguments: { vault: "beta" } })),
+          mcpDeps(h, { fetchImpl }),
+        );
+        expect(res.status).toBe(200);
+      }
+      expect(bearers.size).toBe(1);
+    } finally {
+      restoreHopEnv(prev);
       h.cleanup();
     }
   });

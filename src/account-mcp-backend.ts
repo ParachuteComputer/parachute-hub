@@ -17,11 +17,16 @@
 import { COMPOSED_VERB_RANK, type ComposedVaultVerb } from "@openparachute/door-contract";
 import type { AccountVaultMeta } from "./account-api.ts";
 import {
+  hopCacheKey,
+  lookupHopToken,
+  parseAccountMcpHopTtl,
+  storeHopToken,
+} from "./account-mcp-hop.ts";
+import {
   ACCOUNT_MCP_CLIENT_ID,
   type AccountToolContext,
   AccountToolError,
   FANOUT_TIMEOUT_MS,
-  FANOUT_TOKEN_TTL_SECONDS,
   HUB_NATIVE_TOOL_NAMES,
   installedVaults,
   resolveCoverage,
@@ -61,7 +66,15 @@ export async function mintVaultMcpToken(
   ctx: AccountToolContext,
   vault: AccountVaultMeta,
   verb: ComposedVaultVerb,
+  env: NodeJS.ProcessEnv = process.env,
 ): Promise<string> {
+  const hop = parseAccountMcpHopTtl(env);
+  const nowMs = (ctx.now?.() ?? new Date()).getTime();
+  const key = hopCacheKey(ctx.principal.userId, vault.name, verb, ctx.issuer);
+  if (hop.reuse) {
+    const cached = lookupHopToken(key, nowMs);
+    if (cached) return cached;
+  }
   const sign = ctx.signToken ?? signAccessToken;
   const minted = await sign(ctx.db, {
     sub: ctx.principal.userId,
@@ -69,10 +82,13 @@ export async function mintVaultMcpToken(
     audience: `vault.${vault.name}`,
     clientId: ACCOUNT_MCP_CLIENT_ID,
     issuer: ctx.issuer,
-    ttlSeconds: FANOUT_TOKEN_TTL_SECONDS,
+    ttlSeconds: hop.ttlSeconds,
     vaultScope: [vault.name],
     ...(ctx.now !== undefined ? { now: ctx.now } : {}),
   });
+  if (hop.reuse) {
+    storeHopToken(key, minted.token, nowMs + hop.ttlSeconds * 1000, nowMs);
+  }
   return minted.token;
 }
 

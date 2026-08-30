@@ -19,7 +19,9 @@
  * query-notes (the one account overlay) fans out through a 60s
  * `vault:<name>:read` mint to each vault's MCP `query-notes`. A failed
  * vault becomes that vault's `{ vault, error }` — never a whole-call
- * failure.
+ * failure. Opt-in reuse: `PARACHUTE_ACCOUNT_MCP_HOP_TTL_SECONDS` (1..599)
+ * mints once per (user, vault, verb) and reuses until TTL; unset keeps
+ * the per-call 60s hop. See `account-mcp-hop.ts` (hub#918). Default off.
  */
 import type { Database } from "bun:sqlite";
 import {
