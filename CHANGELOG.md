@@ -6,6 +6,40 @@ All notable changes to `@openparachute/hub` are documented here. The format foll
 >
 > This backfill covers the 0.6.x line only. Two pre-existing gaps remain undocumented and are **not** addressed here: the `0.5.13` stable itself (the file's newest entry is `0.5.13-rc.48`, never the stable) and the entire `0.5.14-rc` chain (rc.1–rc.21 on npm), which never promoted to a `0.5.14` stable — its work folded forward into 0.6.0.
 
+## [0.7.19-rc.2] - 2026-08-30
+
+**Release-gate, hop reuse, first-publish skip, and linkage follow-ups.**
+Five PRs on `next` after 0.7.19-rc.1. Version bump only; no new code in
+this commit. Merging this to `next` publishes `@rc` (hub#911 — no
+next→main hop).
+
+- **Release paths include CHANGELOG.md (#927).** A promotion merge that
+  does not touch `package.json` still fires the Release workflow. Hub
+  0.7.18's first publish-from-main never ran for exactly this reason.
+
+- **Optional account-MCP hop-JWT reuse (#929, hub#918).** Unset = today's
+  per-call 60s mint. `PARACHUTE_ACCOUNT_MCP_HOP_TTL_SECONDS=N` (1..599)
+  reuses one unregistered mint per `(user, vault, verb, issuer)` until
+  TTL. Invalid/junk env fail-closed to 60s. Default unchanged; no wire
+  flip. Issue #918 stays open (vault scope-guard revoke lag).
+
+- **Skip a first publish out of a merge (#930, surface#220).** A
+  never-published package skips on a branch push — npm trusted
+  publishing cannot create a package. `{ambiguous:true}` still refuses.
+  An rc tag-push still tries.
+
+- **Pubkey-linkage follow-ups (#932, closes #861 #862).** Re-verify with
+  no label keeps the stored one; explicit null/empty still clears.
+  `openHubDb` sets `PRAGMA busy_timeout = 5000` (SQLite default was 0).
+  #859 needed no code — already fixed by #866.
+
+- **Docs/copy (#933, closes #853).** Admin-lock comment four→three
+  handlers. Wizard vault-name preview no longer advertises
+  `/vault/<name>/mcp` two screens before the done screen leads with
+  root `/mcp`.
+
+Do not suffix-drop 0.7.19 until this rc has lived.
+
 ## [0.7.19-rc.1] - 2026-08-30
 
 **Account key-link ceremony UI and NIP-98 XFP trust boundary.** Two PRs
