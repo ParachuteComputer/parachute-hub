@@ -1,5 +1,6 @@
-# Release workflow — triggered by a merge to `main` (hub#790), or by pushing a
-# semver tag.
+# Release workflow — triggered by a merge to `next` or `main` (hub#790, and
+# the `next` trigger added when the rc cut stopped needing a `next`→`main`
+# hop of its own), or by pushing a semver tag.
 #
 # This workflow publishes FOUR packages on different tag namespaces:
 #
@@ -26,16 +27,19 @@
 #                                    (door-contract-v0.6.0)
 #
 # Release flow (publish-on-merge — the tag path below still works, see `plan`):
-#   1. When ready to ship: open a release PR bumping `version` in the relevant
-#      package.json (root for hub, packages/scope-guard/ for scope-guard,
-#      packages/depcheck/ for depcheck, packages/door-contract/ for
-#      door-contract).
+#   1. Cutting an rc: open a release PR bumping `version` to an `-rc.N`
+#      shape, targeting `next` directly — no `next`→`main` hop needed just
+#      to publish an rc. Promoting to stable: same shape, but the PR targets
+#      `main` and drops the `-rc.N` suffix; `plan` refuses it unless npm
+#      already has that core version as an rc AND the diff from that rc tag
+#      is version/changelog/lockfile only (RELEASING.md).
 #   2. Merge it. That IS the release signal — `plan` compares each
 #      package.json against npm and publishes what's new.
 #   3. CI runs tests once (workspace-wide), then publishes whichever packages
 #      `plan` selected. Hub also publishes a container image to ghcr.io, tagged
 #      from the published VERSION (`:vX.Y.Z` + `:rc`/`:stable` + `:latest`) —
-#      not from the ref, which on a merge run is just `main` (hub#829).
+#      not from the ref, which on a merge run is just the branch name
+#      (`next` or `main`), never a version (hub#829).
 #   4. `tag-record` pushes `vX.Y.Z` afterwards as a RECORD of what shipped.
 #      Nothing needs to be tagged by hand.
 #
@@ -52,8 +56,25 @@ on:
     # hub#790: publish-on-merge. See the `plan` job for why the tag was
     # replaced as the release SIGNAL (it's still honoured, and still cut as a
     # record).
+    #
+    # `next` publishes rc's directly (no more next→main hop just to cut an
+    # rc). `decidePublish` is idempotent on an already-published version,
+    # refuses to move a dist-tag backwards, refuses a `latest` publish unless
+    # npm already has a matching `-rc.*` and the diff is a pure suffix-drop,
+    # AND refuses a stable unless the trigger is a branch push of `main`.
+    # Matching-rc + suffix-drop alone is not enough: after an rc lands on
+    # `next`, a version/changelog-only promotion PR targeting `next` would
+    # pass those two and publish `@latest`. The `paths` filter below means
+    # an ordinary feature merge (no version bump) never even runs this
+    # workflow a second time — `pr-verify.yml` already tested it before merge.
     branches:
       - main
+      - next
+    paths:
+      - 'package.json'
+      - 'packages/scope-guard/package.json'
+      - 'packages/depcheck/package.json'
+      - 'packages/door-contract/package.json'
     tags:
       # Hub release tags
       - 'v[0-9]+.[0-9]+.[0-9]+'
@@ -88,10 +109,12 @@ jobs:
   # `scripts/release-plan.ts` (unit-tested — release logic that can
   # double-publish or drop a release shouldn't be untested shell in a `run:`).
   #
-  # Note the tag-push path: an explicit tag still publishes, and passes
-  # `--tag-push` so `decidePublish`'s tag short-circuit overrides every
-  # refuse-guard (an ambiguous registry response, an older-than-published
-  # version) — because a tag is a human saying "release this". hub#841.
+  # Note the tag-push path: an explicit **rc** tag still publishes, and
+  # passes `--tag-push` so `decidePublish`'s tag short-circuit overrides the
+  # registry refuse-guards (an ambiguous registry response, an
+  # older-than-published rc) — because an rc tag is a human saying "release
+  # this rc". hub#841. A tag push of a stable is refused; stables publish
+  # from `main` only. A write token can push a tag; it cannot merge to `main`.
   # ---------------------------------------------------------------------------
   plan:
     name: plan
@@ -180,7 +203,10 @@ jobs:
     name: publish hub to npm
     needs: [plan, test]
     # Hub-only: skip on scope-guard / depcheck / door-contract tags (a `v*` tag is hub's).
-    if: ${{ (github.ref_type == 'tag' && (!startsWith(github.ref_name, 'scope-guard-') && !startsWith(github.ref_name, 'depcheck-') && !startsWith(github.ref_name, 'door-contract-'))) || (github.ref_type != 'tag' && needs.plan.outputs.hub == 'true') }}
+    # Plan is consulted on tag pushes too — a tag is not a bypass of the
+    # stable-from-main gate. The prefix clause still stops a scope-guard
+    # tag from also publishing hub (all four plan steps run --tag-push).
+    if: ${{ needs.plan.outputs.hub == 'true' && (github.ref_type != 'tag' || (!startsWith(github.ref_name, 'scope-guard-') && !startsWith(github.ref_name, 'depcheck-') && !startsWith(github.ref_name, 'door-contract-'))) }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -242,8 +268,9 @@ jobs:
   publish-scope-guard-npm:
     name: publish scope-guard to npm
     needs: [plan, test]
-    # scope-guard-only: skip on hub (`v*`) tags.
-    if: ${{ (github.ref_type == 'tag' && (startsWith(github.ref_name, 'scope-guard-'))) || (github.ref_type != 'tag' && needs.plan.outputs.scope_guard == 'true') }}
+    # scope-guard-only: skip on hub (`v*`) tags. Plan is consulted on tag
+    # pushes too — a tag is not a bypass of the stable-from-main gate.
+    if: ${{ needs.plan.outputs.scope_guard == 'true' && (github.ref_type != 'tag' || startsWith(github.ref_name, 'scope-guard-')) }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -300,8 +327,9 @@ jobs:
   publish-depcheck-npm:
     name: publish depcheck to npm
     needs: [plan, test]
-    # depcheck-only: skip on hub (`v*`) + scope-guard tags.
-    if: ${{ (github.ref_type == 'tag' && (startsWith(github.ref_name, 'depcheck-'))) || (github.ref_type != 'tag' && needs.plan.outputs.depcheck == 'true') }}
+    # depcheck-only: skip on hub (`v*`) + scope-guard tags. Plan is consulted
+    # on tag pushes too — a tag is not a bypass of the stable-from-main gate.
+    if: ${{ needs.plan.outputs.depcheck == 'true' && (github.ref_type != 'tag' || startsWith(github.ref_name, 'depcheck-')) }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -359,7 +387,9 @@ jobs:
     name: publish door-contract to npm
     needs: [plan, test]
     # door-contract-only: skip on hub (`v*`) + scope-guard + depcheck tags.
-    if: ${{ (github.ref_type == 'tag' && (startsWith(github.ref_name, 'door-contract-'))) || (github.ref_type != 'tag' && needs.plan.outputs.door_contract == 'true') }}
+    # Plan is consulted on tag pushes too — a tag is not a bypass of the
+    # stable-from-main gate.
+    if: ${{ needs.plan.outputs.door_contract == 'true' && (github.ref_type != 'tag' || startsWith(github.ref_name, 'door-contract-')) }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -417,7 +447,9 @@ jobs:
     name: publish to ghcr.io
     needs: [plan, test]
     # Hub-only: scope-guard / depcheck / door-contract don't ship a container image.
-    if: ${{ (github.ref_type == 'tag' && (!startsWith(github.ref_name, 'scope-guard-') && !startsWith(github.ref_name, 'depcheck-') && !startsWith(github.ref_name, 'door-contract-'))) || (github.ref_type != 'tag' && needs.plan.outputs.hub == 'true') }}
+    # Plan is consulted on tag pushes too — a tag is not a bypass of the
+    # stable-from-main gate (same shape as publish-hub-npm).
+    if: ${{ needs.plan.outputs.hub == 'true' && (github.ref_type != 'tag' || (!startsWith(github.ref_name, 'scope-guard-') && !startsWith(github.ref_name, 'depcheck-') && !startsWith(github.ref_name, 'door-contract-'))) }}
     runs-on: ubuntu-latest
     permissions:
       contents: read

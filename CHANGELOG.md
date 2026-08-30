@@ -6,6 +6,54 @@ All notable changes to `@openparachute/hub` are documented here. The format foll
 >
 > This backfill covers the 0.6.x line only. Two pre-existing gaps remain undocumented and are **not** addressed here: the `0.5.13` stable itself (the file's newest entry is `0.5.13-rc.48`, never the stable) and the entire `0.5.14-rc` chain (rc.1–rc.21 on npm), which never promoted to a `0.5.14` stable — its work folded forward into 0.6.0.
 
+## [0.7.18] - 2026-08-29
+
+**Stable promotion of 0.7.18-rc.10.** No new code. Suffix-drop only. npm `@rc`
+is 0.7.18-rc.10; this is the matching `@latest`.
+
+The 0.7.18 line (rc.1-rc.10) ships key-as-account: a Nostr key is now a
+first-class hub identity. NIP-98 request auth (#882) and the account-MCP
+door (#883); NIP-98 accepted at root `/mcp` plus grant-vault-access by
+pubkey (#888, #889); OAuth `account:vaults` and account-MCP at root `/mcp`
+(#892) with create-note / update-note / query-notes forwarding (#893, #896,
+#907); the consent-picker XOR (#901) and `account:self:*` extras minting
+alongside `account:vaults` (#904); account-MCP proxies vault MCP instead of
+cloning REST (#910); NIP-98 `u`-tag honors `X-Forwarded-Proto` behind a
+TLS-terminating proxy (#914). Also in this line: person-mint `users.id`,
+Account SPA, leftover CAS (#872, #874, #875); rc cuts publish directly from
+`next` (#911) and stables publish from `main` only (#913).
+
+Auto-provision stays off by default: an unlinked key gets nothing unless
+granted or `PARACHUTE_NOSTR_AUTO_PROVISION=1`. Leaves #880, #881, #899 open.
+
+## [0.7.18-rc.10] - 2026-08-29
+
+**Two security/correctness fixes from tonight's release-automation hardening pass.** Version bump only; no new code in this commit. Merging this to `next` publishes `@rc` (hub#911 — no next→main hop).
+
+- **Stables publish from `main` only — not `next`, not a tag push (#913).** `decidePublish()` previously had no branch check, only "does a matching rc already exist on npm." With an rc already published, an ordinary version/changelog-only PR merged to `next` could have published straight to `@latest`, bypassing `main`'s branch protection entirely (branch protection never covered `next` or tags). Checked first now, before any other rule.
+- **NIP-98 `u` tag honors `X-Forwarded-Proto` behind a TLS-terminating reverse proxy (#914).** Tailscale Serve (and cloudflared, and Render) terminate TLS and forward plain HTTP; hub saw `http://…` while a client correctly signed `https://…`, so every NIP-98 request through such a proxy 401'd with `url_mismatch`. Reuses `isHttpsRequest()`, the same helper `resolveIssuer` already trusts for the cookie-`Secure` decision — not new trust surface. Host/path stay bound to `req.url`, not `X-Forwarded-Host`, so loopback NIP-98 stays loopback.
+
+## [0.7.18-rc.9] - 2026-08-29
+
+**Account-MCP proxies vault MCP.** Two PRs on `next` after
+0.7.18-rc.8. Version bump only; no new code in this commit. Merging
+this to `next` publishes `@rc` (hub#911 — no next→main hop).
+
+- **Account-MCP proxies vault MCP instead of cloning REST (#910).**
+  Hub-native tools stay (`list-vaults`, `create-vault`,
+  grant/revoke/list-access). Vault-shaped tools are a live `tools/list`
+  from one covered vault (highest verb, fallback if that vault is down)
+  plus JSON-RPC `tools/call` to `/vault/<name>/mcp` with a 60s mint.
+  `query-notes` without `vault` still fans out; the envelope is
+  unchanged. Per-vault `/vault/<name>/mcp` stays.
+
+- **Rc cuts publish from `next` (#911).** `release.yml` now triggers
+  on `next` as well as `main`, with a `paths` filter on the four
+  package.json files. This is the first rc that uses that path.
+
+Leaves #880, #881, and #899 open. Auto-provision still defaults off. Do
+not suffix-drop 0.7.18.
+
 ## [0.7.18-rc.8] - 2026-08-28
 
 **Account-MCP query-notes sort + bodies.** One PR on `next` after

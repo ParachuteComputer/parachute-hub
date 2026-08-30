@@ -2,13 +2,11 @@
  * Account-level MCP tools for the self-host hub — the payload behind
  * `/account/mcp`.
  *
- * Cloud's twin lives in the identity worker (`account-mcp.ts`). Coverage tools
- * (list-vaults, create-vault, query-notes) plus hub-only grant-access /
- * revoke-access / list-access (pubkey → one `user_vaults` row). create-note /
- * update-note write one vault: `vault` is required, write is checked per call,
- * a 60s `vault:<name>:write` mint fans to REST (POST /api/notes, PATCH
- * /api/notes/:id). Cloud grants are D1-ownership shaped, not `user_vaults`.
- * Coverage is hub-shaped:
+ * Hub-native tools live here (list-vaults, create-vault, grant/revoke/
+ * list-access). Vault-shaped tools are a live `tools/list` + JSON-RPC
+ * proxy (`account-mcp-backend.ts`) onto `/vault/<name>/mcp` — not REST
+ * clones. Cloud's twin in the identity worker is still a REST facade and
+ * is out of this cut. Coverage is hub-shaped:
  *
  *   - Bearer is the cloud-shaped connection grant: `account:self:vaults`
  *     (legacy blanket / narrowed) or composed `account:self:vaults:*:<verb>`,
@@ -18,9 +16,9 @@
  *     else → `user_vaults` ∩ services.json (fail-closed; read verb required).
  *     Auto-provisioned key-only users have no rows → empty list, no create.
  *
- * query-notes fans out through a 60s `vault:<name>:read` mint, the same
- * authority `account-usage.ts` already uses for the friend home tiles. A
- * failed vault becomes that vault's `{ vault, error }` — never a whole-call
+ * query-notes (the one account overlay) fans out through a 60s
+ * `vault:<name>:read` mint to each vault's MCP `query-notes`. A failed
+ * vault becomes that vault's `{ vault, error }` — never a whole-call
  * failure.
  */
 import type { Database } from "bun:sqlite";
@@ -41,20 +39,17 @@ import {
   listAccess,
   revokeAccess,
 } from "./grant-access.ts";
-import { signAccessToken } from "./jwt-sign.ts";
+import type { SignAccessTokenOpts } from "./jwt-sign.ts";
 import { getUserById, isFirstAdmin, vaultVerbsForUserVault } from "./users.ts";
 
 /** Hub account sentinel — account ≡ box. */
 export const HUB_ACCOUNT_ID = "self";
 
-/** Per-vault timeout for the query-notes fan-out. */
+/** Per-vault timeout for MCP JSON-RPC forwards and query-notes fan-out. */
 export const FANOUT_TIMEOUT_MS = 10_000;
 
-/** Per-vault `limit` ceiling on a fan-out query. */
-export const MAX_NOTES_LIMIT = 100;
-
-const ACCOUNT_MCP_CLIENT_ID = "parachute-account";
-const FANOUT_TOKEN_TTL_SECONDS = 60;
+export const ACCOUNT_MCP_CLIENT_ID = "parachute-account";
+export const FANOUT_TOKEN_TTL_SECONDS = 60;
 
 export type AccountMcpAuthKind = "bearer" | "nostr";
 
@@ -105,7 +100,7 @@ export interface AccountToolContext {
     stderr: string;
   }>;
   fetchImpl?: (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
-  signToken?: typeof signAccessToken;
+  signToken?: (db: Database, opts: SignAccessTokenOpts) => Promise<{ token: string }>;
 }
 
 export interface AccountMcpTool {
@@ -213,7 +208,7 @@ export function resolveCoverage(
   return { covered: "listed", vaults, names: vaults.map((v) => v.name), create };
 }
 
-function installedVaults(ctx: AccountToolContext): AccountVaultMeta[] {
+export function installedVaults(ctx: AccountToolContext): AccountVaultMeta[] {
   return listVaultsWithMeta(ctx.manifestPath, ctx.issuer);
 }
 
@@ -248,6 +243,13 @@ export function canWriteVault(
   }
   if (isUnrestricted(db, principal)) return true;
   return vaultVerbsForUserVault(db, principal.userId, vaultName)?.includes("write") === true;
+}
+
+/** Highest verb this principal actually holds on `vaultName`. */
+export function verbForVault(ctx: AccountToolContext, vaultName: string): ComposedVaultVerb {
+  if (callerCanAdminVault(ctx.db, ctx.principal, vaultName)) return "admin";
+  if (canWriteVault(ctx.db, ctx.principal, vaultName)) return "write";
+  return "read";
 }
 
 const listVaultsTool: AccountMcpTool = {
@@ -311,371 +313,6 @@ const createVaultTool: AccountMcpTool = {
       throw new AccountToolError("vault_taken", "That vault name is already taken.");
     }
     return { name: provisioned.entry.name, url: provisioned.entry.url };
-  },
-};
-
-type VaultQueryEntry = { vault: string; notes: unknown } | { vault: string; error: string };
-
-function buildNotesQuery(args: Record<string, unknown>): string {
-  const p = new URLSearchParams();
-  if (typeof args.search === "string" && args.search.length > 0) p.set("search", args.search);
-  const rawTags = Array.isArray(args.tag)
-    ? args.tag
-    : typeof args.tag === "string"
-      ? [args.tag]
-      : [];
-  for (const t of rawTags) if (typeof t === "string" && t.length > 0) p.append("tag", t);
-  if (args.metadata && typeof args.metadata === "object")
-    p.set("metadata", JSON.stringify(args.metadata));
-  const rawLimit =
-    typeof args.limit === "number"
-      ? args.limit
-      : typeof args.limit === "string"
-        ? Number.parseInt(args.limit, 10)
-        : undefined;
-  if (rawLimit !== undefined && Number.isFinite(rawLimit)) {
-    const clamped = Math.min(Math.max(1, Math.floor(rawLimit)), MAX_NOTES_LIMIT);
-    p.set("limit", String(clamped));
-  }
-  // Vault REST defaults: created_at ASC, lean ~120-char preview. Forward the
-  // params that make "latest notes with bodies" expressible. Unknown sort is
-  // dropped rather than 400'd so a hallucinated value does not fail the fan-out.
-  if (args.sort === "asc" || args.sort === "desc") p.set("sort", args.sort);
-  if (typeof args.order_by === "string" && args.order_by.length > 0) {
-    p.set("order_by", args.order_by);
-  }
-  if (args.include_content === true || args.include_content === "true") {
-    p.set("include_content", "true");
-  } else if (args.include_content === false || args.include_content === "false") {
-    p.set("include_content", "false");
-  }
-  const rawOffset =
-    typeof args.offset === "number"
-      ? args.offset
-      : typeof args.offset === "string"
-        ? Number.parseInt(args.offset, 10)
-        : undefined;
-  if (rawOffset !== undefined && Number.isFinite(rawOffset) && rawOffset >= 0) {
-    p.set("offset", String(Math.floor(rawOffset)));
-  }
-  return p.toString();
-}
-
-async function queryOneVault(
-  ctx: AccountToolContext,
-  vault: AccountVaultMeta,
-  args: Record<string, unknown>,
-): Promise<VaultQueryEntry> {
-  const sign = ctx.signToken ?? signAccessToken;
-  const fetchImpl = ctx.fetchImpl ?? fetch;
-  const qs = buildNotesQuery(args);
-  const minted = await sign(ctx.db, {
-    sub: ctx.principal.userId,
-    scopes: [`vault:${vault.name}:read`],
-    audience: `vault.${vault.name}`,
-    clientId: ACCOUNT_MCP_CLIENT_ID,
-    issuer: ctx.issuer,
-    ttlSeconds: FANOUT_TOKEN_TTL_SECONDS,
-    vaultScope: [vault.name],
-    ...(ctx.now !== undefined ? { now: ctx.now } : {}),
-  });
-  const origin =
-    typeof vault.port === "number" && vault.port > 0
-      ? `http://127.0.0.1:${vault.port}`
-      : vault.url.replace(/\/vault\/[^/]+\/?$/, "");
-  const url = `${origin.replace(/\/$/, "")}/vault/${vault.name}/api/notes${qs ? `?${qs}` : ""}`;
-  const res = await fetchImpl(url, {
-    headers: { authorization: `Bearer ${minted.token}`, accept: "application/json" },
-    signal: AbortSignal.timeout(FANOUT_TIMEOUT_MS),
-  });
-  if (!res.ok) {
-    let detail = `vault responded ${res.status}`;
-    try {
-      const body = (await res.json()) as Record<string, unknown>;
-      if (typeof body.error === "string") detail = body.error;
-    } catch {
-      // Non-JSON error body — keep the status-only detail.
-    }
-    return { vault: vault.name, error: detail };
-  }
-  const notes = await res.json();
-  return { vault: vault.name, notes };
-}
-
-async function fanOut(
-  ctx: AccountToolContext,
-  targets: AccountVaultMeta[],
-  args: Record<string, unknown>,
-): Promise<VaultQueryEntry[]> {
-  const settled = await Promise.allSettled(targets.map((v) => queryOneVault(ctx, v, args)));
-  return settled.map((s, i) =>
-    s.status === "fulfilled"
-      ? s.value
-      : {
-          vault: targets[i]!.name,
-          error: s.reason instanceof Error ? s.reason.message : "query failed",
-        },
-  );
-}
-
-const queryNotesTool: AccountMcpTool = {
-  name: "query-notes",
-  description:
-    "Search notes across the vaults this connection can reach. Omit `vault` to fan the query out " +
-    "(results are grouped per vault, not ranked across vaults); pass `vault` to target one. " +
-    "Default order is created_at ASC (oldest first) and the lean ~120-char preview — pass " +
-    '`sort: "desc"` for newest-first and `include_content: true` for bodies. Also: keyword ' +
-    "`search`, `tag`, `metadata`, `limit` (per vault, default 50), `order_by` (`updated_at` or " +
-    "an indexed field), `offset`.",
-  inputSchema: {
-    type: "object",
-    properties: {
-      vault: {
-        type: "string",
-        description:
-          "Target a single vault by name. Must be one of the reachable vaults. Omit to query all.",
-      },
-      search: { type: "string", description: "Full-text keyword query." },
-      tag: {
-        type: ["string", "array"],
-        items: { type: "string" },
-        description: "Restrict to notes carrying this tag (or any of these tags).",
-      },
-      metadata: {
-        type: "object",
-        description: 'Structured metadata filters, e.g. {"status":{"eq":"open"}}.',
-      },
-      limit: { type: "number", description: "Maximum notes per vault (default 50)." },
-      sort: {
-        type: "string",
-        enum: ["asc", "desc"],
-        description: "Order by created_at. Default asc (oldest first). Pass desc for newest first.",
-      },
-      order_by: {
-        type: "string",
-        description:
-          "Sort by this field instead of created_at. `updated_at` needs no schema; other " +
-          "fields must be indexed on the target vault.",
-      },
-      include_content: {
-        type: "boolean",
-        description: "Return full note bodies. Default false: lean rows with a ~120-char preview.",
-      },
-      offset: {
-        type: "number",
-        description: "Skip this many notes per vault (default 0).",
-      },
-    },
-    additionalProperties: false,
-  },
-  async execute(args, ctx) {
-    const coverage = resolveCoverage(ctx.db, ctx.principal, installedVaults(ctx));
-    let targets = coverage.vaults;
-    if (typeof args.vault === "string" && args.vault.length > 0) {
-      const wanted = args.vault.toLowerCase();
-      const hit = coverage.vaults.find((v) => v.name === wanted);
-      if (!hit) {
-        throw new AccountToolError(
-          "vault_not_covered",
-          `Vault "${args.vault}" is not among the vaults this connection can reach.`,
-        );
-      }
-      targets = [hit];
-    }
-    const results = await fanOut(ctx, targets, args);
-    return { vaults_queried: targets.map((v) => v.name), results };
-  },
-};
-
-function noteWriteBody(args: Record<string, unknown>): Record<string, unknown> {
-  const body: Record<string, unknown> = {};
-  if (typeof args.content === "string") body.content = args.content;
-  if (typeof args.path === "string") body.path = args.path;
-  if (Array.isArray(args.tags)) body.tags = args.tags;
-  if (args.metadata && typeof args.metadata === "object") body.metadata = args.metadata;
-  if (typeof args.if_exists === "string") body.if_exists = args.if_exists;
-  return body;
-}
-
-function noteUpdateBody(args: Record<string, unknown>): Record<string, unknown> {
-  const body: Record<string, unknown> = {};
-  if (typeof args.content === "string") body.content = args.content;
-  if (typeof args.append === "string") body.append = args.append;
-  if (typeof args.prepend === "string") body.prepend = args.prepend;
-  if (args.content_edit && typeof args.content_edit === "object")
-    body.content_edit = args.content_edit;
-  if (typeof args.path === "string") body.path = args.path;
-  if (args.tags && typeof args.tags === "object") body.tags = args.tags;
-  if (args.metadata && typeof args.metadata === "object" && args.metadata !== null) {
-    body.metadata = args.metadata;
-  }
-  if (typeof args.if_updated_at === "string") body.if_updated_at = args.if_updated_at;
-  if (args.force === true) body.force = true;
-  if (typeof args.if_missing === "string") body.if_missing = args.if_missing;
-  return body;
-}
-
-function requireWritableVault(ctx: AccountToolContext, rawVault: unknown): AccountVaultMeta {
-  if (typeof rawVault !== "string" || rawVault.length === 0) {
-    throw new AccountToolError("invalid_vault", "vault is required.");
-  }
-  const coverage = resolveCoverage(ctx.db, ctx.principal, installedVaults(ctx));
-  const wanted = rawVault.toLowerCase();
-  const hit = coverage.vaults.find((v) => v.name === wanted);
-  if (!hit) {
-    throw new AccountToolError(
-      "vault_not_covered",
-      `Vault "${rawVault}" is not among the vaults this connection can reach.`,
-    );
-  }
-  if (!canWriteVault(ctx.db, ctx.principal, hit.name)) {
-    throw new AccountToolError(
-      "write_not_granted",
-      `This connection cannot write vault "${hit.name}".`,
-    );
-  }
-  return hit;
-}
-
-async function vaultNoteWrite(
-  ctx: AccountToolContext,
-  vault: AccountVaultMeta,
-  opts: { method: string; path: string; body: Record<string, unknown> },
-): Promise<unknown> {
-  const sign = ctx.signToken ?? signAccessToken;
-  const fetchImpl = ctx.fetchImpl ?? fetch;
-  const minted = await sign(ctx.db, {
-    sub: ctx.principal.userId,
-    scopes: [`vault:${vault.name}:write`],
-    audience: `vault.${vault.name}`,
-    clientId: ACCOUNT_MCP_CLIENT_ID,
-    issuer: ctx.issuer,
-    ttlSeconds: FANOUT_TOKEN_TTL_SECONDS,
-    vaultScope: [vault.name],
-    ...(ctx.now !== undefined ? { now: ctx.now } : {}),
-  });
-  const origin =
-    typeof vault.port === "number" && vault.port > 0
-      ? `http://127.0.0.1:${vault.port}`
-      : vault.url.replace(/\/vault\/[^/]+\/?$/, "");
-  const url = `${origin.replace(/\/$/, "")}/vault/${vault.name}${opts.path}`;
-  const res = await fetchImpl(url, {
-    method: opts.method,
-    headers: {
-      authorization: `Bearer ${minted.token}`,
-      accept: "application/json",
-      "content-type": "application/json",
-    },
-    body: JSON.stringify(opts.body),
-    signal: AbortSignal.timeout(FANOUT_TIMEOUT_MS),
-  });
-  if (!res.ok) {
-    let detail = `vault responded ${res.status}`;
-    try {
-      const errBody = (await res.json()) as Record<string, unknown>;
-      if (typeof errBody.error === "string") detail = errBody.error;
-      else if (typeof errBody.error_type === "string") detail = errBody.error_type;
-    } catch {
-      // Non-JSON error body — keep the status-only detail.
-    }
-    throw new AccountToolError("vault_error", detail, { status: res.status, vault: vault.name });
-  }
-  return res.json();
-}
-
-const createNoteTool: AccountMcpTool = {
-  name: "create-note",
-  description:
-    "Create a note in one vault this connection can write. `vault` is required — this " +
-    "door does not invent a target. Does not return a vault token.",
-  inputSchema: {
-    type: "object",
-    properties: {
-      vault: {
-        type: "string",
-        description: "Target vault by name. Must be a reachable vault this connection can write.",
-      },
-      content: { type: "string", description: "Note body (markdown)." },
-      path: { type: "string", description: "Note path (e.g. 'Log/hello')." },
-      tags: { type: "array", items: { type: "string" }, description: "Tags to apply." },
-      metadata: { type: "object", description: "Metadata fields to set." },
-      if_exists: {
-        type: "string",
-        enum: ["error", "ignore", "update", "replace"],
-        description: "What to do when `path` already names a note. Default error.",
-      },
-    },
-    required: ["vault"],
-    additionalProperties: false,
-  },
-  async execute(args, ctx) {
-    const hit = requireWritableVault(ctx, args.vault);
-    const note = await vaultNoteWrite(ctx, hit, {
-      method: "POST",
-      path: "/api/notes",
-      body: noteWriteBody(args),
-    });
-    return { vault: hit.name, note };
-  },
-};
-
-const updateNoteTool: AccountMcpTool = {
-  name: "update-note",
-  description:
-    "Update a note in one vault this connection can write. `vault` and `id` are required. " +
-    "Same body as vault PATCH /api/notes/:id (content / append / prepend / content_edit / " +
-    "path / tags / metadata / if_updated_at / force). Does not return a vault token.",
-  inputSchema: {
-    type: "object",
-    properties: {
-      vault: {
-        type: "string",
-        description: "Target vault by name. Must be a reachable vault this connection can write.",
-      },
-      id: {
-        type: "string",
-        description: "Note ID or path in that vault.",
-      },
-      content: { type: "string", description: "Full content replace." },
-      append: { type: "string", description: "Append to the end of the note." },
-      prepend: { type: "string", description: "Prepend to the start of the note." },
-      content_edit: {
-        type: "object",
-        properties: {
-          old_text: { type: "string" },
-          new_text: { type: "string" },
-        },
-        required: ["old_text", "new_text"],
-        description: "Find-and-replace one occurrence.",
-      },
-      path: { type: "string", description: "New path." },
-      tags: { type: "object", description: "Tag mutations `{ add, remove }`." },
-      metadata: { type: "object", description: "Metadata merge-patch." },
-      if_updated_at: {
-        type: "string",
-        description: "Optimistic concurrency: reject if the note changed since.",
-      },
-      force: { type: "boolean", description: "Waive if_updated_at requirement." },
-      if_missing: {
-        type: "string",
-        enum: ["fail", "create"],
-        description: "What to do when the note does not exist. Default fail.",
-      },
-    },
-    required: ["vault", "id"],
-    additionalProperties: false,
-  },
-  async execute(args, ctx) {
-    if (typeof args.id !== "string" || args.id.length === 0) {
-      throw new AccountToolError("invalid_id", "id is required.");
-    }
-    const hit = requireWritableVault(ctx, args.vault);
-    const note = await vaultNoteWrite(ctx, hit, {
-      method: "PATCH",
-      path: `/api/notes/${encodeURIComponent(args.id)}`,
-      body: noteUpdateBody(args),
-    });
-    return { vault: hit.name, note };
   },
 };
 
@@ -778,32 +415,32 @@ const listAccessTool: AccountMcpTool = {
   },
 };
 
-/** Order is stable so `tools/list` is deterministic. */
+/** Hub-native catalog. Vault-shaped tools come from a live module `tools/list`. */
 export const ACCOUNT_MCP_TOOLS: readonly AccountMcpTool[] = [
   listVaultsTool,
   createVaultTool,
-  queryNotesTool,
-  createNoteTool,
-  updateNoteTool,
   grantAccessTool,
   revokeAccessTool,
   listAccessTool,
 ];
 
+/** Hub-native names win on collision with a module backend. */
+export const HUB_NATIVE_TOOL_NAMES: ReadonlySet<string> = new Set(
+  ACCOUNT_MCP_TOOLS.map((t) => t.name),
+);
+
 /**
- * Catalog filtered by what this principal can actually call. Admin-shaped
- * tools (grant/revoke/list-access) and write tools are invisible below the
- * verb, not just refused. Same pattern as the vault door.
+ * Hub-native catalog filtered by what this principal can actually call.
+ * Admin-shaped tools are invisible below the verb, not just refused.
+ * Vault-shaped tools are merged in by `account-mcp-http.ts` from a live list.
  */
 export function toolsForPrincipal(ctx: AccountToolContext): readonly AccountMcpTool[] {
   const installed = installedVaults(ctx);
   const coverage = resolveCoverage(ctx.db, ctx.principal, installed);
-  const canWrite = coverage.vaults.some((v) => canWriteVault(ctx.db, ctx.principal, v.name));
   const canAdmin = coverage.vaults.some((v) => callerCanAdminVault(ctx.db, ctx.principal, v.name));
   const create = canCreate(ctx.principal);
   return ACCOUNT_MCP_TOOLS.filter((t) => {
     if (t.name === "create-vault") return create;
-    if (t.name === "create-note" || t.name === "update-note") return canWrite;
     if (t.name === "grant-access" || t.name === "revoke-access" || t.name === "list-access") {
       return canAdmin;
     }

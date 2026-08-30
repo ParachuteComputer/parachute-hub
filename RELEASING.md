@@ -9,9 +9,9 @@ This repo publishes FOUR npm packages on independent release cadences via [`.git
 | `@openparachute/depcheck` | `depcheck-v...` (e.g. `depcheck-v0.1.1`) | no |
 | `@openparachute/door-contract` | `door-contract-v...` (e.g. `door-contract-v0.6.0`) | no |
 
-**Merging a version bump to `main` is the release signal** (hub#790). CI runs `bun run typecheck` + the four test suites once, then `scripts/release-plan.ts` compares each `package.json` against npm and publishes whatever is new. Nothing is tagged by hand — the `tag-record` job pushes `vX.Y.Z` afterwards as a record of what shipped.
+**Merging a version bump to `next` or `main` is the release signal** (hub#790, `next` added so an rc cut no longer needs a `next`→`main` hop). CI runs `bun run typecheck` + the four test suites once, then `scripts/release-plan.ts` compares each `package.json` against npm and publishes whatever is new. `next` can only ever produce an rc or an idempotent no-op — `release-plan.ts` refuses a `latest`/stable publish unless the trigger is a branch push of `main` (a write token can merge to `next` and can push tags; it cannot merge to `main`). On `main`, it further refuses a stable unless a matching `-rc.*` is already on npm and the diff from that rc tag is a pure version/changelog/lockfile suffix-drop. Nothing is tagged by hand — the `tag-record` job pushes `vX.Y.Z` afterwards as a record of what shipped.
 
-Pushing a tag is the explicit override: the `plan` job passes `--tag-push`, which makes `release-plan.ts` publish regardless of what the guards would otherwise say — an unpublished-older version, an ambiguous registry response, none of it blocks a tag push, because a tag is a human saying "release this" (hub#841). The one thing a tag can't force is npm itself: republishing an **already-published** version still gets rejected by npm (the npm job goes red — expected), so a deliberate re-release only actually re-pushes the image. The merge path is the normal one; reach for a tag push when you need to bypass the guards on purpose.
+Pushing an **rc** tag is the explicit override for registry guards: the `plan` job passes `--tag-push`, which makes `release-plan.ts` publish an rc regardless of an unpublished-older version or an ambiguous registry response (hub#841). A tag push of a **stable** is refused — stables publish from `main` only. The one thing a tag can't force is npm itself: republishing an **already-published** version still gets rejected by npm (the npm job goes red — expected), so a deliberate re-release of an rc only actually re-pushes the image. The merge path is the normal one.
 
 ## Version conventions
 
@@ -40,20 +40,21 @@ Always cut an **rc** first. Stable is a suffix-drop from that rc, never a
 skip — `release-plan.ts` refuses a stable unless npm already has a matching
 `X.Y.Z-rc.*`, and refuses again unless the tree is a suffix-drop from that
 rc tag (version / changelog / lockfile only). `0.7.13`–`0.7.16` skipped this;
-the hook starts at `0.7.17-rc.1`. An explicit tag push still overrides.
+the hook starts at `0.7.17-rc.1`. An explicit **rc** tag push still overrides the registry guards; a tag push of a stable does not.
 
-Feature work lands on `next`. The rc cut is a version bump on `next`, then
-`next` → `main`. That merge publishes `@rc`.
+Feature work lands on `next`. The rc cut is a version bump PR that targets
+`next` directly — merging it publishes `@rc`. No `next` → `main` hop needed
+just to cut an rc.
 
 ```sh
 git fetch && git checkout -b release/hub-X.Y.Z-rc.N origin/next
 # Bump ./package.json to X.Y.Z-rc.N + CHANGELOG.
 git commit -am "release: hub X.Y.Z-rc.N — <what shipped>"
 gh pr create --base next
-# After that merges: open next → main. That click publishes @rc.
+# Merging this PR publishes @rc.
 ```
 
-Merge the `next` → `main` PR. CI takes over — watch the run at [Actions](https://github.com/ParachuteComputer/parachute-hub/actions). On success:
+Merge the release PR into `next`. CI takes over — watch the run at [Actions](https://github.com/ParachuteComputer/parachute-hub/actions). On success:
 - npm gets the new version with the appropriate dist-tag
 - ghcr gets a new image at `:vX.Y.Z` plus `:rc`, or `:stable` + `:latest`
 - a `vX.Y.Z` git tag is pushed as a record
@@ -133,7 +134,7 @@ There's no "unpublish" path for either npm (npm has a strict 72-hour unpublish p
 
 - **Workflow ran but nothing published**: the `plan` job decided there was nothing to do — read its log. `<pkg>@<version> is already on npm` means the version wasn't bumped. `plan` also warns (never fails) when commits sit on `main` that no published version contains; that warning is the cue to cut a release PR.
 - **`plan` failed with "refusing to guess" / "is OLDER than the current"**: an ambiguous npm response, or two release PRs merged out of version order so the merge would move a dist-tag backwards. Bump past the published version and re-merge.
-- **Workflow doesn't trigger at all**: for the merge path, confirm the merge landed on `main`. For a tag push, confirm the tag matches one of the patterns in `on.push.tags` (hub: `v[0-9]+...`; scope-guard: `scope-guard-v[0-9]+...`; depcheck: `depcheck-v[0-9]+...`; door-contract: `door-contract-v[0-9]+...`).
+- **Workflow doesn't trigger at all**: for the merge path, confirm the merge landed on `next` or `main`, and that it actually touched one of the `paths` the workflow filters on (a `package.json` at the root or under `packages/{scope-guard,depcheck,door-contract}/`) — a merge that doesn't touch those paths never fires this workflow, by design. For a tag push, confirm the tag matches one of the patterns in `on.push.tags` (hub: `v[0-9]+...`; scope-guard: `scope-guard-v[0-9]+...`; depcheck: `depcheck-v[0-9]+...`; door-contract: `door-contract-v[0-9]+...`).
 - **`version mismatch` error in publish-npm**: tag path only — the relevant `package.json` version differs from the tag. Re-tag the correct commit, or fix the version in `package.json`.
 - **Image published with no `:vX.Y.Z` tag**: pre-hub#829 behaviour, where the image tags came from the ref (`main` on a merge run). Fixed by deriving every tag from `plan`'s `hub_version`.
 - **`npm ERR! 403 You do not have permission to publish`**: Trusted Publisher rule on npm doesn't match this workflow. Verify org/repo/workflow filename are exactly `ParachuteComputer` / `parachute-hub` / `release.yml`. If the workflow file was renamed, the rule needs updating on npm.
