@@ -24,6 +24,7 @@ import {
 } from "../nostr-http-auth.ts";
 import { bindPubkeyFromHttpAuth, findPubkeyLink } from "../pubkey-links.ts";
 import { issuePubkeyChallenge, linkPubkey } from "../pubkey-links.ts";
+import { bindRequestPeer } from "../request-layer.ts";
 import { createUser } from "../users.ts";
 
 const hexToBytes = (hex: string): Uint8Array => Uint8Array.from(Buffer.from(hex, "hex"));
@@ -122,6 +123,56 @@ describe("requestAbsoluteUrl", () => {
     const req = new Request("https://uni.taildf9ce2.ts.net/mcp", { method: "POST" });
     expect(requestAbsoluteUrl(req)).toBe("https://uni.taildf9ce2.ts.net/mcp");
   });
+
+  test("loopback peer + forged XFP does not upgrade (hub#915)", () => {
+    const req = new Request("http://uni.taildf9ce2.ts.net/mcp", {
+      method: "POST",
+      headers: { "x-forwarded-proto": "https" },
+    });
+    expect(requestAbsoluteUrl(req, "127.0.0.1")).toBe("http://uni.taildf9ce2.ts.net/mcp");
+    expect(requestAbsoluteUrl(req, "::1")).toBe("http://uni.taildf9ce2.ts.net/mcp");
+    expect(requestAbsoluteUrl(req, "::ffff:127.0.0.1")).toBe("http://uni.taildf9ce2.ts.net/mcp");
+  });
+
+  test("loopback peer + XFP + X-Forwarded-For still upgrades (Tailscale Serve)", () => {
+    const req = new Request("http://uni.taildf9ce2.ts.net/mcp", {
+      method: "POST",
+      headers: {
+        "x-forwarded-proto": "https",
+        "x-forwarded-for": "100.64.0.12",
+      },
+    });
+    expect(requestAbsoluteUrl(req, "127.0.0.1")).toBe("https://uni.taildf9ce2.ts.net/mcp");
+  });
+
+  test("loopback peer + XFP + Tailscale-User-Login still upgrades", () => {
+    const req = new Request("http://uni.taildf9ce2.ts.net/mcp", {
+      method: "POST",
+      headers: {
+        "x-forwarded-proto": "https",
+        "tailscale-user-login": "aaron@example.com",
+      },
+    });
+    expect(requestAbsoluteUrl(req, "127.0.0.1")).toBe("https://uni.taildf9ce2.ts.net/mcp");
+  });
+
+  test("unknown peer still upgrades — hub#914 tests, fail-closed to public", () => {
+    const req = new Request("http://uni.taildf9ce2.ts.net/mcp", {
+      method: "POST",
+      headers: { "x-forwarded-proto": "https" },
+    });
+    expect(requestAbsoluteUrl(req)).toBe("https://uni.taildf9ce2.ts.net/mcp");
+    expect(requestAbsoluteUrl(req, null)).toBe("https://uni.taildf9ce2.ts.net/mcp");
+  });
+
+  test("hubFetch bindRequestPeer is enough — no explicit peerAddr needed", () => {
+    const req = new Request("http://uni.taildf9ce2.ts.net/mcp", {
+      method: "POST",
+      headers: { "x-forwarded-proto": "https" },
+    });
+    bindRequestPeer(req, "127.0.0.1");
+    expect(requestAbsoluteUrl(req)).toBe("http://uni.taildf9ce2.ts.net/mcp");
+  });
 });
 
 describe("verifyNostrHttpEvent", () => {
@@ -195,6 +246,24 @@ describe("verifyNostrHttpEvent", () => {
         reqFor(behindTls, "POST", event, undefined, { "x-forwarded-proto": "https" }),
         event,
         { replay: new NostrReplayCache() },
+      ),
+    ).toThrow(/u tag/);
+  });
+
+  test("rejects a captured https u-tag replayed on loopback with forged XFP (hub#915)", () => {
+    const publicUrl = "https://uni.taildf9ce2.ts.net/mcp";
+    const behindTls = "http://uni.taildf9ce2.ts.net/mcp";
+    const event = signEvent({
+      tags: [
+        ["u", publicUrl],
+        ["method", "POST"],
+      ],
+    });
+    expect(() =>
+      verifyNostrHttpEvent(
+        reqFor(behindTls, "POST", event, undefined, { "x-forwarded-proto": "https" }),
+        event,
+        { replay: new NostrReplayCache(), peerAddr: "127.0.0.1" },
       ),
     ).toThrow(/u tag/);
   });
