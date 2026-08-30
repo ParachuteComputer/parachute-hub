@@ -3377,7 +3377,7 @@ export function hubFetch(
       // Admin screen-lock management (optional idle PIN lock for the admin
       // UI). Session-cookie-gated to the first admin; these manage the lock
       // itself so they are NOT behind the lock gate. The lock GATE lives in
-      // the four `/admin/*-token` mint handlers (admin-lock.ts:requireUnlocked)
+      // the three `/admin/*-token` mint handlers (admin-lock.ts:requireUnlocked)
       // — it does NOT touch `/oauth/*`, so the OAuth issuer is unaffected.
       if (pathname === "/api/admin-lock" || pathname.startsWith("/api/admin-lock/")) {
         if (!getDb) return dbNotConfigured();
