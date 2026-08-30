@@ -1,29 +1,50 @@
 /**
  * /admin/account — "My account": self-service password, 2FA, my-tokens, and
- * pubkey-link for the signed-in user (hub#85 + hub#833 (b)).
+ * pubkey-link for the signed-in user (hub#85 + hub#833 (b) + hub#880).
  *
  * The owner is NOT special here: `two_factor_enabled` comes from `/api/me`
  * (keyed off the session's own user), and every action POSTs to
  * `/api/account/*`, which act on `session.userId`. Same path for the first
  * admin and any friend user.
  *
- * Four sections:
+ * ## Layout (hub#880)
+ *
+ * Summary-first. The page is four **disclosure cards**, each collapsed by
+ * default and each showing a one-line status in its header ("Two-factor: On",
+ * "3 API tokens", "1 linked key") so the operator can read their whole account
+ * posture without expanding anything. Toggles are real `<button>`s with
+ * `aria-expanded` / `aria-controls` (WAI-ARIA accordion shape), not
+ * `<details>`, so the disclosure state is programmatically announced.
+ *
+ * A `location.hash` of `#password` / `#two-factor` / `#tokens` / `#keys` opens
+ * that card on arrival — deep links from elsewhere in the shell land expanded.
+ *
+ * The four cards:
  *   - Password — current → new (+ confirm). 12-char floor mirrors the server
  *     validator; the server is authoritative (its 400/401 message surfaces).
- *   - Two-factor — status pill; when off, an enroll flow (QR + secret + verify
- *     a code → backup codes shown ONCE); when on, a password-gated disable.
+ *   - Two-factor — status pill in the card header; when off, an enroll flow
+ *     (QR + secret + verify a code → backup codes shown ONCE); when on, a
+ *     password-gated disable.
  *   - API tokens — list / mint / revoke THIS user's tokens. Operator registry
  *     stays at `/admin/tokens`. JWT shown once. Cookie+CSRF, cannot mint
  *     `parachute:host:*`.
- *   - Nostr keys — list / link / unlink. A linked key is an attribution
- *     label; it grants nothing. First-link is password-gated.
+ *   - Nostr keys — list / link / unlink, driven by a three-step guided
+ *     ceremony (see `PubkeysSection`). A linked key is an attribution label;
+ *     it grants nothing. First-link is password-gated.
+ *
+ * ## Why the list fetches are hoisted
+ *
+ * `useAccountTokens` / `useAccountPubkeys` live on the *page*, not inside the
+ * collapsed sections, because the card headers need the counts before anything
+ * is expanded. Collapsing unmounts the body; hoisting the fetch keeps the
+ * summary honest and stops a re-fetch on every expand/collapse.
  *
  * The CSRF token + 2FA status are read from `/api/me` (the single who-am-I
  * read App.tsx already does). We refetch it after a 2FA change so the status
  * pill + section swap without a full reload.
  */
-import { type FormEvent, useCallback, useEffect, useState } from "react";
-import { Link } from "react-router-dom";
+import { type FormEvent, type ReactNode, useCallback, useEffect, useState } from "react";
+import { Link, useLocation } from "react-router-dom";
 import {
   type AccountPubkey,
   type AccountTokenListing,
@@ -51,8 +72,19 @@ type LoadState =
   | { kind: "signed-out" }
   | { kind: "ok"; csrf: string; twoFactorEnabled: boolean };
 
+/** `#password` → the password card, etc. Anything else opens nothing. */
+const HASH_TARGETS: Record<string, string> = {
+  "#password": "password",
+  "#two-factor": "two-factor",
+  "#2fa": "two-factor",
+  "#tokens": "tokens",
+  "#keys": "keys",
+};
+
 export function Account() {
   const [state, setState] = useState<LoadState>({ kind: "loading" });
+  const { hash } = useLocation();
+  const openTarget = HASH_TARGETS[hash] ?? null;
 
   const refresh = useCallback(async () => {
     try {
@@ -71,6 +103,12 @@ export function Account() {
     void refresh();
   }, [refresh]);
 
+  // Hoisted so the collapsed card headers can show counts. Both hooks fetch
+  // once on mount regardless of the sign-in state resolving — the helpers
+  // redirect to login on 401 themselves.
+  const tokens = useAccountTokens();
+  const pubkeys = useAccountPubkeys();
+
   if (state.kind === "loading") {
     return <div className="empty">Loading account…</div>;
   }
@@ -85,21 +123,141 @@ export function Account() {
   }
 
   return (
-    <section className="settings" data-testid="account-page">
+    <section className="settings account-page" data-testid="account-page">
       <h1>My account</h1>
       <p className="muted">
-        Manage your own sign-in credentials, API tokens, and linked Nostr keys. Changes here apply
-        to your account only. The operator token registry is a separate page.
+        Your sign-in credentials, API tokens, and linked Nostr keys. Changes here apply to your
+        account only. The operator token registry is a separate page.
       </p>
 
-      <PasswordSection csrf={state.csrf} />
-      <TwoFactorSection
-        csrf={state.csrf}
-        enabled={state.twoFactorEnabled}
-        onChanged={() => void refresh()}
-      />
-      <TokensSection csrf={state.csrf} />
-      <PubkeysSection csrf={state.csrf} />
+      <div className="account-cards">
+        <AccountCard
+          cardId="password"
+          title="Password"
+          summary="Used to sign in to this hub"
+          testId="account-password"
+          openInitially={openTarget === "password"}
+        >
+          <PasswordSection csrf={state.csrf} />
+        </AccountCard>
+
+        <AccountCard
+          cardId="two-factor"
+          title="Two-factor authentication"
+          summary={
+            <span
+              className={`lock-status-pill ${
+                state.twoFactorEnabled ? "lock-status-on" : "lock-status-off"
+              }`}
+              data-testid="account-2fa-status"
+            >
+              {state.twoFactorEnabled ? "Enabled" : "Off"}
+            </span>
+          }
+          testId="account-2fa"
+          openInitially={openTarget === "two-factor"}
+        >
+          <TwoFactorSection
+            csrf={state.csrf}
+            enabled={state.twoFactorEnabled}
+            onChanged={() => void refresh()}
+          />
+        </AccountCard>
+
+        <AccountCard
+          cardId="tokens"
+          title="API tokens"
+          summary={summarizeTokens(tokens.list)}
+          testId="account-tokens"
+          openInitially={openTarget === "tokens"}
+        >
+          <TokensSection csrf={state.csrf} tokens={tokens} />
+        </AccountCard>
+
+        <AccountCard
+          cardId="keys"
+          title="Nostr keys"
+          summary={summarizePubkeys(pubkeys.list)}
+          testId="account-pubkeys"
+          openInitially={openTarget === "keys"}
+        >
+          <PubkeysSection csrf={state.csrf} pubkeys={pubkeys} />
+        </AccountCard>
+      </div>
+    </section>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Disclosure card
+// ---------------------------------------------------------------------------
+
+/**
+ * One collapsible settings card. WAI-ARIA accordion shape: a real `<button>`
+ * inside the heading carries `aria-expanded` + `aria-controls`, and the panel
+ * it points at exists in the DOM (empty + `hidden`) while collapsed so the
+ * relationship stays resolvable.
+ *
+ * The body is *unmounted* while collapsed — the sections own transient form
+ * state (a half-typed password, a mid-flight challenge) and collapsing should
+ * discard it rather than keep it alive invisibly. List fetches that the header
+ * summary depends on are hoisted to the page for exactly this reason.
+ */
+function AccountCard({
+  cardId,
+  title,
+  summary,
+  testId,
+  openInitially = false,
+  children,
+}: {
+  cardId: string;
+  title: string;
+  summary: ReactNode;
+  testId: string;
+  openInitially?: boolean;
+  children: ReactNode;
+}) {
+  const [open, setOpen] = useState(openInitially);
+
+  // A hash arriving after first paint (in-shell nav to `/account#keys`) should
+  // still expand the targeted card. Never auto-*collapses*.
+  useEffect(() => {
+    if (openInitially) setOpen(true);
+  }, [openInitially]);
+
+  const titleId = `${cardId}-title`;
+  const panelId = `${cardId}-panel`;
+
+  return (
+    <section
+      className={`account-card${open ? " is-open" : ""}`}
+      aria-labelledby={titleId}
+      data-testid={testId}
+    >
+      <h2 className="account-card-heading">
+        <button
+          type="button"
+          className="account-card-toggle"
+          aria-expanded={open}
+          aria-controls={panelId}
+          onClick={() => setOpen((o) => !o)}
+          data-testid={`${testId}-toggle`}
+        >
+          <span className="account-card-chevron" aria-hidden="true">
+            {open ? "▾" : "▸"}
+          </span>
+          <span className="account-card-title" id={titleId}>
+            {title}
+          </span>
+          <span className="account-card-summary" data-testid={`${testId}-summary`}>
+            {summary}
+          </span>
+        </button>
+      </h2>
+      <div className="account-card-body" id={panelId} hidden={!open}>
+        {open ? children : null}
+      </div>
     </section>
   );
 }
@@ -148,15 +306,10 @@ function PasswordSection({ csrf }: { csrf: string }) {
   }
 
   return (
-    <section
-      className="settings-block"
-      aria-labelledby="account-password-heading"
-      data-testid="account-password"
-    >
-      <h2 id="account-password-heading">Password</h2>
+    <>
       <p className="muted">Change the password you use to sign in to this hub.</p>
 
-      <form onSubmit={(e) => void onSubmit(e)} className="settings-form">
+      <form onSubmit={(e) => void onSubmit(e)} className="settings-form account-form">
         <label>
           Current password
           <input
@@ -207,7 +360,7 @@ function PasswordSection({ csrf }: { csrf: string }) {
           {notice}
         </p>
       )}
-    </section>
+    </>
   );
 }
 
@@ -302,24 +455,10 @@ function TwoFactorSection({
   }
 
   return (
-    <section
-      className="settings-block"
-      aria-labelledby="account-2fa-heading"
-      data-testid="account-2fa"
-    >
-      <h2 id="account-2fa-heading">Two-factor authentication</h2>
+    <>
       <p className="muted">
-        Add a time-based one-time code (TOTP) from an authenticator app as a second step at sign-in.
-      </p>
-
-      <p>
-        Status:{" "}
-        <span
-          className={`lock-status-pill ${enabled ? "lock-status-on" : "lock-status-off"}`}
-          data-testid="account-2fa-status"
-        >
-          {enabled ? "Enabled" : "Off"}
-        </span>
+        A time-based one-time code (TOTP) from an authenticator app, asked for as a second step at
+        sign-in.
       </p>
 
       {/* Show the backup codes ONCE after a successful enrollment. */}
@@ -348,7 +487,7 @@ function TwoFactorSection({
         </div>
       ) : enabled ? (
         // Enrolled → password-gated disable.
-        <form onSubmit={(e) => void onDisable(e)} className="settings-form">
+        <form onSubmit={(e) => void onDisable(e)} className="settings-form account-form">
           <p className="muted">Turning off two-factor requires your current password.</p>
           <label>
             Current password
@@ -374,7 +513,7 @@ function TwoFactorSection({
         </form>
       ) : view.kind === "enrolling" ? (
         // Mid-enroll → QR + secret + confirm a code.
-        <form onSubmit={(e) => void onConfirm(e)} className="settings-form">
+        <form onSubmit={(e) => void onConfirm(e)} className="settings-form account-form">
           <p>
             Scan this QR code with your authenticator app, then enter the 6-digit code it shows to
             confirm.
@@ -409,7 +548,7 @@ function TwoFactorSection({
             </button>
             <button
               type="button"
-              className="destructive"
+              className="secondary"
               disabled={busy}
               onClick={onCancelEnroll}
               data-testid="account-2fa-cancel"
@@ -437,7 +576,7 @@ function TwoFactorSection({
           {err}
         </div>
       )}
-    </section>
+    </>
   );
 }
 
@@ -462,19 +601,21 @@ type TokenRevokeState =
   | { kind: "revoking"; jti: string }
   | { kind: "error"; jti: string; message: string };
 
-function TokensSection({ csrf }: { csrf: string }) {
+interface AccountTokensHandle {
+  list: TokenListState;
+  reload: () => void;
+  loadingMore: boolean;
+  loadMore: () => Promise<void>;
+}
+
+/** Page-level tokens fetch — see the module docstring for why it's hoisted. */
+function useAccountTokens(): AccountTokensHandle {
   const [list, setList] = useState<TokenListState>({ kind: "loading" });
-  const [reload, setReload] = useState(0);
-  const [mint, setMint] = useState<TokenMintState>({ kind: "idle" });
-  const [revoke, setRevoke] = useState<TokenRevokeState>({ kind: "idle" });
-  const [showForm, setShowForm] = useState(false);
+  const [reloadN, setReloadN] = useState(0);
   const [loadingMore, setLoadingMore] = useState(false);
-  const [scope, setScope] = useState("");
-  const [label, setLabel] = useState("");
-  const [expiresIn, setExpiresIn] = useState("");
 
   useEffect(() => {
-    void reload;
+    void reloadN;
     let cancelled = false;
     setList({ kind: "loading" });
     listAccountTokens()
@@ -484,16 +625,15 @@ function TokensSection({ csrf }: { csrf: string }) {
       })
       .catch((err: unknown) => {
         if (cancelled) return;
-        setList({
-          kind: "error",
-          message: err instanceof Error ? err.message : String(err),
-        });
+        setList({ kind: "error", message: err instanceof Error ? err.message : String(err) });
       });
     return () => {
       cancelled = true;
     };
-  }, [reload]);
+  }, [reloadN]);
 
+  // "Load more" cursor pagination — the three-ingredient shape from
+  // web/ui/CLAUDE.md (flag + disabled + early return).
   async function loadMore(): Promise<void> {
     if (list.kind !== "ok" || !list.nextCursor || loadingMore) return;
     setLoadingMore(true);
@@ -505,14 +645,31 @@ function TokensSection({ csrf }: { csrf: string }) {
         nextCursor: page.next_cursor,
       });
     } catch (err) {
-      setList({
-        kind: "error",
-        message: err instanceof Error ? err.message : String(err),
-      });
+      setList({ kind: "error", message: err instanceof Error ? err.message : String(err) });
     } finally {
       setLoadingMore(false);
     }
   }
+
+  return { list, reload: () => setReloadN((n) => n + 1), loadingMore, loadMore };
+}
+
+function summarizeTokens(list: TokenListState): string {
+  if (list.kind === "loading") return "Loading…";
+  if (list.kind === "error") return "Couldn't load tokens";
+  const n = list.tokens.length;
+  if (n === 0) return "No API tokens";
+  return `${n} API token${n === 1 ? "" : "s"}`;
+}
+
+function TokensSection({ csrf, tokens }: { csrf: string; tokens: AccountTokensHandle }) {
+  const { list, reload, loadingMore, loadMore } = tokens;
+  const [mint, setMint] = useState<TokenMintState>({ kind: "idle" });
+  const [revoke, setRevoke] = useState<TokenRevokeState>({ kind: "idle" });
+  const [showForm, setShowForm] = useState(false);
+  const [scope, setScope] = useState("");
+  const [label, setLabel] = useState("");
+  const [expiresIn, setExpiresIn] = useState("");
 
   async function onSubmitMint(e: FormEvent): Promise<void> {
     e.preventDefault();
@@ -542,12 +699,9 @@ function TokensSection({ csrf }: { csrf: string }) {
       setLabel("");
       setExpiresIn("");
       setShowForm(false);
-      setReload((n) => n + 1);
+      reload();
     } catch (err) {
-      setMint({
-        kind: "error",
-        message: err instanceof Error ? err.message : String(err),
-      });
+      setMint({ kind: "error", message: err instanceof Error ? err.message : String(err) });
     }
   }
 
@@ -556,7 +710,7 @@ function TokensSection({ csrf }: { csrf: string }) {
     try {
       await revokeAccountToken(csrf, jti);
       setRevoke({ kind: "idle" });
-      setReload((n) => n + 1);
+      reload();
     } catch (err) {
       setRevoke({
         kind: "error",
@@ -573,12 +727,7 @@ function TokensSection({ csrf }: { csrf: string }) {
   }
 
   return (
-    <section
-      className="settings-block"
-      aria-labelledby="account-tokens-heading"
-      data-testid="account-tokens"
-    >
-      <h2 id="account-tokens-heading">API tokens</h2>
+    <>
       <p className="muted">
         Tokens minted as you. A friend can mint a subset of their own authority (assigned vaults);
         nobody mints <code>parachute:host:*</code> here. The operator registry — every CLI / OAuth /
@@ -611,78 +760,86 @@ function TokensSection({ csrf }: { csrf: string }) {
         </div>
       ) : null}
 
-      <div className="actions" style={{ marginBottom: "0.75rem" }}>
+      <div className="account-subsection">
         <button
           type="button"
+          className="secondary account-disclosure"
+          aria-expanded={showForm}
+          aria-controls="account-token-mint-form"
           onClick={() => setShowForm((s) => !s)}
           data-testid="account-token-mint-toggle"
         >
+          <span aria-hidden="true">{showForm ? "▾" : "▸"}</span>{" "}
           {showForm ? "Hide form" : "Mint a token"}
         </button>
+
+        <div id="account-token-mint-form" hidden={!showForm}>
+          {showForm ? (
+            <form onSubmit={(e) => void onSubmitMint(e)} className="settings-form account-form">
+              <label>
+                Scope (space-separated)
+                <input
+                  type="text"
+                  value={scope}
+                  onChange={(e) => setScope(e.target.value)}
+                  placeholder="e.g. vault:work:read"
+                  data-testid="account-token-scope"
+                />
+              </label>
+              <label>
+                Label (optional)
+                <input
+                  type="text"
+                  value={label}
+                  onChange={(e) => setLabel(e.target.value)}
+                  placeholder="laptop, backup, …"
+                  data-testid="account-token-label"
+                />
+              </label>
+              <label>
+                Expires in (seconds, optional)
+                <input
+                  type="text"
+                  inputMode="numeric"
+                  value={expiresIn}
+                  onChange={(e) => setExpiresIn(e.target.value)}
+                  placeholder="default 90d"
+                  data-testid="account-token-expires"
+                />
+              </label>
+              {mint.kind === "error" ? (
+                <div className="error" data-testid="account-token-mint-error">
+                  {mint.message}
+                </div>
+              ) : null}
+              <div className="actions">
+                <button
+                  type="submit"
+                  disabled={mint.kind === "submitting"}
+                  data-testid="account-token-mint"
+                >
+                  {mint.kind === "submitting" ? "Minting…" : "Mint"}
+                </button>
+                <button
+                  type="button"
+                  className="secondary"
+                  onClick={() => {
+                    setShowForm(false);
+                    setMint({ kind: "idle" });
+                  }}
+                >
+                  Cancel
+                </button>
+              </div>
+            </form>
+          ) : null}
+        </div>
       </div>
 
-      {showForm ? (
-        <form onSubmit={(e) => void onSubmitMint(e)} className="settings-form">
-          <label>
-            Scope (space-separated)
-            <input
-              type="text"
-              value={scope}
-              onChange={(e) => setScope(e.target.value)}
-              placeholder="e.g. vault:work:read"
-              data-testid="account-token-scope"
-            />
-          </label>
-          <label>
-            Label (optional)
-            <input
-              type="text"
-              value={label}
-              onChange={(e) => setLabel(e.target.value)}
-              placeholder="laptop, backup, …"
-              data-testid="account-token-label"
-            />
-          </label>
-          <label>
-            Expires in (seconds, optional)
-            <input
-              type="text"
-              inputMode="numeric"
-              value={expiresIn}
-              onChange={(e) => setExpiresIn(e.target.value)}
-              placeholder="default 90d"
-              data-testid="account-token-expires"
-            />
-          </label>
-          {mint.kind === "error" ? (
-            <div className="error" data-testid="account-token-mint-error">
-              {mint.message}
-            </div>
-          ) : null}
-          <div className="actions">
-            <button
-              type="submit"
-              disabled={mint.kind === "submitting"}
-              data-testid="account-token-mint"
-            >
-              {mint.kind === "submitting" ? "Minting…" : "Mint"}
-            </button>
-            <button
-              type="button"
-              className="secondary"
-              onClick={() => {
-                setShowForm(false);
-                setMint({ kind: "idle" });
-              }}
-            >
-              Cancel
-            </button>
-          </div>
-        </form>
-      ) : null}
-
       {list.kind === "loading" ? (
-        <p className="muted">Loading tokens…</p>
+        <p className="muted" data-loading="true">
+          Loading tokens…
+        </p>
       ) : list.kind === "error" ? (
         <div className="error" data-testid="account-tokens-error">
           {list.message}
@@ -784,7 +941,7 @@ function TokensSection({ csrf }: { csrf: string }) {
           ) : null}
         </div>
       )}
-    </section>
+    </>
   );
 }
 
@@ -807,7 +964,64 @@ type PubkeyListState =
   | { kind: "ok"; pubkeys: AccountPubkey[] }
   | { kind: "error"; message: string };
 
-type LinkView = { kind: "idle" } | { kind: "challenging"; challenge: PubkeyChallenge };
+interface AccountPubkeysHandle {
+  list: PubkeyListState;
+  reload: () => void;
+}
+
+/** Page-level pubkeys fetch — see the module docstring for why it's hoisted. */
+function useAccountPubkeys(): AccountPubkeysHandle {
+  const [list, setList] = useState<PubkeyListState>({ kind: "loading" });
+  const [reloadN, setReloadN] = useState(0);
+
+  useEffect(() => {
+    void reloadN;
+    let cancelled = false;
+    setList({ kind: "loading" });
+    listAccountPubkeys()
+      .then((pubkeys) => {
+        if (cancelled) return;
+        setList({ kind: "ok", pubkeys });
+      })
+      .catch((e: unknown) => {
+        if (cancelled) return;
+        setList({ kind: "error", message: e instanceof Error ? e.message : String(e) });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [reloadN]);
+
+  return { list, reload: () => setReloadN((n) => n + 1) };
+}
+
+function summarizePubkeys(list: PubkeyListState): string {
+  if (list.kind === "loading") return "Loading…";
+  if (list.kind === "error") return "Couldn't load keys";
+  const n = list.pubkeys.length;
+  if (n === 0) return "No linked keys";
+  return `${n} linked key${n === 1 ? "" : "s"}`;
+}
+
+/**
+ * The link ceremony, as three visible steps.
+ *
+ *   idle      → why you'd do this at all, and a single "Link a key" button.
+ *   statement → the hub's one-time sentence, shown before anything is signed.
+ *   sign      → NIP-07 extension (primary when present) or paste a signed
+ *               event (primary when absent, tucked behind a disclosure when
+ *               an extension is available).
+ *   confirm   → optional label + first-link password step-up + submit.
+ *
+ * The wire protocol is unchanged (challenge → sign → verify); the steps are
+ * purely how the same three moves are surfaced. Cancel from any step returns
+ * to `idle` with every field cleared.
+ */
+type LinkState =
+  | { kind: "idle" }
+  | { kind: "statement"; challenge: PubkeyChallenge }
+  | { kind: "sign"; challenge: PubkeyChallenge }
+  | { kind: "confirm"; challenge: PubkeyChallenge; event: SignedNostrEvent };
 
 type Nip07 = {
   signEvent: (event: {
@@ -824,40 +1038,76 @@ function hasNip07(): Nip07 | null {
   return nostr && typeof nostr.signEvent === "function" ? nostr : null;
 }
 
-function PubkeysSection({ csrf }: { csrf: string }) {
-  const [list, setList] = useState<PubkeyListState>({ kind: "loading" });
-  const [reload, setReload] = useState(0);
-  const [view, setView] = useState<LinkView>({ kind: "idle" });
+/** Parse a pasted signed event. Returns the event or an operator-readable why-not. */
+function parseSignedEvent(
+  json: string,
+): { ok: true; event: SignedNostrEvent } | { ok: false; message: string } {
+  if (!json.trim()) {
+    return { ok: false, message: "Paste the signed event before continuing." };
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(json) as unknown;
+  } catch {
+    return { ok: false, message: "Signed event is not valid JSON." };
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return { ok: false, message: "Paste a signed NIP-01 event object." };
+  }
+  return { ok: true, event: parsed as SignedNostrEvent };
+}
+
+const LINK_STEP_LABELS = ["Get the statement", "Sign it", "Confirm"] as const;
+
+function StepIndicator({ current }: { current: 1 | 2 | 3 }) {
+  return (
+    <ol className="link-steps" data-testid="account-pubkey-steps">
+      {LINK_STEP_LABELS.map((label, i) => {
+        const n = i + 1;
+        const state = n === current ? "current" : n < current ? "done" : "todo";
+        return (
+          <li
+            key={label}
+            className={`link-step link-step-${state}`}
+            {...(n === current ? { "aria-current": "step" as const } : {})}
+          >
+            <span className="link-step-num" aria-hidden="true">
+              {n}
+            </span>
+            <span className="link-step-label">{label}</span>
+          </li>
+        );
+      })}
+    </ol>
+  );
+}
+
+function PubkeysSection({ csrf, pubkeys }: { csrf: string; pubkeys: AccountPubkeysHandle }) {
+  const { list, reload } = pubkeys;
+  const [link, setLink] = useState<LinkState>({ kind: "idle" });
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [eventJson, setEventJson] = useState("");
+  const [showPaste, setShowPaste] = useState(false);
   const [label, setLabel] = useState("");
   const [password, setPassword] = useState("");
   const [unlink, setUnlink] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
 
-  useEffect(() => {
-    void reload;
-    let cancelled = false;
-    setList({ kind: "loading" });
-    listAccountPubkeys()
-      .then((pubkeys) => {
-        if (cancelled) return;
-        setList({ kind: "ok", pubkeys });
-      })
-      .catch((e: unknown) => {
-        if (cancelled) return;
-        setList({ kind: "error", message: e instanceof Error ? e.message : String(e) });
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [reload]);
-
   // Password step-up is required on the FIRST link. Show the field unless we
   // already know this account holds a key; a failed list still shows it
   // (server ignores the extra password on a subsequent link).
   const firstLink = list.kind !== "ok" || list.pubkeys.length === 0;
+  const nip07 = hasNip07();
+
+  function resetFlow() {
+    setLink({ kind: "idle" });
+    setEventJson("");
+    setShowPaste(false);
+    setLabel("");
+    setPassword("");
+    setErr(null);
+  }
 
   async function onStartLink(): Promise<void> {
     if (busy) return;
@@ -866,8 +1116,10 @@ function PubkeysSection({ csrf }: { csrf: string }) {
     setBusy(true);
     try {
       const challenge = await startPubkeyChallenge(csrf);
-      setView({ kind: "challenging", challenge });
+      setLink({ kind: "statement", challenge });
       setEventJson("");
+      // With no extension the paste path IS the path — open it by default.
+      setShowPaste(!nip07);
       setLabel("");
       setPassword("");
     } catch (e) {
@@ -878,7 +1130,7 @@ function PubkeysSection({ csrf }: { csrf: string }) {
   }
 
   async function onSignWithExtension(): Promise<void> {
-    if (view.kind !== "challenging") return;
+    if (link.kind !== "sign") return;
     const nostr = hasNip07();
     if (!nostr) {
       setErr("No NIP-07 signer is available in this browser.");
@@ -887,7 +1139,7 @@ function PubkeysSection({ csrf }: { csrf: string }) {
     setErr(null);
     setBusy(true);
     try {
-      const tpl = view.challenge.event_template;
+      const tpl = link.challenge.event_template;
       const signed = await nostr.signEvent({
         kind: tpl.kind,
         created_at: Math.floor(Date.now() / 1000),
@@ -895,6 +1147,7 @@ function PubkeysSection({ csrf }: { csrf: string }) {
         content: tpl.content,
       });
       setEventJson(JSON.stringify(signed, null, 2));
+      setLink({ kind: "confirm", challenge: link.challenge, event: signed });
     } catch (e) {
       setErr(e instanceof Error ? e.message : String(e));
     } finally {
@@ -902,40 +1155,37 @@ function PubkeysSection({ csrf }: { csrf: string }) {
     }
   }
 
-  async function onVerify(e: FormEvent): Promise<void> {
-    e.preventDefault();
-    if (busy) return;
-    setErr(null);
-    setNotice(null);
-    let event: SignedNostrEvent;
-    try {
-      const parsed = JSON.parse(eventJson) as unknown;
-      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-        setErr("Paste a signed NIP-01 event object.");
-        return;
-      }
-      event = parsed as SignedNostrEvent;
-    } catch {
-      setErr("Signed event is not valid JSON.");
+  /** Step 2 → 3 on the paste path. Validates here so a typo fails early. */
+  function onUsePastedEvent(): void {
+    if (link.kind !== "sign") return;
+    const parsed = parseSignedEvent(eventJson);
+    if (!parsed.ok) {
+      setErr(parsed.message);
       return;
     }
+    setErr(null);
+    setLink({ kind: "confirm", challenge: link.challenge, event: parsed.event });
+  }
+
+  async function onVerify(e: FormEvent): Promise<void> {
+    e.preventDefault();
+    if (busy || link.kind !== "confirm") return;
+    setErr(null);
+    setNotice(null);
     setBusy(true);
     try {
       const result = await verifyPubkeyLink(csrf, {
-        event,
+        event: link.event,
         ...(label.trim() ? { label: label.trim() } : {}),
         ...(password ? { password } : {}),
       });
-      setView({ kind: "idle" });
-      setEventJson("");
-      setLabel("");
-      setPassword("");
+      resetFlow();
       setNotice(
         result.relinked
           ? `Re-verified ${truncatePubkey(result.pubkey)}.`
           : `Linked ${truncatePubkey(result.pubkey)}. A linked key grants nothing — it is an attribution label.`,
       );
-      setReload((n) => n + 1);
+      reload();
     } catch (e2) {
       setErr(e2 instanceof Error ? e2.message : String(e2));
     } finally {
@@ -950,7 +1200,7 @@ function PubkeysSection({ csrf }: { csrf: string }) {
     try {
       await unlinkAccountPubkey(csrf, pubkey);
       setUnlink(null);
-      setReload((n) => n + 1);
+      reload();
     } catch (e) {
       setErr(e instanceof Error ? e.message : String(e));
     } finally {
@@ -958,18 +1208,43 @@ function PubkeysSection({ csrf }: { csrf: string }) {
     }
   }
 
-  const nip07 = hasNip07();
+  const pasteField = (
+    <>
+      <label>
+        Signed event (JSON)
+        <textarea
+          value={eventJson}
+          onChange={(e) => setEventJson(e.target.value)}
+          rows={8}
+          spellCheck={false}
+          className="account-event-input"
+          data-testid="account-pubkey-event"
+        />
+      </label>
+      <p className="dim">
+        Sign the statement above with any Nostr tool — <code>nak</code>, a nostr-tools script, a
+        phone signer — and paste the whole event object it prints:{" "}
+        <code>{'{"id":…,"pubkey":…,"sig":…}'}</code>
+      </p>
+      <div className="actions">
+        <button
+          type="button"
+          disabled={busy}
+          onClick={onUsePastedEvent}
+          data-testid="account-pubkey-paste-continue"
+        >
+          Continue
+        </button>
+      </div>
+    </>
+  );
 
   return (
-    <section
-      className="settings-block"
-      aria-labelledby="account-pubkeys-heading"
-      data-testid="account-pubkeys"
-    >
-      <h2 id="account-pubkeys-heading">Nostr keys</h2>
+    <>
       <p className="muted">
-        A linked key is an attribution label. It does not log you in, mint a token, or widen a
-        scope. Unlink does not revoke tokens.
+        Linking a Nostr key lets this hub recognize things you sign with it — signed requests from
+        your agents or apps — as yours. It's an attribution label: it does not log you in, mint a
+        token, or widen a scope. Unlinking does not revoke tokens.
       </p>
 
       {notice ? (
@@ -978,87 +1253,7 @@ function PubkeysSection({ csrf }: { csrf: string }) {
         </p>
       ) : null}
 
-      {view.kind === "challenging" ? (
-        <form onSubmit={(e) => void onVerify(e)} className="settings-form">
-          <p>
-            Sign this statement with a Nostr key you hold, then paste the signed event. A signer
-            that shows you the content will show you this sentence:
-          </p>
-          <pre
-            className="token-box"
-            data-testid="account-pubkey-statement"
-            style={{ whiteSpace: "pre-wrap" }}
-          >
-            <code>{view.challenge.event_template.content}</code>
-          </pre>
-          {nip07 ? (
-            <div className="actions">
-              <button
-                type="button"
-                disabled={busy}
-                onClick={() => void onSignWithExtension()}
-                data-testid="account-pubkey-nip07"
-              >
-                {busy ? "Waiting for signer…" : "Sign with browser extension"}
-              </button>
-            </div>
-          ) : (
-            <p className="muted">
-              No NIP-07 extension detected. Sign the event template elsewhere and paste the JSON
-              below.
-            </p>
-          )}
-          <label>
-            Signed event (JSON)
-            <textarea
-              value={eventJson}
-              onChange={(e) => setEventJson(e.target.value)}
-              rows={8}
-              style={{ width: "100%", fontFamily: "monospace", fontSize: "0.85rem" }}
-              data-testid="account-pubkey-event"
-            />
-          </label>
-          <label>
-            Label (optional)
-            <input
-              type="text"
-              value={label}
-              onChange={(e) => setLabel(e.target.value)}
-              placeholder="phone, signing device, …"
-              data-testid="account-pubkey-label"
-            />
-          </label>
-          {firstLink ? (
-            <label>
-              Current password (required to link your first key)
-              <input
-                type="password"
-                autoComplete="current-password"
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                data-testid="account-pubkey-password"
-              />
-            </label>
-          ) : null}
-          <div className="actions">
-            <button type="submit" disabled={busy} data-testid="account-pubkey-verify">
-              {busy ? "Verifying…" : "Link key"}
-            </button>
-            <button
-              type="button"
-              className="secondary"
-              disabled={busy}
-              onClick={() => {
-                setView({ kind: "idle" });
-                setErr(null);
-              }}
-              data-testid="account-pubkey-cancel"
-            >
-              Cancel
-            </button>
-          </div>
-        </form>
-      ) : (
+      {link.kind === "idle" ? (
         <div className="actions">
           <button
             type="button"
@@ -1066,13 +1261,205 @@ function PubkeysSection({ csrf }: { csrf: string }) {
             onClick={() => void onStartLink()}
             data-testid="account-pubkey-link"
           >
-            {busy ? "Starting…" : "Link a Nostr key"}
+            {busy ? "Starting…" : "Link a key"}
           </button>
+        </div>
+      ) : (
+        <div className="link-flow" data-testid="account-pubkey-flow">
+          <StepIndicator current={link.kind === "statement" ? 1 : link.kind === "sign" ? 2 : 3} />
+
+          {link.kind === "statement" ? (
+            <div className="link-panel" data-testid="account-pubkey-step-statement">
+              <h3>Get the statement</h3>
+              <p>
+                The hub wrote this one-time statement naming your account and this hub. Signing it
+                proves you hold the key — nothing else.
+              </p>
+              <pre
+                className="statement-box"
+                data-testid="account-pubkey-statement"
+                style={{ whiteSpace: "pre-wrap" }}
+              >
+                <code>{link.challenge.event_template.content}</code>
+              </pre>
+              <p className="dim">
+                It stops being valid at <code>{formatDate(link.challenge.expires_at)}</code>. Start
+                over if that passes.
+              </p>
+              <div className="actions">
+                <button
+                  type="button"
+                  disabled={busy}
+                  onClick={() => setLink({ kind: "sign", challenge: link.challenge })}
+                  data-testid="account-pubkey-statement-continue"
+                >
+                  Next: sign it
+                </button>
+                <button
+                  type="button"
+                  className="secondary"
+                  disabled={busy}
+                  onClick={resetFlow}
+                  data-testid="account-pubkey-cancel"
+                >
+                  Cancel
+                </button>
+              </div>
+            </div>
+          ) : null}
+
+          {link.kind === "sign" ? (
+            <div className="link-panel" data-testid="account-pubkey-step-sign">
+              <h3>Sign it</h3>
+              <pre
+                className="statement-box"
+                data-testid="account-pubkey-statement"
+                style={{ whiteSpace: "pre-wrap" }}
+              >
+                <code>{link.challenge.event_template.content}</code>
+              </pre>
+
+              {nip07 ? (
+                <>
+                  <p>
+                    Your browser has a Nostr signing extension. It will show you that sentence and
+                    ask you to approve it.
+                  </p>
+                  <div className="actions">
+                    <button
+                      type="button"
+                      disabled={busy}
+                      onClick={() => void onSignWithExtension()}
+                      data-testid="account-pubkey-nip07"
+                    >
+                      {busy ? "Waiting for signer…" : "Sign with browser extension"}
+                    </button>
+                  </div>
+                  <div className="account-subsection">
+                    <button
+                      type="button"
+                      className="secondary account-disclosure"
+                      aria-expanded={showPaste}
+                      aria-controls="account-pubkey-paste"
+                      onClick={() => setShowPaste((s) => !s)}
+                      data-testid="account-pubkey-paste-toggle"
+                    >
+                      <span aria-hidden="true">{showPaste ? "▾" : "▸"}</span> Sign somewhere else /
+                      paste manually
+                    </button>
+                    <div id="account-pubkey-paste" hidden={!showPaste}>
+                      {showPaste ? pasteField : null}
+                    </div>
+                  </div>
+                </>
+              ) : (
+                <>
+                  <p data-testid="account-pubkey-no-extension">
+                    No signing extension detected in this browser. Sign the statement wherever your
+                    key lives, then paste the result below.
+                  </p>
+                  <p className="dim">
+                    A NIP-07 extension (Alby, nos2x, and friends) makes this one click next time.
+                  </p>
+                  <div id="account-pubkey-paste">{pasteField}</div>
+                </>
+              )}
+
+              <div className="actions">
+                <button
+                  type="button"
+                  className="secondary"
+                  disabled={busy}
+                  onClick={() => setLink({ kind: "statement", challenge: link.challenge })}
+                  data-testid="account-pubkey-back-statement"
+                >
+                  Back
+                </button>
+                <button
+                  type="button"
+                  className="secondary"
+                  disabled={busy}
+                  onClick={resetFlow}
+                  data-testid="account-pubkey-cancel"
+                >
+                  Cancel
+                </button>
+              </div>
+            </div>
+          ) : null}
+
+          {link.kind === "confirm" ? (
+            <form
+              onSubmit={(e) => void onVerify(e)}
+              className="link-panel settings-form account-form"
+              data-testid="account-pubkey-step-confirm"
+            >
+              <h3>Confirm</h3>
+              <p>
+                Signed by{" "}
+                <code data-testid="account-pubkey-signer">{truncatePubkey(link.event.pubkey)}</code>
+                . Linking records that this key is yours.
+              </p>
+              <label>
+                Label (optional)
+                <input
+                  type="text"
+                  value={label}
+                  onChange={(e) => setLabel(e.target.value)}
+                  placeholder="e.g. 'my phone key'"
+                  data-testid="account-pubkey-label"
+                />
+              </label>
+              {firstLink ? (
+                <>
+                  <label>
+                    Your hub password
+                    <input
+                      type="password"
+                      autoComplete="current-password"
+                      value={password}
+                      onChange={(e) => setPassword(e.target.value)}
+                      data-testid="account-pubkey-password"
+                    />
+                  </label>
+                  <p className="dim" data-testid="account-pubkey-password-why">
+                    First link asks for your hub password so a stolen browser session can't bind a
+                    key to your account.
+                  </p>
+                </>
+              ) : null}
+              <div className="actions">
+                <button type="submit" disabled={busy} data-testid="account-pubkey-verify">
+                  {busy ? "Verifying…" : "Link key"}
+                </button>
+                <button
+                  type="button"
+                  className="secondary"
+                  disabled={busy}
+                  onClick={() => setLink({ kind: "sign", challenge: link.challenge })}
+                  data-testid="account-pubkey-back-sign"
+                >
+                  Back
+                </button>
+                <button
+                  type="button"
+                  className="secondary"
+                  disabled={busy}
+                  onClick={resetFlow}
+                  data-testid="account-pubkey-cancel"
+                >
+                  Cancel
+                </button>
+              </div>
+            </form>
+          ) : null}
         </div>
       )}
 
       {list.kind === "loading" ? (
-        <p className="muted">Loading keys…</p>
+        <p className="muted" data-loading="true">
+          Loading keys…
+        </p>
       ) : list.kind === "error" ? (
         <div className="error" data-testid="account-pubkeys-error">
           {list.message}
@@ -1145,7 +1532,7 @@ function PubkeysSection({ csrf }: { csrf: string }) {
           {err}
         </div>
       )}
-    </section>
+    </>
   );
 }
 
