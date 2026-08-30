@@ -36,6 +36,21 @@
  * published only when the trigger is a branch push of `main`. `isTagPush`
  * still overrides the registry guards for **rc** versions (re-release, an
  * older rc, an ambiguous registry). It does not override this gate.
+ *
+ * **A first publish out of a merge.** npm trusted publishing (OIDC) cannot
+ * CREATE a package — it can only publish a new version of one that already
+ * exists and already trusts this workflow. So a package with nothing on npm
+ * at all used to read as "not published → publish", and the job 404'd at the
+ * registry (surface#220, `@openparachute/account-client@0.1.0`; same hole
+ * here). Worse than the noise: "never published" and "registry unreachable"
+ * are the two ways to see an empty registry, and only one of them is safe
+ * to act on. So a never-published package SKIPS on a branch push, with a
+ * reason that says how to do it deliberately. Note this is about the
+ * package, not the version: once anything is on npm, merge-driven releases
+ * take over as before. An explicit **tag push** of an rc still
+ * short-circuits — a human pushing a tag is the deliberate act, and letting
+ * it try surfaces the real npm error (`404` / "you must be logged in")
+ * instead of hiding it behind our own skip.
  */
 
 import { appendFileSync } from "node:fs";
@@ -77,9 +92,13 @@ export interface RegistryView {
   currentDistTagVersion?: string;
   /**
    * Every version currently on npm. Used to require an `X.Y.Z-rc.*` of the
-   * same core before a stable. Omitted is treated as empty — a stable then
-   * refuses unless this is a first-ever package (nothing on the dist-tag
-   * either). Forgetting to plumb the list must not silently skip the gate.
+   * same core before a stable, and — when it is empty AND no dist-tag
+   * resolves — to recognise a package that has never been published at all.
+   * Omitted is treated as empty, which now means "never published" and skips.
+   * That is the safe direction for a plumbing mistake: a forgotten list can
+   * only cost a skip, never an attempted publish of a package npm won't
+   * create. An unreadable registry is `{ ambiguous: true }`, not an empty
+   * list, and stays a refusal — the two must not collapse into each other.
    */
   publishedVersions?: readonly string[];
 }
@@ -218,6 +237,17 @@ export function decidePublish(
   if (registry.versionExists) {
     return { publish: false, reason: `${version} is already on npm` };
   }
+  // Nothing on npm under this name AT ALL — not "this version is new", but
+  // "this package does not exist". Trusted publishing cannot create it, so a
+  // merge-driven run would 404 (surface#220). Distinct from `ambiguous`
+  // above: that is a registry we couldn't read, this is a registry that
+  // answered 404. Only the second one is knowledge.
+  if ((registry.publishedVersions ?? []).length === 0 && !registry.currentDistTagVersion) {
+    return {
+      publish: false,
+      reason: `nothing is published under this name yet, and ${version} would be its first release — a first publish is a deliberate act, not a merge side-effect. npm trusted publishing cannot create a package, only add versions to one that already trusts this workflow. Publish once by hand (or push an explicit rc tag), wire up the trusted publisher, and merge-driven releases take over from the second version on.`,
+    };
+  }
   const current = registry.currentDistTagVersion;
   if (current && compareVersions(version, current) < 0) {
     return {
@@ -229,17 +259,17 @@ export function decidePublish(
     };
   }
   if (distTagFor(version) === "latest") {
+    // No first-ever carve-out here any more: a package with nothing published
+    // returned above, so by this point npm has *something* and a stable owes
+    // us a matching rc unconditionally.
     const published = registry.publishedVersions ?? [];
-    const firstEver = published.length === 0 && !current;
-    if (!firstEver) {
-      const rcs = matchingRcVersions(version, published);
-      if (rcs.length === 0) {
-        const core = coreVersion(version);
-        return {
-          refuse: true,
-          reason: `${version} is a stable release but npm has no ${core}-rc.* — stable is a suffix-drop from an rc, never a skip. Cut an rc first, soak, then drop the suffix.`,
-        };
-      }
+    const rcs = matchingRcVersions(version, published);
+    if (rcs.length === 0) {
+      const core = coreVersion(version);
+      return {
+        refuse: true,
+        reason: `${version} is a stable release but npm has no ${core}-rc.* — stable is a suffix-drop from an rc, never a skip. Cut an rc first, soak, then drop the suffix.`,
+      };
     }
   }
   return { publish: true, reason: `${version} is not on npm` };
@@ -255,7 +285,8 @@ export async function readRegistry(
   try {
     const res = await fetchImpl(`https://registry.npmjs.org/${encoded}`);
     if (res.status === 404) {
-      // Package has never been published at all — first release.
+      // Package does not exist. publishedVersions: [] (present-and-empty)
+      // is what decidePublish reads as never-published (surface#220).
       return { versionExists: false, publishedVersions: [] };
     }
     if (!res.ok) return { ambiguous: true };
@@ -374,8 +405,9 @@ if (import.meta.main) {
   }
   // Stable must be a suffix-drop from the latest matching rc tag.
   // decidePublish already required that npm has an X.Y.Z-rc.*; this is the
-  // "no new code" half. First-ever packages have no rc to diff against and
-  // skip. Tag-push overrides, same as decidePublish.
+  // "no new code" half. (Never-published packages don't reach here at all —
+  // decidePublish skips them, surface#220.) Tag-push overrides, same as
+  // decidePublish.
   if (
     decision.publish &&
     distTagFor(version) === "latest" &&
