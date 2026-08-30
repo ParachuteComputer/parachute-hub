@@ -797,8 +797,9 @@ export function renderVaultStep(props: RenderVaultStepProps): string {
           <span class="preview-fine">— admin: you, MCP-ready for Claude Code</span>
         </div>
         <p class="preview-fine">
-          The name shows up in the MCP URL (<code>/vault/&lt;name&gt;/mcp</code>)
-          and on the admin UI. You can add or manage vaults later from the
+          The name labels the vault on the admin UI, and rides along as the
+          MCP server name (<code>parachute-&lt;name&gt;</code>) if you connect
+          this vault on its own. You can add or manage vaults later from the
           vault module's own admin at <code>/vault/admin/</code>.
         </p>
       </section>
