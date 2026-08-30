@@ -334,6 +334,37 @@ describe("POST /verify — happy path", () => {
     expect(listUserPubkeys(db, alice.userId)).toHaveLength(1);
     expect(listUserPubkeys(db, alice.userId)[0]!.label).toBe("new");
   });
+
+  // hub#862. The wizard omits `label` entirely when its field is blank, so a
+  // plain "prove this key again" round trip used to silently wipe a label the
+  // user had set. Absent is now "unspecified"; only an explicit erase erases.
+  test("a re-verify carrying no label keeps the existing one", async () => {
+    const alice = await userWithSession("alice");
+    expect((await linkKey(alice, SECRET_A, { label: "laptop" })).status).toBe(200);
+
+    const res = await linkKey(alice, SECRET_A);
+    expect(res.status).toBe(200);
+    expect((await res.json()) as { relinked: boolean; label: string | null }).toMatchObject({
+      relinked: true,
+      label: "laptop",
+    });
+    expect(listUserPubkeys(db, alice.userId)[0]!.label).toBe("laptop");
+  });
+
+  test("a re-verify with an explicit null or empty label clears it", async () => {
+    for (const [name, cleared] of [
+      ["alice", null],
+      ["bob", ""],
+    ] as const) {
+      const user = await userWithSession(name);
+      const secret = name === "alice" ? SECRET_A : SECRET_B;
+      expect((await linkKey(user, secret, { label: "laptop" })).status).toBe(200);
+      const res = await linkKey(user, secret, { label: cleared });
+      expect(res.status).toBe(200);
+      expect(((await res.json()) as { label: string | null }).label).toBeNull();
+      expect(listUserPubkeys(db, user.userId)[0]!.label).toBeNull();
+    }
+  });
 });
 
 describe("POST /verify — the statement binding", () => {

@@ -402,21 +402,30 @@ async function handleVerify(
   const unlinkable = unlinkableUsername(user.username);
   if (unlinkable) return unlinkable;
 
-  // 1. Label.
-  let label: string | null = null;
-  if (body.label !== undefined && body.label !== null) {
-    if (
-      typeof body.label !== "string" ||
-      body.label.length > MAX_PUBKEY_LABEL_LEN ||
-      LABEL_FORBIDDEN_RE.test(body.label)
-    ) {
-      return jsonError(
-        400,
-        "invalid_label",
-        `label must be printable single-line text of at most ${MAX_PUBKEY_LABEL_LEN} characters`,
-      );
+  // 1. Label. Three-valued on purpose (hub#862): ABSENT means "say nothing
+  //    about the label", which on a re-verify of an already-linked key leaves
+  //    the stored label standing. Only an explicit `null` (or empty string)
+  //    clears it. The old two-valued read collapsed absent into null and so
+  //    silently erased a label the user had set, on a request that was only
+  //    ever about re-proving possession.
+  let label: string | null | undefined;
+  if (body.label !== undefined) {
+    if (body.label === null || body.label === "") {
+      label = null;
+    } else {
+      if (
+        typeof body.label !== "string" ||
+        body.label.length > MAX_PUBKEY_LABEL_LEN ||
+        LABEL_FORBIDDEN_RE.test(body.label)
+      ) {
+        return jsonError(
+          400,
+          "invalid_label",
+          `label must be printable single-line text of at most ${MAX_PUBKEY_LABEL_LEN} characters`,
+        );
+      }
+      label = body.label;
     }
-    label = body.label;
   }
 
   // 2. Event shape. One generic error for every shape failure — the granular
