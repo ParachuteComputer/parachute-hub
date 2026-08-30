@@ -86,7 +86,7 @@ import { type OAuthClient, deriveVaultScopeFromMcpUrl, realOAuthClient } from ".
 import { type PendingFlow, deleteFlow, getFlowByState, putFlow } from "./oauth-flows-store.ts";
 import { isSafeHubReturnTo } from "./oauth-handlers.ts";
 import { findSession, parseSessionCookie } from "./sessions.ts";
-import { isFirstAdmin } from "./users.ts";
+import { isHubAdmin } from "./users.ts";
 import { validateVaultName } from "./vault-name.ts";
 
 /**
@@ -287,7 +287,7 @@ function requireOperator(req: Request, deps: AgentGrantsDeps): { userId: string 
   if (!session) {
     return jsonError(401, "unauthenticated", "no admin session — sign in at /login first");
   }
-  if (!isFirstAdmin(deps.db, session.userId)) {
+  if (!isHubAdmin(deps.db, session.userId)) {
     return jsonError(
       403,
       "not_admin",

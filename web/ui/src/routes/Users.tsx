@@ -9,11 +9,19 @@
  *
  * Surface:
  *
- *   1. **Users list table.** Username · Assigned vaults · Password set ·
- *      Created · Actions. First admin (the wizard / env-seeded
- *      bootstrap row) has every row action disabled with a tooltip; the
- *      server enforces every rail (`first_admin_undeletable`,
- *      `cannot_reset_first_admin`, `cannot_edit_first_admin_vaults`).
+ *   1. **Users list table.** Username · Email · Role · Assigned vaults ·
+ *      Password set · Created · Actions. Since hub#881 the "is an admin"
+ *      oracle is the row's `hub_role`, not its position — a hub can hold
+ *      several admins. Which control is disabled follows which rail it
+ *      mirrors: Edit vaults + Reset password are dead for ANY admin
+ *      (`cannot_edit_first_admin_vaults`, `cannot_reset_first_admin` —
+ *      both fan out to every admin server-side), Delete is dead only for
+ *      the FIRST admin (`first_admin_undeletable`, the rail that keeps
+ *      ≥1 admin alive), so a promoted admin stays deletable.
+ *   6. **Promote to admin (hub#881).** Per non-admin row, behind a
+ *      confirm step because there is no demote endpoint. Disabled while
+ *      the user holds vault assignments — the server refuses with
+ *      `has_vault_assignments` rather than dropping those grants.
  *   2. **Create user form.** Collapsible section below the table.
  *      Username + password + assigned-vaults multi-select (fetched on
  *      mount from `/api/users/vaults`). `<select multiple>` with shift-
@@ -57,6 +65,7 @@ import {
   listUserVaults,
   listUsers,
   listVaultCaps,
+  promoteHubAdmin,
   resetUserPassword,
   setVaultCap,
   updateUserVaults,
@@ -151,6 +160,30 @@ type EditVaultsState =
   | { kind: "error"; userId: string; selected: string[]; message: string };
 
 /**
+ * Per-row promote-to-hub-admin state (hub#881). Shaped like `DeleteState`
+ * rather than the inline-form states because promotion is a confirm-then-
+ * act action with no fields — and, like delete, it is not reversible from
+ * this UI (there is no demote endpoint), so it earns a confirm step.
+ */
+type PromoteState =
+  | { kind: "idle" }
+  | { kind: "confirming"; user: UserListing }
+  | { kind: "promoting"; userId: string }
+  | { kind: "done"; username: string }
+  | { kind: "error"; userId: string; message: string };
+
+/**
+ * Whether a listed user holds hub-admin role (hub#881). Reads the stored
+ * `hub_role` rather than the row's position — before v20 the SPA inferred
+ * "admin" from `users[0].id`, which cannot represent a second admin.
+ * A missing value (SPA newer than the hub) degrades to non-admin, matching
+ * the server's fail-closed `isHubAdmin`.
+ */
+function isHubAdminRow(u: UserListing): boolean {
+  return u.hub_role === "admin";
+}
+
+/**
  * The "where do they sign in?" handoff line, shared by the create-user
  * and reset-password success banners. Surfaces the concrete
  * `<hub-origin>/login` URL + the username so the operator can hand a
@@ -187,6 +220,7 @@ export function Users() {
   const [deleteSt, setDeleteSt] = useState<DeleteState>({ kind: "idle" });
   const [resetSt, setResetSt] = useState<ResetState>({ kind: "idle" });
   const [editVaultsSt, setEditVaultsSt] = useState<EditVaultsState>({ kind: "idle" });
+  const [promoteSt, setPromoteSt] = useState<PromoteState>({ kind: "idle" });
 
   useEffect(() => {
     void reload;
@@ -273,6 +307,26 @@ export function Users() {
             ? err.message
             : String(err);
       setDeleteSt({ kind: "error", userId: user.id, message });
+    }
+  }
+
+  async function onConfirmPromote(user: UserListing): Promise<void> {
+    setPromoteSt({ kind: "promoting", userId: user.id });
+    try {
+      await promoteHubAdmin(user.id);
+      setPromoteSt({ kind: "done", username: user.username });
+      // Refresh rather than patching in place: promotion changes which
+      // row actions are live (vault edit + password reset go dead), and
+      // the server list is the source of truth for that.
+      setReload((n) => n + 1);
+    } catch (err) {
+      const message =
+        err instanceof HttpError
+          ? `Promote failed (${err.status}): ${err.message}`
+          : err instanceof Error
+            ? err.message
+            : String(err);
+      setPromoteSt({ kind: "error", userId: user.id, message });
     }
   }
 
@@ -376,6 +430,27 @@ export function Users() {
         </output>
       )}
 
+      {promoteSt.kind === "done" && (
+        <output
+          className="success-banner"
+          style={{ display: "block", marginBottom: "0.75rem" }}
+          data-testid="promote-done-banner"
+        >
+          <code>{promoteSt.username}</code> is now a hub admin — unrestricted across every vault,
+          able to mint host-admin tokens, and able to reach <code>/admin/*</code>. There is no
+          demote action; remove the role by deleting the account.
+          <div style={{ marginTop: "0.5rem" }}>
+            <button
+              type="button"
+              className="secondary"
+              onClick={() => setPromoteSt({ kind: "idle" })}
+            >
+              Dismiss
+            </button>
+          </div>
+        </output>
+      )}
+
       {renderListSection(
         state,
         deleteSt,
@@ -387,6 +462,9 @@ export function Users() {
         editVaultsSt,
         setEditVaultsSt,
         onSubmitEditVaults,
+        promoteSt,
+        setPromoteSt,
+        onConfirmPromote,
         state.kind === "ok" ? state.data.vaults : [],
         state.kind === "ok" ? state.data.hubOrigin : "",
         () => setReload((n) => n + 1),
@@ -424,6 +502,9 @@ function renderListSection(
   editVaultsSt: EditVaultsState,
   setEditVaultsSt: (s: EditVaultsState) => void,
   onSubmitEditVaults: (user: UserListing, selected: string[]) => Promise<void>,
+  promoteSt: PromoteState,
+  setPromoteSt: (s: PromoteState) => void,
+  onConfirmPromote: (user: UserListing) => Promise<void>,
   availableVaults: string[],
   hubOrigin: string,
   onRetry: () => void,
@@ -452,11 +533,13 @@ function renderListSection(
       </div>
     );
   }
-  // The first row by `created_at ASC` is the wizard / env-seeded admin
-  // — the server enforces "first admin can't be deleted" AND "first
-  // admin password reset goes through /account/change-password
-  // directly." The SPA disables both row actions as a UX hint; the
-  // server checks are authoritative.
+  // The first row by `created_at ASC` is the wizard / env-seeded admin.
+  // Since hub#881 this is NOT the "is an admin" oracle any more — that is
+  // `hub_role`, read per row via `isHubAdminRow`. `firstAdminId` narrows
+  // to the one rail that is genuinely about position: the first admin is
+  // undeletable, which is what guarantees the hub always keeps ≥1 admin.
+  // Promoted admins ARE deletable. The server checks are authoritative;
+  // these disabled states are UX hints.
   const firstAdminId = users[0]?.id;
   return (
     <ListRendered
@@ -471,6 +554,9 @@ function renderListSection(
       editVaultsSt={editVaultsSt}
       setEditVaultsSt={setEditVaultsSt}
       onSubmitEditVaults={onSubmitEditVaults}
+      promoteSt={promoteSt}
+      setPromoteSt={setPromoteSt}
+      onConfirmPromote={onConfirmPromote}
       availableVaults={availableVaults}
       hubOrigin={hubOrigin}
     />
@@ -489,6 +575,9 @@ interface ListRenderedProps {
   editVaultsSt: EditVaultsState;
   setEditVaultsSt: (s: EditVaultsState) => void;
   onSubmitEditVaults: (user: UserListing, selected: string[]) => Promise<void>;
+  promoteSt: PromoteState;
+  setPromoteSt: (s: PromoteState) => void;
+  onConfirmPromote: (user: UserListing) => Promise<void>;
   availableVaults: string[];
   /** Canonical hub origin for the reset-password sign-in handoff line. */
   hubOrigin: string;
@@ -506,6 +595,9 @@ function ListRendered({
   editVaultsSt,
   setEditVaultsSt,
   onSubmitEditVaults,
+  promoteSt,
+  setPromoteSt,
+  onConfirmPromote,
   availableVaults,
   hubOrigin,
 }: ListRenderedProps): React.ReactNode {
@@ -527,6 +619,22 @@ function ListRendered({
           <tbody>
             {users.map((u) => {
               const isFirstAdmin = u.id === firstAdminId;
+              // Any hub admin (first or promoted). Drives the badge and the
+              // rails that fan out to every admin: vault-membership edits and
+              // admin-initiated password resets.
+              const isAdmin = isHubAdminRow(u);
+              // A promoted admin — admin, but not the undeletable first row.
+              const isPromotedAdmin = isAdmin && !isFirstAdmin;
+              // Promotion is offered only to non-admins, and the server
+              // refuses a target that still holds vault assignments (an
+              // admin's vault access is unrestricted, so per-vault rows must
+              // be revoked first). Mirror that as a disabled button + reason.
+              const hasVaultAssignments = u.assigned_vaults.length > 0;
+              const isPromoting = promoteSt.kind === "promoting" && promoteSt.userId === u.id;
+              const isPromoteConfirming =
+                promoteSt.kind === "confirming" && promoteSt.user.id === u.id;
+              const rowPromoteError =
+                promoteSt.kind === "error" && promoteSt.userId === u.id ? promoteSt : null;
               const isDeleting = deleteSt.kind === "deleting" && deleteSt.userId === u.id;
               const isConfirming = deleteSt.kind === "confirming" && deleteSt.user.id === u.id;
               const rowDeleteError =
@@ -557,6 +665,11 @@ function ListRendered({
                         first admin
                       </span>
                     )}
+                    {isPromotedAdmin && (
+                      <span className="badge" style={{ marginLeft: "0.5rem" }}>
+                        hub admin
+                      </span>
+                    )}
                   </td>
                   <td>
                     {u.email ? (
@@ -581,11 +694,10 @@ function ListRendered({
                     )}
                   </td>
                   <td>
-                    {/* No per-user role column exists in Phase 1 — the first
-                        admin is *the* admin by construction (earliest-created
-                        row). Surface that as the operator-facing "role" so a
-                        demo viewer can tell admin from member at a glance. */}
-                    {isFirstAdmin ? (
+                    {/* Reads the stored `hub_role` (hub#881, migration v20),
+                        so EVERY admin shows as admin — not just the earliest-
+                        created row the SPA used to infer it from. */}
+                    {isAdmin ? (
                       <span className="badge">admin</span>
                     ) : (
                       <span className="muted">member</span>
@@ -608,8 +720,8 @@ function ListRendered({
                       <span
                         className="muted"
                         title={
-                          isFirstAdmin
-                            ? "First admin is unrestricted (admin posture)"
+                          isAdmin
+                            ? "Hub admins are unrestricted (admin posture)"
                             : "No vaults assigned — user can't authorize any vault yet"
                         }
                       >
@@ -641,7 +753,7 @@ function ListRendered({
                     <span title={u.created_at}>{formatCreatedAt(u.created_at)}</span>
                   </td>
                   <td>
-                    {isConfirming ? null : (
+                    {isConfirming || isPromoteConfirming ? null : (
                       <div
                         style={{
                           display: "flex",
@@ -659,34 +771,40 @@ function ListRendered({
                         `title` too for sighted hover users.
                       */}
                         {isFirstAdmin && (
+                          <span id={`first-admin-tooltip-${u.id}`} className="sr-only">
+                            First admin can't be deleted (would self-lock the hub)
+                          </span>
+                        )}
+                        {isAdmin && (
                           <>
-                            <span id={`first-admin-tooltip-${u.id}`} className="sr-only">
-                              First admin can't be deleted (would self-lock the hub)
+                            <span id={`admin-reset-tooltip-${u.id}`} className="sr-only">
+                              Hub admins self-rotate via /account/change-password
                             </span>
-                            <span id={`first-admin-reset-tooltip-${u.id}`} className="sr-only">
-                              First admin uses /account/change-password directly
-                            </span>
-                            <span id={`first-admin-vaults-tooltip-${u.id}`} className="sr-only">
-                              First admin's vault membership is unrestricted by design
+                            <span id={`admin-vaults-tooltip-${u.id}`} className="sr-only">
+                              A hub admin's vault membership is unrestricted by design
                             </span>
                           </>
+                        )}
+                        {!isAdmin && hasVaultAssignments && (
+                          <span id={`promote-assignments-tooltip-${u.id}`} className="sr-only">
+                            Revoke this user's vault assignments before promoting — a hub admin's
+                            vault access is unrestricted
+                          </span>
                         )}
                         <button
                           type="button"
                           className="secondary"
                           disabled={
-                            isFirstAdmin ||
+                            isAdmin ||
                             editVaultsForRow !== null ||
                             (editVaultsSt.kind === "submitting" && editVaultsSt.userId === u.id)
                           }
                           title={
-                            isFirstAdmin
-                              ? "First admin's vault membership is unrestricted by design"
+                            isAdmin
+                              ? "A hub admin's vault membership is unrestricted by design"
                               : undefined
                           }
-                          aria-describedby={
-                            isFirstAdmin ? `first-admin-vaults-tooltip-${u.id}` : undefined
-                          }
+                          aria-describedby={isAdmin ? `admin-vaults-tooltip-${u.id}` : undefined}
                           onClick={() =>
                             setEditVaultsSt({
                               kind: "open",
@@ -702,18 +820,16 @@ function ListRendered({
                           type="button"
                           className="secondary"
                           disabled={
-                            isFirstAdmin ||
+                            isAdmin ||
                             resetForRow !== null ||
                             (resetSt.kind === "submitting" && resetSt.userId === u.id)
                           }
                           title={
-                            isFirstAdmin
-                              ? "First admin uses /account/change-password directly"
+                            isAdmin
+                              ? "Hub admins self-rotate via /account/change-password"
                               : undefined
                           }
-                          aria-describedby={
-                            isFirstAdmin ? `first-admin-reset-tooltip-${u.id}` : undefined
-                          }
+                          aria-describedby={isAdmin ? `admin-reset-tooltip-${u.id}` : undefined}
                           onClick={() => setResetSt({ kind: "open", userId: u.id, password: "" })}
                           aria-label={`Reset password for ${u.username}`}
                         >
@@ -736,7 +852,85 @@ function ListRendered({
                         >
                           {isDeleting ? "Deleting…" : "Delete"}
                         </button>
+                        {/*
+                          Promote to hub admin (hub#881). Offered only on
+                          non-admin rows — there is no demote endpoint, so an
+                          admin row has no role control at all. Disabled while
+                          the user still holds vault assignments: an admin's
+                          vault access is unrestricted, so the server refuses
+                          (403 `has_vault_assignments`) rather than silently
+                          discarding those grants. Revoke via Edit vaults first.
+                        */}
+                        {!isAdmin && (
+                          <button
+                            type="button"
+                            className="secondary"
+                            disabled={hasVaultAssignments || isPromoting}
+                            title={
+                              hasVaultAssignments
+                                ? "Revoke this user's vault assignments before promoting — a hub admin's vault access is unrestricted"
+                                : undefined
+                            }
+                            aria-describedby={
+                              hasVaultAssignments
+                                ? `promote-assignments-tooltip-${u.id}`
+                                : undefined
+                            }
+                            onClick={() => setPromoteSt({ kind: "confirming", user: u })}
+                            aria-label={`Promote ${u.username} to hub admin`}
+                          >
+                            {isPromoting ? "Promoting…" : "Promote to admin"}
+                          </button>
+                        )}
                       </div>
+                    )}
+                    {isPromoteConfirming && (
+                      <dialog
+                        open
+                        className="error-banner"
+                        style={{ marginTop: "0.25rem", background: "var(--bg-warn, #fffbe6)" }}
+                        aria-label={`Confirm promote ${u.username}`}
+                      >
+                        <p>
+                          Make <code>{u.username}</code> a hub admin? They get unrestricted access
+                          to every vault on this hub, can mint host-admin tokens, and can reach{" "}
+                          <code>/admin/*</code>. <strong>This cannot be undone from the UI</strong>{" "}
+                          — there is no demote action; removing admin means deleting the account.
+                        </p>
+                        <div style={{ display: "flex", gap: "0.5rem", marginTop: "0.5rem" }}>
+                          <button
+                            type="button"
+                            className="destructive"
+                            onClick={() => {
+                              void onConfirmPromote(u);
+                            }}
+                            disabled={isPromoting}
+                          >
+                            {isPromoting ? "Promoting…" : "Promote to admin"}
+                          </button>
+                          <button
+                            type="button"
+                            className="secondary"
+                            onClick={() => setPromoteSt({ kind: "idle" })}
+                            disabled={isPromoting}
+                          >
+                            Cancel
+                          </button>
+                        </div>
+                      </dialog>
+                    )}
+                    {rowPromoteError && (
+                      <output className="error-banner" style={{ marginTop: "0.25rem" }}>
+                        {rowPromoteError.message}
+                        <button
+                          type="button"
+                          className="secondary"
+                          style={{ marginLeft: "0.5rem" }}
+                          onClick={() => setPromoteSt({ kind: "idle" })}
+                        >
+                          Dismiss
+                        </button>
+                      </output>
                     )}
                     {isConfirming && (
                       <dialog

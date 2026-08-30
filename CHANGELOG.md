@@ -6,12 +6,14 @@ All notable changes to `@openparachute/hub` are documented here. The format foll
 >
 > This backfill covers the 0.6.x line only. Two pre-existing gaps remain undocumented and are **not** addressed here: the `0.5.13` stable itself (the file's newest entry is `0.5.13-rc.48`, never the stable) and the entire `0.5.14-rc` chain (rc.1–rc.21 on npm), which never promoted to a `0.5.14` stable — its work folded forward into 0.6.0.
 
-## [0.7.18] - 2026-08-29
+## [0.7.18] - 2026-08-30
 
-**Stable promotion of 0.7.18-rc.10.** No new code. Suffix-drop only. npm `@rc`
-is 0.7.18-rc.10; this is the matching `@latest`.
+**Stable promotion of 0.7.18-rc.11.** No new code. Suffix-drop only. npm `@rc`
+is 0.7.18-rc.11; this is the matching `@latest`. (An earlier promotion cut
+from rc.10 — hub#917 — was refused by the plan gate after rc.11 published on
+the same core; this entry supersedes its changelog text.)
 
-The 0.7.18 line (rc.1-rc.10) ships key-as-account: a Nostr key is now a
+The 0.7.18 line (rc.1-rc.11) ships key-as-account: a Nostr key is now a
 first-class hub identity. NIP-98 request auth (#882) and the account-MCP
 door (#883); NIP-98 accepted at root `/mcp` plus grant-vault-access by
 pubkey (#888, #889); OAuth `account:vaults` and account-MCP at root `/mcp`
@@ -19,12 +21,49 @@ pubkey (#888, #889); OAuth `account:vaults` and account-MCP at root `/mcp`
 #907); the consent-picker XOR (#901) and `account:self:*` extras minting
 alongside `account:vaults` (#904); account-MCP proxies vault MCP instead of
 cloning REST (#910); NIP-98 `u`-tag honors `X-Forwarded-Proto` behind a
-TLS-terminating proxy (#914). Also in this line: person-mint `users.id`,
-Account SPA, leftover CAS (#872, #874, #875); rc cuts publish directly from
-`next` (#911) and stables publish from `main` only (#913).
+TLS-terminating proxy (#914); the 401 challenge at `/mcp` names the root
+PRM (#920, closes #899); multiple hub admins via `users.hub_role` (#921,
+closes #881). Also in this line: person-mint `users.id`, Account SPA,
+leftover CAS (#872, #874, #875); rc cuts publish directly from `next`
+(#911), stables publish from `main` only (#913), and tag-record fetches
+tags (#919).
 
 Auto-provision stays off by default: an unlinked key gets nothing unless
-granted or `PARACHUTE_NOSTR_AUTO_PROVISION=1`. Leaves #880, #881, #899 open.
+granted or `PARACHUTE_NOSTR_AUTO_PROVISION=1`. Leaves #880 open (its UI
+rework, #923, rides the 0.7.19 line).
+
+## [0.7.18-rc.11] - 2026-08-29
+
+**Tag-record, canonical `/mcp` 401, and multiple hub admins.** Three PRs
+on `next` after 0.7.18-rc.10. Version bump only; no new code in this
+commit. Merging this to `next` publishes `@rc` (hub#911 — no next→main
+hop).
+
+- **Tag-record checkout fetches tags (#919).** Port of surface#216: the
+  already-tagged dedupe rev-parses the tag, but a shallow tagless clone
+  cannot see pre-existing remote tags, so the push is rejected and
+  swallowed by continue-on-error.
+
+- **401 challenge at `/mcp` names the root PRM (#920, closes #899).**
+  `handleAccountMcp` answers both `/mcp` and `/account/mcp`. The 401
+  `WWW-Authenticate` `resource_metadata` now follows the request URL:
+  `/mcp` → root PRM (vault-only scopes); `/account/mcp` → account PRM.
+  Root PRM stays vault-only — mixing `account:vaults` onto it would
+  make catalog-copy request both families and bounce as
+  `invalid_scope`.
+
+- **Multiple hub admins via `users.hub_role` (#921, closes #881).**
+  Persistent `admin`/`user` column; migration backfills the earliest
+  row. `isHubAdmin()` is privilege; `getFirstAdminId` stays the
+  undeletable first account plus empty-table bootstrap sentinels.
+  Promote-only (`POST /api/users/:id/promote-hub-admin`), refuses a
+  target with vault assignments (empty `user_vaults` means unrestricted
+  for an admin and no access for a friend). No demote in v1. Peer
+  rails extend to every admin. SPA reads `hub_role` instead of
+  `users[0]`.
+
+Leaves #880 open (link-ceremony UX, rides rc.12). Auto-provision still
+defaults off. Do not suffix-drop 0.7.18.
 
 ## [0.7.18-rc.10] - 2026-08-29
 

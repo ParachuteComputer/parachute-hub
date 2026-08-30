@@ -304,7 +304,7 @@ export const NON_REQUESTABLE_SCOPES: ReadonlySet<string> = new Set([
  * can delegate `vault:<their-vault>:admin` to their client. The cap still
  * drops admin (and every verb) for a vault the user is NOT assigned to
  * (held=null), and an admin-only request the cap empties is refused outright
- * (never minted as a zero-scope token). The hub owner (isFirstAdmin) holds
+ * (never minted as a zero-scope token). A hub admin (isHubAdmin) holds
  * admin everywhere by construction.
  *
  * `vault:<name>:admin` also remains mintable by operator-proving local paths,

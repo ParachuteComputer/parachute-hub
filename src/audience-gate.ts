@@ -72,7 +72,7 @@ import type { Database } from "bun:sqlite";
 import { validateHostAdminToken } from "./host-admin-token-validation.ts";
 import type { ServiceEntry, UiAudience, UiSubUnit } from "./services-manifest.ts";
 import { findActiveSession } from "./sessions.ts";
-import { isFirstAdmin } from "./users.ts";
+import { isHubAdmin } from "./users.ts";
 
 /** A pathname resolved to the UI sub-unit that hosts it. */
 export interface UiMountMatch {
@@ -218,7 +218,7 @@ export async function gateUiAudience(
   const session = findActiveSession(db, req);
 
   if (audience === "operator") {
-    if (session && isFirstAdmin(db, session.userId)) return null;
+    if (session && isHubAdmin(db, session.userId)) return null;
     if (session) {
       return denyJson(
         403,

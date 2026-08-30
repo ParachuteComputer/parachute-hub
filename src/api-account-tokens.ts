@@ -44,7 +44,7 @@ import {
   isWellFormedOrNonVaultScope,
   vaultScopeName,
 } from "./scope-explanations.ts";
-import { type User, isFirstAdmin, vaultVerbsForUserVault } from "./users.ts";
+import { type User, isHubAdmin, vaultVerbsForUserVault } from "./users.ts";
 
 export interface AccountTokensDeps {
   db: Database;
@@ -76,7 +76,7 @@ function jsonError(status: number, error: string, description: string): Response
  */
 export function canAccountSelfMint(db: Database, user: User, scope: string): boolean {
   if (scope.toLowerCase().startsWith("parachute:host:")) return false;
-  if (isFirstAdmin(db, user.id)) return !isNonRequestableScope(scope);
+  if (isHubAdmin(db, user.id)) return !isNonRequestableScope(scope);
   const name = vaultScopeName(scope);
   if (name === null) return false;
   const verb = scope.split(":")[2];
@@ -86,7 +86,7 @@ export function canAccountSelfMint(db: Database, user: User, scope: string): boo
 }
 
 function hasAccountMintAuthority(db: Database, user: User): boolean {
-  if (isFirstAdmin(db, user.id)) return true;
+  if (isHubAdmin(db, user.id)) return true;
   return user.assignedVaults.some((name) => {
     const held = vaultVerbsForUserVault(db, user.id, name);
     return held !== null && held.length > 0;

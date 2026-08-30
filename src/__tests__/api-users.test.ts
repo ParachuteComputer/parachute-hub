@@ -19,6 +19,11 @@
  *   - GET /api/users/vaults returns the same name set the OAuth issuer
  *     would resolve against.
  *   - 405 on wrong methods.
+ *   - POST /:id/promote-hub-admin (hub#881) happy path, refusals
+ *     (404 / 409 `already_hub_admin` / 403 `has_vault_assignments`),
+ *     and the multi-admin rails: a promoted admin is deletable, cannot
+ *     have their vaults edited, cannot have their password reset, and
+ *     the first admin stays undeletable.
  */
 import type { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
@@ -30,12 +35,13 @@ import {
   handleDeleteUser,
   handleListUsers,
   handleListVaults,
+  handlePromoteHubAdmin,
   handleResetUserPassword,
   handleUpdateUserVaults,
 } from "../api-users.ts";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
 import { findTokenRowByJti, recordTokenMint, signAccessToken } from "../jwt-sign.ts";
-import { createUser, getUserById, verifyPassword } from "../users.ts";
+import { createUser, getUserById, isHubAdmin, setHubRoleAdmin, verifyPassword } from "../users.ts";
 
 const ISSUER = "https://hub.test";
 const HOST_ADMIN_SCOPE = "parachute:host:admin";
@@ -895,5 +901,226 @@ describe("handleUpdateUserVaults", () => {
     expect(res.status).toBe(200);
     const fresh = getUserById(harness.db, friend.id);
     expect(fresh?.assignedVaults).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// POST /api/users/:id/promote-hub-admin (hub#881)
+// ---------------------------------------------------------------------------
+
+describe("handlePromoteHubAdmin", () => {
+  function promote(bearer: string, id: string): Promise<Response> {
+    return handlePromoteHubAdmin(
+      withBearer(`/api/users/${id}/promote-hub-admin`, bearer, { method: "POST" }),
+      id,
+      deps(),
+    );
+  }
+
+  test("401 with no Authorization header", async () => {
+    const res = await handlePromoteHubAdmin(
+      req("/api/users/some-id/promote-hub-admin", { method: "POST" }),
+      "some-id",
+      deps(),
+    );
+    expect(res.status).toBe(401);
+  });
+
+  test("403 when the bearer lacks parachute:host:admin", async () => {
+    const { bearer } = await makeAdminBearer(["other:scope"]);
+    const friend = await createUser(harness.db, "alice", "alice-strong-passphrase", {
+      allowMulti: true,
+    });
+    const res = await promote(bearer, friend.id);
+    expect(res.status).toBe(403);
+    // The friend must NOT have been promoted by a rejected request.
+    expect(isHubAdmin(harness.db, friend.id)).toBe(false);
+  });
+
+  test("405 on GET", async () => {
+    const { bearer } = await makeAdminBearer();
+    const res = await handlePromoteHubAdmin(
+      withBearer("/api/users/some-id/promote-hub-admin", bearer, { method: "GET" }),
+      "some-id",
+      deps(),
+    );
+    expect(res.status).toBe(405);
+  });
+
+  test("404 when the target user does not exist", async () => {
+    const { bearer } = await makeAdminBearer();
+    const res = await promote(bearer, "no-such-id");
+    expect(res.status).toBe(404);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toBe("not_found");
+  });
+
+  test("200 promotes a friend with no vault assignments", async () => {
+    const { bearer } = await makeAdminBearer();
+    const friend = await createUser(harness.db, "alice", "alice-strong-passphrase", {
+      allowMulti: true,
+      passwordChanged: true,
+    });
+    expect(isHubAdmin(harness.db, friend.id)).toBe(false);
+    const res = await promote(bearer, friend.id);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("cache-control")).toBe("no-store");
+    const body = (await res.json()) as {
+      ok: boolean;
+      user: Record<string, unknown>;
+    };
+    expect(body.ok).toBe(true);
+    expect(body.user.hub_role).toBe("admin");
+    expect(body.user.id).toBe(friend.id);
+    // Hash never leaks, even on the promote response.
+    expect(body.user).not.toHaveProperty("password_hash");
+    expect(isHubAdmin(harness.db, friend.id)).toBe(true);
+  });
+
+  test("409 already_hub_admin when the target is already an admin", async () => {
+    const { bearer, userId } = await makeAdminBearer();
+    const res = await promote(bearer, userId);
+    expect(res.status).toBe(409);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toBe("already_hub_admin");
+  });
+
+  test("403 has_vault_assignments when the target holds any user_vaults row", async () => {
+    // The []-invariant: `vaultScopeForUser` reads `[]` as "unrestricted"
+    // for an admin and "no access" for a friend, so an admin must carry
+    // zero assignments. Refuse rather than silently dropping the rows.
+    harness.cleanup();
+    harness = makeHarness(manifestWithVaults("home"));
+    const { bearer } = await makeAdminBearer();
+    const friend = await createUser(harness.db, "alice", "alice-strong-passphrase", {
+      allowMulti: true,
+      assignedVaults: ["home"],
+    });
+    const res = await promote(bearer, friend.id);
+    expect(res.status).toBe(403);
+    const body = (await res.json()) as { error: string; error_description: string };
+    expect(body.error).toBe("has_vault_assignments");
+    // The message must name the vault AND tell the operator what to do.
+    expect(body.error_description).toContain("home");
+    expect(body.error_description).toMatch(/revoke/i);
+    expect(isHubAdmin(harness.db, friend.id)).toBe(false);
+  });
+
+  test("promoting works after the blocking vault assignments are revoked", async () => {
+    harness.cleanup();
+    harness = makeHarness(manifestWithVaults("home"));
+    const { bearer } = await makeAdminBearer();
+    const friend = await createUser(harness.db, "alice", "alice-strong-passphrase", {
+      allowMulti: true,
+      assignedVaults: ["home"],
+    });
+    expect((await promote(bearer, friend.id)).status).toBe(403);
+    // Revoke via the documented path — PATCH /:id/vaults with an empty list.
+    const clear = await handleUpdateUserVaults(
+      withBearer(`/api/users/${friend.id}/vaults`, bearer, {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ assigned_vaults: [] }),
+      }),
+      friend.id,
+      deps(),
+    );
+    expect(clear.status).toBe(200);
+    expect((await promote(bearer, friend.id)).status).toBe(200);
+    expect(isHubAdmin(harness.db, friend.id)).toBe(true);
+  });
+});
+
+describe("multi-admin rails (hub#881)", () => {
+  /** Seed a friend and promote them, returning the admin bearer + ids. */
+  async function withPromotedAdmin(): Promise<{
+    bearer: string;
+    firstAdminId: string;
+    promotedId: string;
+  }> {
+    const { bearer, userId } = await makeAdminBearer();
+    const friend = await createUser(harness.db, "alice", "alice-strong-passphrase", {
+      allowMulti: true,
+      passwordChanged: true,
+    });
+    setHubRoleAdmin(harness.db, friend.id);
+    return { bearer, firstAdminId: userId, promotedId: friend.id };
+  }
+
+  test("a promoted admin IS deletable (the first admin is the one that isn't)", async () => {
+    // Second admins are deletable because the first admin's undeletable
+    // rail already guarantees the hub keeps at least one admin.
+    const { bearer, firstAdminId, promotedId } = await withPromotedAdmin();
+    const del = await handleDeleteUser(
+      withBearer(`/api/users/${promotedId}`, bearer, { method: "DELETE" }),
+      promotedId,
+      deps(),
+    );
+    expect(del.status).toBe(200);
+    expect(getUserById(harness.db, promotedId)).toBeNull();
+    // …and the first admin still refuses.
+    const delFirst = await handleDeleteUser(
+      withBearer(`/api/users/${firstAdminId}`, bearer, { method: "DELETE" }),
+      firstAdminId,
+      deps(),
+    );
+    expect(delFirst.status).toBe(403);
+    const body = (await delFirst.json()) as { error: string };
+    expect(body.error).toBe("first_admin_undeletable");
+    expect(getUserById(harness.db, firstAdminId)).not.toBeNull();
+  });
+
+  test("cannot edit ANY hub admin's vault assignments, not just the first", async () => {
+    harness.cleanup();
+    harness = makeHarness(manifestWithVaults("home"));
+    const { bearer, promotedId } = await withPromotedAdmin();
+    const res = await handleUpdateUserVaults(
+      withBearer(`/api/users/${promotedId}/vaults`, bearer, {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ assigned_vaults: ["home"] }),
+      }),
+      promotedId,
+      deps(),
+    );
+    expect(res.status).toBe(403);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toBe("cannot_edit_first_admin_vaults");
+    // The []-invariant holds: no rows were written.
+    expect(getUserById(harness.db, promotedId)?.assignedVaults).toEqual([]);
+  });
+
+  test("cannot reset ANY hub admin's password — prevents peer takeover", async () => {
+    // Without this fan-out, admin A could set admin B's password and then
+    // sign in as B: a privilege the single-admin model never granted.
+    const { bearer, promotedId } = await withPromotedAdmin();
+    const before = getUserById(harness.db, promotedId);
+    const res = await handleResetUserPassword(
+      withBearer(`/api/users/${promotedId}/reset-password`, bearer, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ new_password: "attacker-chosen-pw" }),
+      }),
+      promotedId,
+      deps(),
+    );
+    expect(res.status).toBe(403);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toBe("cannot_reset_first_admin");
+    const after = getUserById(harness.db, promotedId);
+    expect(after?.passwordHash).toBe(before?.passwordHash ?? "");
+    expect(await verifyPassword(after!, "attacker-chosen-pw")).toBe(false);
+  });
+
+  test("the list surface reports hub_role for every row", async () => {
+    const { bearer, firstAdminId, promotedId } = await withPromotedAdmin();
+    await createUser(harness.db, "bob", "bob-strong-passphrase", { allowMulti: true });
+    const res = await handleListUsers(withBearer("/api/users", bearer), deps());
+    const body = (await res.json()) as { users: Array<Record<string, unknown>> };
+    const byId = new Map(body.users.map((u) => [u.id as string, u.hub_role]));
+    expect(byId.get(firstAdminId)).toBe("admin");
+    expect(byId.get(promotedId)).toBe("admin");
+    expect([...byId.values()].filter((r) => r === "admin")).toHaveLength(2);
+    expect([...byId.values()].filter((r) => r === "user")).toHaveLength(1);
   });
 });

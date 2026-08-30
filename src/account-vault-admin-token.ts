@@ -5,7 +5,7 @@
  * (`admin-vault-admin-token.ts`). Both mint a `vault:<name>:admin` JWT and
  * hand it to the vault's own admin SPA via a `#token=<jwt>` URL fragment — the
  * SPA reads `location.hash` on bootstrap, then strips it. The admin sibling is
- * gated `isFirstAdmin` and returns JSON for the hub SPA's fetch; THIS surface
+ * gated `isHubAdmin` and returns JSON for the hub SPA's fetch; THIS surface
  * is gated on ASSIGNMENT (an individual user holds `admin` on a vault they're
  * assigned to) and is a server-rendered POST → 303 redirect, matching the
  * no-JS posture of the rest of `/account/*`.
