@@ -46,7 +46,7 @@ import type { ServicesManifest } from "../services-manifest.ts";
 import { SESSION_TTL_MS, buildSessionCookie, createSession, findSession } from "../sessions.ts";
 import { _resetTotpReplayCache, generateTotpSecret } from "../totp.ts";
 import { backupCodesRemaining, isTotpEnrolled, persistEnrollment } from "../two-factor-store.ts";
-import { createUser, setUserVaults } from "../users.ts";
+import { createUser, getUserById, isHubAdmin, setHubRoleAdmin, setUserVaults } from "../users.ts";
 
 const ISSUER = "https://hub.example";
 const TEST_CSRF = "csrf-test-token";
@@ -6532,6 +6532,50 @@ describe("vaultScopeForUser (multi-user Phase 2 PR 2 — many-to-many)", () => {
     const { db, cleanup } = await makeDb();
     try {
       expect(vaultScopeForUser(db, "no-such-id")).toEqual([]);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("a PROMOTED admin with zero user_vaults rows returns [] = unrestricted (hub#881)", async () => {
+    // The load-bearing asymmetry: `[]` means "no narrowing" for an admin
+    // and "no access" for a friend. Promotion flips which meaning the
+    // SAME empty array carries, so this pins that a second admin lands on
+    // the unrestricted side of it — the whole reason the promote endpoint
+    // refuses a target that still holds assignments.
+    const { db, cleanup } = await makeDb();
+    try {
+      await createUser(db, "admin-aaron", "pw");
+      const bob = await createUser(db, "bob", "pw", { allowMulti: true });
+      // Before promotion the identical [] means "no vault access".
+      expect(vaultScopeForUser(db, bob.id)).toEqual([]);
+      expect(isHubAdmin(db, bob.id)).toBe(false);
+
+      setHubRoleAdmin(db, bob.id);
+
+      expect(isHubAdmin(db, bob.id)).toBe(true);
+      expect(vaultScopeForUser(db, bob.id)).toEqual([]);
+      expect(getUserById(db, bob.id)?.assignedVaults).toEqual([]);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("a promoted admin short-circuits BEFORE reading user_vaults", async () => {
+    // Defense-in-depth: if a stale assignment ever survived (hand-edited
+    // row, or a future code path that skips the promote endpoint's
+    // `has_vault_assignments` gate), the admin branch must still return
+    // [] rather than narrowing the admin to that one vault — narrowing an
+    // admin would be a silent privilege REDUCTION that reads as working.
+    const { db, cleanup } = await makeDb();
+    try {
+      await createUser(db, "admin-aaron", "pw");
+      const bob = await createUser(db, "bob", "pw", {
+        allowMulti: true,
+        assignedVaults: ["personal"],
+      });
+      setHubRoleAdmin(db, bob.id);
+      expect(vaultScopeForUser(db, bob.id)).toEqual([]);
     } finally {
       cleanup();
     }

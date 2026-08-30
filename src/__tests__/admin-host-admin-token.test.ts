@@ -26,7 +26,7 @@ import {
   findSession,
 } from "../sessions.ts";
 import { rotateSigningKey } from "../signing-keys.ts";
-import { createUser } from "../users.ts";
+import { createUser, setHubRoleAdmin } from "../users.ts";
 
 const ISSUER = "https://hub.test";
 
@@ -278,5 +278,43 @@ describe("handleHostAdminToken", () => {
     };
     expect(Array.isArray(tokensBody.tokens)).toBe(true);
     expect(tokensBody.next_cursor).toBeNull();
+  });
+});
+
+describe("handleHostAdminToken — promoted second admin (hub#881)", () => {
+  test("a promoted admin can mint the host-admin bearer", async () => {
+    // The gate moved from "is the earliest users row" to "hub_role =
+    // 'admin'", so a SECOND admin must now get through the same door the
+    // first admin uses — that is the whole point of #881.
+    const { friendCookie, friendId } = await withAdminAndFriend();
+    setHubRoleAdmin(harness.db, friendId);
+    rotateSigningKey(harness.db);
+    const res = await handleHostAdminToken(
+      new Request(`${ISSUER}/admin/host-admin-token`, { headers: { cookie: friendCookie } }),
+      { db: harness.db, issuer: ISSUER },
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { token: string };
+    const validated = await validateAccessToken(harness.db, body.token, ISSUER);
+    expect(validated.payload.sub).toBe(friendId);
+    const scopes = String(validated.payload.scope ?? "").split(" ");
+    expect(scopes).toContain("parachute:host:admin");
+  });
+
+  test("a NON-promoted friend is still refused after another user is promoted", async () => {
+    // Guard against the gate degrading to "any admin exists" — promotion
+    // must be per-account, not a hub-wide switch.
+    const { friendCookie, friendId } = await withAdminAndFriend();
+    const other = await createUser(harness.db, "bob", "bob-passphrase", { allowMulti: true });
+    setHubRoleAdmin(harness.db, other.id);
+    expect(other.id).not.toBe(friendId);
+    rotateSigningKey(harness.db);
+    const res = await handleHostAdminToken(
+      new Request(`${ISSUER}/admin/host-admin-token`, { headers: { cookie: friendCookie } }),
+      { db: harness.db, issuer: ISSUER },
+    );
+    expect(res.status).toBe(403);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toBe("not_admin");
   });
 });

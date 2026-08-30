@@ -16,6 +16,7 @@
  *   DELETE /api/users/:id                   hard-delete user (host:admin)
  *   POST   /api/users/:id/reset-password    admin password reset (host:admin)
  *   PATCH  /api/users/:id/vaults            edit a user's vault list (host:admin)
+ *   POST   /api/users/:id/promote-hub-admin promote to hub admin (host:admin)
  *   GET    /api/users/vaults                vault-name list for the
  *                                           assigned-vault dropdown
  *                                           (host:admin)
@@ -37,11 +38,15 @@
  * `lib/auth.ts` caches it in module-scoped memory (never `localStorage`).
  *
  * First-admin-undeletable: enforced server-side via
- * `SELECT id FROM users ORDER BY created_at ASC LIMIT 1`. Per design §7
- * the safety rail is absolute — Phase 1 has no role model, so the
- * first-created admin is *the* admin by construction. A malicious or
- * buggy SPA bypassing the row-level disabled-button can't get past
- * the API check.
+ * `SELECT id FROM users ORDER BY created_at ASC LIMIT 1` (`getFirstAdminId`).
+ * Per design §7 the safety rail is absolute. Since hub#881 a hub can hold
+ * several admins, so this rail is no longer "the admin is undeletable" but
+ * "ONE admin is always undeletable" — that is what guarantees no sequence of
+ * deletes can leave the hub with zero admins. Promoted admins ARE deletable.
+ * The peer rails next to it (cannot edit ANY admin's vaults, cannot reset ANY
+ * admin's password) key off `isHubAdmin` instead, and fan out to every admin.
+ * A malicious or buggy SPA bypassing the row-level disabled-button can't get
+ * past the API check.
  */
 import type { Database } from "bun:sqlite";
 import { type AdminAuthError, adminAuthErrorResponse, requireScope } from "./admin-auth.ts";
@@ -53,14 +58,15 @@ import {
   type User,
   UsernameTakenError,
   createUser,
-  describeUsernameReason,
   deleteUser,
+  describeUsernameReason,
   getFirstAdminId,
   getUserById,
   getUserByUsernameCI,
-  isFirstAdmin,
+  isHubAdmin,
   listUsers,
   resetUserPassword,
+  setHubRoleAdmin,
   setUserVaults,
   validatePassword,
   validateUsername,
@@ -103,6 +109,15 @@ export interface UserWireShape {
   email: string | null;
   assigned_vaults: string[];
   created_at: string;
+  /**
+   * Hub-wide role: `'admin'` | `'user'` (migration v20, hub#881). The SPA
+   * reads this instead of the old `users[0].id` first-admin oracle to draw
+   * the admin badge and to decide which per-row controls are live. Note
+   * the first admin is still special for the delete rail specifically —
+   * the SPA identifies them positionally (first row of a `created_at ASC`
+   * list), which is exactly what `getFirstAdminId` does server-side.
+   */
+  hub_role: string;
 }
 
 function toWire(u: User): UserWireShape {
@@ -113,6 +128,7 @@ function toWire(u: User): UserWireShape {
     email: u.email,
     assigned_vaults: [...u.assignedVaults],
     created_at: u.createdAt,
+    hub_role: u.hubRole,
   };
 }
 
@@ -565,10 +581,11 @@ async function parseUpdateVaultsBody(
  *   2. Bearer carries `parachute:host:admin` (401 / 403 via `requireScope`).
  *   3. Parse body (400 on shape).
  *   4. Target user exists (404 `not_found`).
- *   5. Target is NOT the first admin (403 `cannot_edit_first_admin_vaults`)
- *      — admin posture is unrestricted by design (`isFirstAdmin`); the
- *      first admin's "vault membership" is implicit and shouldn't be
- *      mutated. Mirrors the first-admin-undeletable rail.
+ *   5. Target is NOT a hub admin (403 `cannot_edit_first_admin_vaults`)
+ *      — admin posture is unrestricted by design (`isHubAdmin`); an
+ *      admin's "vault membership" is implicit and must stay empty (see
+ *      the invariant on `isHubAdmin`). Applies to EVERY admin since
+ *      hub#881, not only the first.
  *   6. Every requested vault name is registered in services.json
  *      (400 `assigned_vault_not_found`).
  *   7. `setUserVaults` — atomic DELETE+INSERT inside one transaction.
@@ -597,16 +614,25 @@ export async function handleUpdateUserVaults(
   if (!target) {
     return jsonError(404, "not_found", `no user with id "${userId}"`);
   }
-  // First-admin protection — admin posture is "unrestricted" by design
-  // (`isFirstAdmin` short-circuits `vaultScopeForUser` to `[]`). Pinning
-  // the first admin to a vault list would muddy that semantic. The SPA
+  // Hub-admin protection, and it is load-bearing, not cosmetic (hub#881).
+  // `vaultScopeForUser` short-circuits ANY admin to `[]` = "no narrowing",
+  // while `[]` on a non-admin means "no access". Writing `user_vaults` rows
+  // onto an admin therefore produces rows that read as nothing while the
+  // role holds and silently become the account's entire access surface if
+  // the role is ever removed. Admins hold zero assignments — that is the
+  // invariant the promote endpoint's `has_vault_assignments` refusal also
+  // defends. Extended from the first admin to EVERY admin here. The SPA
   // disables this row's button as a UX hint; the server check is
   // authoritative.
-  if (isFirstAdmin(deps.db, userId)) {
+  //
+  // Wire error code kept as `cannot_edit_first_admin_vaults` for API
+  // compatibility even though it now fires for any admin; the description
+  // carries the accurate reason.
+  if (isHubAdmin(deps.db, userId)) {
     return jsonError(
       403,
       "cannot_edit_first_admin_vaults",
-      "the first admin's vault membership is unrestricted by design — no vault list to edit",
+      "a hub admin's vault membership is unrestricted by design — no vault list to edit",
     );
   }
   // Validate every vault name against the live services.json list.
@@ -786,17 +812,22 @@ export async function handleResetUserPassword(
   if (!target) {
     return jsonError(404, "not_found", `no user with id "${userId}"`);
   }
-  // First-admin protection. The earliest-created row is the wizard or
-  // env-seeded admin by construction (Phase 1 has no role model). Reset
-  // by admin would be a self-action — the admin should use the normal
-  // `/account/change-password` rotate flow instead, which requires
-  // knowing the current password (genuine credential rotation, not a
-  // recovery reset). Pairs with the first-admin-undeletable rail above.
-  if (isFirstAdmin(deps.db, userId)) {
+  // Hub-admin protection, extended from the first admin to EVERY admin
+  // (hub#881). Admins self-rotate: `/account/change-password` requires the
+  // current password, so it is genuine credential rotation rather than a
+  // recovery reset. Letting one admin reset a peer admin's password would
+  // be a peer-takeover primitive — admin A sets admin B's password, then
+  // signs in as B — which is strictly worse than the single-admin case it
+  // replaced, so the rail must fan out with the role. Pairs with the
+  // first-admin-undeletable rail above.
+  //
+  // Wire error code kept as `cannot_reset_first_admin` for API
+  // compatibility even though it now fires for any admin.
+  if (isHubAdmin(deps.db, userId)) {
     return jsonError(
       403,
       "cannot_reset_first_admin",
-      "the first admin must use /account/change-password directly — admin password reset is for friend accounts",
+      "a hub admin must use /account/change-password directly — admin password reset is for friend accounts",
     );
   }
   const validity = validatePassword(parsed.body.new_password);
@@ -835,4 +866,103 @@ export async function handleResetUserPassword(
       headers: { "content-type": "application/json", "cache-control": "no-store" },
     },
   );
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/users/:id/promote-hub-admin — grant a second (nth) hub admin
+// ---------------------------------------------------------------------------
+
+/**
+ * Promote a friend account to hub administrator (hub#881).
+ *
+ * Before migration v20 the hub admin was a POSITION — the earliest `users`
+ * row — so "add another admin" was unrepresentable. `users.hub_role` makes
+ * it a stored property and this is the only endpoint that writes `'admin'`
+ * to it after bootstrap.
+ *
+ * Auth: identical to every other `/api/users` surface — a Bearer carrying
+ * `parachute:host:admin`, validated by `requireScope` against the hub-bound
+ * issuer set. The SPA mints that bearer from its session cookie via
+ * `/admin/host-admin-token`, which is itself `isHubAdmin`-gated, so the
+ * effective rule is "an admin may promote". Deliberately NOT a
+ * session-cookie gate: `api-users.ts` is a bearer surface end to end, and
+ * introducing a second auth flavor on one endpoint is how gaps appear.
+ *
+ * Order of checks (mirrors `handleResetUserPassword` / `handleUpdateUserVaults`):
+ *
+ *   1. Method gate (405 on non-POST).
+ *   2. Bearer carries `parachute:host:admin` (401 / 403 via `requireScope`).
+ *   3. Target user exists (404 `not_found`).
+ *   4. Target is not already an admin (409 `already_hub_admin`).
+ *   5. Target holds ZERO `user_vaults` rows (403 `has_vault_assignments`).
+ *   6. `setHubRoleAdmin` — single UPDATE.
+ *
+ * Step 5 is the security core, not a tidiness check. `vaultScopeForUser`
+ * returns `[]` for an admin meaning "no narrowing — may request scope
+ * against any vault", and `[]` for a non-admin meaning "no access". A
+ * promoted account that kept its `user_vaults` rows would carry stale
+ * assignments that are invisible while the role holds and become its whole
+ * access surface if the role is ever cleared. Refusing here keeps the
+ * invariant "admins have no vault assignments" true by construction, in
+ * the same direction as `handleUpdateUserVaults` refusing to write
+ * assignments onto an admin. The operator revokes the assignments first —
+ * a deliberate, visible act — rather than having the hub silently discard
+ * access records on their behalf.
+ *
+ * There is NO demote endpoint by design. Removing an admin's role is a
+ * hub-lockout shape (last admin, or one admin stripping a peer) that wants
+ * its own design pass; promotion is one-way for now, and an admin who
+ * shouldn't be one is removed by deleting the account.
+ *
+ * Response on success: `200 { ok: true, user: <wire shape> }` with
+ * `hub_role: "admin"`.
+ */
+export async function handlePromoteHubAdmin(
+  req: Request,
+  userId: string,
+  deps: ApiUsersDeps,
+): Promise<Response> {
+  if (req.method !== "POST") {
+    return jsonError(405, "method_not_allowed", "use POST");
+  }
+  try {
+    await requireScope(deps.db, req, HOST_ADMIN_SCOPE, deps.knownIssuers ?? [deps.issuer]);
+  } catch (err) {
+    return adminAuthErrorResponse(err as AdminAuthError);
+  }
+  const target = getUserById(deps.db, userId);
+  if (!target) {
+    return jsonError(404, "not_found", `no user with id "${userId}"`);
+  }
+  // Already an admin — 409 rather than a silent 200. Promotion is not
+  // idempotent-by-intent: an operator repeating it usually means they
+  // targeted the wrong row, and a conflict says so.
+  if (isHubAdmin(deps.db, userId)) {
+    return jsonError(409, "already_hub_admin", `user "${target.username}" is already a hub admin`);
+  }
+  // Zero-assignment invariant — see the docstring. `assignedVaults` is
+  // hydrated straight from `user_vaults` by `getUserById`.
+  if (target.assignedVaults.length > 0) {
+    return jsonError(
+      403,
+      "has_vault_assignments",
+      `user "${target.username}" is assigned to vault(s) ${target.assignedVaults
+        .map((n) => `"${n}"`)
+        .join(
+          ", ",
+        )}; revoke those assignments first — a hub admin's vault access is unrestricted and must not carry per-vault rows`,
+    );
+  }
+  const ok = setHubRoleAdmin(deps.db, userId);
+  if (!ok) {
+    // Race: row deleted between `getUserById` and the UPDATE. Same
+    // race-tolerant 404 as the reset-password / vaults paths.
+    return jsonError(404, "not_found", `no user with id "${userId}"`);
+  }
+  console.log(`user promoted to hub admin: id=${userId} username=${target.username}`);
+  const fresh = getUserById(deps.db, userId);
+  return new Response(JSON.stringify({ ok: true, user: fresh ? toWire(fresh) : null }), {
+    status: 200,
+    headers: { "content-type": "application/json", "cache-control": "no-store" },
+  });
 }

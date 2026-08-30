@@ -47,7 +47,7 @@ export interface User {
    * The vault instance names this user has access to (multi-user Phase 2
    * PR 2 — many-to-many via the `user_vaults` table; design
    * 2026-05-20-multi-user-phase-1.md §Phase 2). Empty `[]` means "no per-
-   * vault restriction" for admin accounts (where `isFirstAdmin` is true
+   * vault restriction" for admin accounts (where `isHubAdmin` is true
    * and the OAuth issuer mints tokens for any requested vault). Empty
    * `[]` for a non-admin means "no access" — distinct semantics that the
    * consent picker enforces. A non-empty array lists every vault the
@@ -58,7 +58,23 @@ export interface User {
    * `created_at ASC` insert-order for deterministic iteration.
    */
   assignedVaults: string[];
+  /**
+   * Hub-wide role (migration v20, hub#881). `'admin'` = hub administrator
+   * (unrestricted vault posture, may mint the host-admin bearer, may reach
+   * `/admin/*`); `'user'` = friend account. Before v20 "admin" was the
+   * earliest `users` row (`getFirstAdminId`) — a position, not a property,
+   * so there could only ever be one. The column stores it, so a second
+   * admin can be promoted (`POST /api/users/:id/promote-hub-admin`).
+   *
+   * Read through `isHubAdmin`, never by comparing this string at a call
+   * site: that helper fails closed on unrecognised values. `getFirstAdminId`
+   * survives for the genuinely first-admin-only rails (undeletable, seed
+   * `admin` username waiver) — see `isHubAdmin`.
+   */
+  hubRole: string;
 }
+
+export type HubRole = "admin" | "user";
 
 export class SingleUserModeError extends Error {
   constructor() {
@@ -100,6 +116,7 @@ interface Row {
   updated_at: string;
   password_changed: number;
   email: string | null;
+  hub_role: string;
 }
 
 /**
@@ -147,6 +164,9 @@ function rowToUser(r: Row, assignedVaults: string[]): User {
     passwordChanged: r.password_changed === 1,
     email: r.email ?? null,
     assignedVaults,
+    // Pre-v20 rows read back through a test DB built without the column
+    // would be `undefined`; normalise to the fail-closed 'user' default.
+    hubRole: r.hub_role ?? "user",
   };
 }
 
@@ -281,6 +301,27 @@ export interface CreateUserOpts {
    * Must be synchronous — bun:sqlite transactions can't await.
    */
   withinTx?: (userId: string) => void;
+  /**
+   * Hub-wide role for the new account (migration v20, hub#881).
+   *
+   * Default: `'admin'` when this is the FIRST account on the hub (the
+   * users table is empty), `'user'` otherwise. That default is exactly
+   * the pre-v20 definition of "the admin" — `getFirstAdminId` returned
+   * the earliest row, and the earliest row is whichever account a
+   * bootstrap path created into an empty table. Deriving it here rather
+   * than at each bootstrap call site is deliberate: there are SIX first-
+   * user paths (setup wizard, `serve`'s env-seeded admin, `auth
+   * set-password`, and the NIP-98 auto-provision pairs in
+   * `grant-access.ts` / `nostr-http-auth.ts`), and a path that forgot to
+   * pass the flag would silently create a hub whose only account is not
+   * an admin. The seed paths still pass `'admin'` explicitly for
+   * legibility; it agrees with the default.
+   *
+   * Non-first accounts must NOT pass `'admin'` — promotion is the
+   * `POST /api/users/:id/promote-hub-admin` endpoint, which enforces
+   * the zero-`user_vaults`-rows invariant that admin posture requires.
+   */
+  hubRole?: HubRole;
 }
 
 export async function createUser(
@@ -306,6 +347,8 @@ export async function createUser(
   const stamp = (opts.now?.() ?? new Date()).toISOString();
   const passwordChanged = opts.passwordChanged === true ? 1 : 0;
   const email = opts.email ?? null;
+  // First account on the hub is the hub admin — see `CreateUserOpts.hubRole`.
+  const hubRole: HubRole = opts.hubRole ?? (count === 0 ? "admin" : "user");
   // De-dupe + preserve insert order so the returned array matches what
   // `getUserById` would load right after (which sorts by created_at +
   // vault_name). Empty array is "no vaults" — admin posture or a non-
@@ -322,9 +365,9 @@ export async function createUser(
     db.transaction(() => {
       db.prepare(
         `INSERT INTO users
-           (id, username, password_hash, created_at, updated_at, password_changed, email)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      ).run(id, username, passwordHash, stamp, stamp, passwordChanged, email);
+           (id, username, password_hash, created_at, updated_at, password_changed, email, hub_role)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(id, username, passwordHash, stamp, stamp, passwordChanged, email, hubRole);
       if (assignedVaults.length > 0) {
         const role = opts.role ?? "write";
         const insertVault = db.prepare(
@@ -355,6 +398,7 @@ export async function createUser(
     passwordChanged: passwordChanged === 1,
     email,
     assignedVaults,
+    hubRole,
   };
 }
 
@@ -411,22 +455,26 @@ export function userCount(db: Database): number {
 }
 
 /**
- * Single source of truth for "who is *the* admin in Phase 1." The
- * earliest-created user row is the wizard or env-seeded admin by
- * construction — Phase 1 has no role model, so the first row is the
- * hub administrator. Used by:
+ * The earliest-created user row — the account the setup wizard, the
+ * env seed, or `auth set-password` created into an empty hub.
  *
- *   - `api-users.ts` for the first-admin-undeletable rail (the only
- *     user who can't be deleted, since deleting them would self-lock
- *     the hub).
- *   - `admin-host-admin-token.ts` to gate the SPA-bearer mint endpoint
- *     to the admin only — any signed-in non-admin friend hitting it
- *     would otherwise get a JWT carrying `parachute:host:admin` +
- *     `parachute:host:auth`, a full-admin privesc (multi-user Phase 1
- *     friend-account follow-up).
- *   - `admin-handlers.ts` for the login-redirect default — non-admin
- *     users targeting `/admin/*` get redirected to `/account/` instead
- *     of a 403 wall.
+ * **This is no longer "who is an admin."** Since migration v20 (hub#881)
+ * that question is `isHubAdmin`, which reads the stored `users.hub_role`
+ * and is true for any number of accounts. `getFirstAdminId` narrowed to
+ * the two rails that are genuinely about the FIRST account, not about
+ * administrator privilege:
+ *
+ *   - `api-users.ts` first-admin-undeletable. Deleting the original
+ *     account would self-lock the hub; keeping exactly one account
+ *     permanently undeletable is what guarantees ≥1 admin survives any
+ *     sequence of deletes. Promoted admins ARE deletable.
+ *   - `users.ts:isSeedAdminUsername` — the reserved-word waiver that
+ *     lets the very first account be named `admin`.
+ *
+ * Two bootstrap sentinels also still read it, as `=== null` ("this hub
+ * has no accounts at all yet"): `grant-access.ts` and `nostr-http-auth.ts`
+ * refuse to auto-provision the hub owner. See `isHubAdmin` for why that
+ * spelling was kept.
  *
  * Returns `null` only when the users table is empty (pre-wizard state).
  */
@@ -440,9 +488,78 @@ export function getFirstAdminId(db: Database): string | null {
 /**
  * Convenience predicate over `getFirstAdminId`. Caller sites read
  * cleaner as `isFirstAdmin(db, userId)` than `getFirstAdminId(db) === userId`.
+ * Only for the first-account rails listed there — for "may this user do
+ * admin things", use `isHubAdmin`.
  */
 export function isFirstAdmin(db: Database, userId: string): boolean {
   return getFirstAdminId(db) === userId;
+}
+
+/**
+ * Single source of truth for "is this user a hub administrator"
+ * (migration v20, hub#881).
+ *
+ * Reads the stored `users.hub_role`, so a hub can have more than one
+ * admin. Replaces `isFirstAdmin` at every site that meant *privilege*
+ * rather than *position*: the host-admin / vault-admin / module-token
+ * mints, `/admin/*` routing, the OAuth vault-scope decision, the NIP-98
+ * principal, and the account-MCP admin tools.
+ *
+ * **Fails closed.** True only for the exact string `'admin'`; a missing
+ * row, an unknown role, or a NULL all return false. Same defense
+ * `vaultVerbsForRole` applies to `user_vaults.role` — a hand-edited or
+ * future-valued row grants nothing rather than defaulting to broad.
+ *
+ * ## The invariant admins carry
+ *
+ * `vaultScopeForUser` (oauth-handlers.ts) short-circuits an admin to
+ * `[]` = "no vault narrowing". For a NON-admin the identical `[]` means
+ * "no vault access at all". So an admin's `user_vaults` rows are dead
+ * weight that silently become live the moment the role is removed, and
+ * an admin with assignments reads as unrestricted regardless of what
+ * those rows say. **Admins must hold zero `user_vaults` rows.** The
+ * promote endpoint refuses a target that has any (`has_vault_assignments`),
+ * and `api-users.ts` refuses to write assignments onto any admin.
+ */
+export function isHubAdmin(db: Database, userId: string): boolean {
+  const row = db
+    .query<{ hub_role: string }, [string]>("SELECT hub_role FROM users WHERE id = ?")
+    .get(userId);
+  return row?.hub_role === "admin";
+}
+
+/**
+ * Promote a user to hub admin (`hub_role = 'admin'`). Returns `false`
+ * when no such row exists (idempotent — the API layer maps that to 404).
+ *
+ * Deliberately does NOT check the zero-`user_vaults` invariant itself:
+ * the caller (`api-users.ts:handlePromoteHubAdmin`) checks it so it can
+ * return a specific `has_vault_assignments` refusal naming what to
+ * revoke. There is no demote counterpart by design (hub#881) — removing
+ * the last admin, or an admin removing a peer, are both hub-lockout
+ * shapes that want a deliberate design pass rather than a symmetric
+ * button.
+ */
+export function setHubRoleAdmin(db: Database, userId: string, now?: () => Date): boolean {
+  const stamp = (now?.() ?? new Date()).toISOString();
+  const res = db
+    .prepare("UPDATE users SET hub_role = 'admin', updated_at = ? WHERE id = ?")
+    .run(stamp, userId);
+  return res.changes > 0;
+}
+
+/**
+ * Count the hub's administrators. Used by tests and by any future
+ * demote/delete rail that needs "would this leave the hub with zero
+ * admins". Not consulted by the delete path today — the first admin is
+ * unconditionally undeletable, which already guarantees ≥1.
+ */
+export function countHubAdmins(db: Database): number {
+  return (
+    db
+      .query<{ n: number }, []>("SELECT COUNT(*) AS n FROM users WHERE hub_role = 'admin'")
+      .get() ?? { n: 0 }
+  ).n;
 }
 
 export async function verifyPassword(user: User, password: string): Promise<boolean> {
@@ -468,7 +585,7 @@ export async function verifyPassword(user: User, password: string): Promise<bool
  *
  * Caller responsibilities:
  *   - First-admin protection — admin "membership" is unrestricted by
- *     design (see `isFirstAdmin`); `api-users.ts` refuses to call this
+ *     design (see `isHubAdmin`); `api-users.ts` refuses to call this
  *     for the first admin's row.
  *   - Vault-name validation against the live services manifest.
  */

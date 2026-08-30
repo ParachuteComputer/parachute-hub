@@ -29,9 +29,9 @@
  * 400 pointing at that endpoint, so a caller can't accidentally mint a useless
  * bare `vault:admin`.
  *
- * Gate: the session must belong to the first admin (the single hub admin under
- * the Phase 1 multi-user model — `users.ts:isFirstAdmin`), exactly like
- * host-admin-token and vault-admin-token. A friend account holds
+ * Gate: the session must belong to a hub admin (`users.ts:isHubAdmin` —
+ * `users.hub_role = 'admin'`, any number of accounts since hub#881), exactly
+ * like host-admin-token and vault-admin-token. A friend account holds
  * a valid session but must not mint a module admin Bearer.
  *
  * Tokens are short-lived (10 min — matches the sibling admin-token mints); the
@@ -47,7 +47,7 @@ import {
 import { RETIRED_MODULES, findServiceByShort, isKnownModuleShort } from "./service-spec.ts";
 import type { ServiceEntry } from "./services-manifest.ts";
 import { findSession, parseSessionCookie } from "./sessions.ts";
-import { isFirstAdmin } from "./users.ts";
+import { isHubAdmin } from "./users.ts";
 
 /** Short TTL — matches sibling admin-token mints. UI re-fetches on near-expiry. */
 export const MODULE_TOKEN_TTL_SECONDS = 10 * 60;
@@ -155,7 +155,7 @@ export async function handleModuleToken(
   // First-admin gate (mirrors host/vault/agent-admin-token). A friend account
   // (non-first-admin user) holds a valid session but must not mint a module
   // admin Bearer.
-  if (!isFirstAdmin(deps.db, session.userId)) {
+  if (!isHubAdmin(deps.db, session.userId)) {
     return jsonError(
       403,
       "not_admin",

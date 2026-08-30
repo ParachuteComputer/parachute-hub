@@ -139,6 +139,7 @@
  *   /api/users/vaults             (GET)        → vault-name list for assigned-vault picker (host:admin)
  *   /api/users/<id>               (DELETE)     → hard-delete user + revoke tokens (host:admin)
  *   /api/users/<id>/reset-password (POST)      → admin-initiated password reset (host:admin)
+ *   /api/users/<id>/promote-hub-admin (POST)   → promote a user to hub admin (host:admin)
  *   /api/vault-caps               (GET)        → list vaults + persisted storage caps (host:admin)
  *   /api/vault-caps/<name>        (PUT)        → set/update a vault's storage cap (host:admin)
  *   /login                        (GET + POST) → operator password login
@@ -316,6 +317,7 @@ import {
   handleDeleteUser,
   handleListUsers,
   handleListVaults,
+  handlePromoteHubAdmin,
   handleResetUserPassword,
   handleUpdateUserVaults,
 } from "./api-users.ts";
@@ -3914,6 +3916,27 @@ export function hubFetch(
           });
         }
       }
+      // hub#881 — `/api/users/:id/promote-hub-admin` (grant `hub_role =
+      // 'admin'`). Routed before the per-id DELETE catch-all so the trailing
+      // segment isn't mistaken for part of a user id. Same `host:admin`
+      // Bearer gate as the other /api/users surfaces. No demote counterpart
+      // by design — see `handlePromoteHubAdmin`.
+      {
+        const promoteMatch = pathname.match(/^\/api\/users\/([^/]+)\/promote-hub-admin$/);
+        if (promoteMatch) {
+          if (!getDb) return dbNotConfigured();
+          const id = decodeURIComponent(promoteMatch[1] ?? "");
+          if (!id) {
+            return new Response("not found", { status: 404 });
+          }
+          return handlePromoteHubAdmin(req, id, {
+            db: getDb(),
+            issuer: oauthDeps(req).issuer,
+            knownIssuers: oauthDeps(req).hubBoundOrigins(),
+            manifestPath,
+          });
+        }
+      }
       if (pathname.startsWith("/api/users/")) {
         if (!getDb) return dbNotConfigured();
         const id = decodeURIComponent(pathname.slice("/api/users/".length));
@@ -4393,10 +4416,9 @@ export function hubFetch(
         }
         const accountMcp = isNostrAuthorization(req) || peekBearerAudience(req) === "account";
         if (accountMcp) {
-          // Success path: same handler as /account/mcp. Failure path: that
-          // handler's 401 challenge still points at the /account/mcp PRM
-          // (RFC 9728 §3.3 mismatch vs the requested /mcp URL). hub#899;
-          // do not mix scope families on the root PRM to paper over it.
+          // Success path: same handler as /account/mcp. Failure path
+          // (hub#899): challenge builders take the request URL, so a /mcp
+          // 401 names the root PRM. Do not mix scope families there.
           if (!getDb) return dbNotConfigured();
           return handleAccountMcp(req, {
             db: getDb(),

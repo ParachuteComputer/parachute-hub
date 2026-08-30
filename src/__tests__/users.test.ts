@@ -12,6 +12,7 @@ import {
   USERNAME_RESERVED,
   UserNotFoundError,
   UsernameTakenError,
+  countHubAdmins,
   createUser,
   deleteUser,
   getFirstAdminId,
@@ -19,11 +20,13 @@ import {
   getUserByUsername,
   getUserByUsernameCI,
   isFirstAdmin,
+  isHubAdmin,
   isSeedAdminUsername,
   listUnlinkableUsernames,
   listUsers,
   removeUserVault,
   resetUserPassword,
+  setHubRoleAdmin,
   setPassword,
   setUserVaults,
   upsertUserVault,
@@ -1052,6 +1055,112 @@ describe("vaultVerbsForRole / vaultVerbsForUserVault (friend token-mint cap)", (
         "work",
       );
       expect(vaultVerbsForUserVault(db, friend.id, "work")).toEqual(["read"]);
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+describe("isHubAdmin / setHubRoleAdmin (hub#881 multi-admin)", () => {
+  test("the first account created on a hub is its admin; later accounts are not", async () => {
+    const { db, cleanup } = makeDb();
+    try {
+      const admin = await createUser(db, "admin", "pw1", { now: () => new Date(1000) });
+      const friend = await createUser(db, "alice", "pw2", {
+        allowMulti: true,
+        now: () => new Date(2000),
+      });
+      expect(admin.hubRole).toBe("admin");
+      expect(friend.hubRole).toBe("user");
+      expect(isHubAdmin(db, admin.id)).toBe(true);
+      expect(isHubAdmin(db, friend.id)).toBe(false);
+      expect(countHubAdmins(db)).toBe(1);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("isHubAdmin fails closed on an unknown id and on an unrecognised role", async () => {
+    const { db, cleanup } = makeDb();
+    try {
+      const friend = await createUser(db, "admin", "pw1");
+      expect(isHubAdmin(db, "no-such-id")).toBe(false);
+      // A hand-edited / future role value must grant nothing rather than
+      // being treated as broad — same posture as `vaultVerbsForRole`.
+      db.prepare("UPDATE users SET hub_role = ? WHERE id = ?").run("superadmin", friend.id);
+      expect(isHubAdmin(db, friend.id)).toBe(false);
+      expect(countHubAdmins(db)).toBe(0);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("setHubRoleAdmin promotes a friend; returns false for a missing row", async () => {
+    const { db, cleanup } = makeDb();
+    try {
+      await createUser(db, "admin", "pw1", { now: () => new Date(1000) });
+      const friend = await createUser(db, "alice", "pw2", {
+        allowMulti: true,
+        now: () => new Date(2000),
+      });
+      expect(setHubRoleAdmin(db, friend.id)).toBe(true);
+      expect(isHubAdmin(db, friend.id)).toBe(true);
+      expect(getUserById(db, friend.id)?.hubRole).toBe("admin");
+      expect(countHubAdmins(db)).toBe(2);
+      expect(setHubRoleAdmin(db, "no-such-id")).toBe(false);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("a promoted admin STAYS an admin after an earlier-created user is deleted", async () => {
+    // The regression this pins: under the pre-#881 positional definition,
+    // "who is admin" moved when a row was deleted. `hub_role` is stored,
+    // so deleting the second-created user must not change anyone's role —
+    // and must not make the promoted third user "the first admin" either.
+    const { db, cleanup } = makeDb();
+    try {
+      const owner = await createUser(db, "admin", "pw1", { now: () => new Date(1000) });
+      const middle = await createUser(db, "mallory", "pw2", {
+        allowMulti: true,
+        now: () => new Date(2000),
+      });
+      const promoted = await createUser(db, "alice", "pw3", {
+        allowMulti: true,
+        now: () => new Date(3000),
+      });
+      setHubRoleAdmin(db, promoted.id);
+
+      deleteUser(db, middle.id);
+
+      expect(isHubAdmin(db, promoted.id)).toBe(true);
+      expect(isHubAdmin(db, owner.id)).toBe(true);
+      expect(countHubAdmins(db)).toBe(2);
+      // The FIRST admin is still the owner — position and role are now
+      // independent, and only the owner carries the undeletable rail.
+      expect(getFirstAdminId(db)).toBe(owner.id);
+      expect(isFirstAdmin(db, promoted.id)).toBe(false);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("deleting the first admin does not silently promote the next row by position", async () => {
+    // `deleteUser` has no first-admin rail of its own (that lives in
+    // api-users.ts), so exercise the storage layer directly: role is a
+    // property, so the survivor's role is whatever was stored.
+    const { db, cleanup } = makeDb();
+    try {
+      const owner = await createUser(db, "admin", "pw1", { now: () => new Date(1000) });
+      const friend = await createUser(db, "alice", "pw2", {
+        allowMulti: true,
+        now: () => new Date(2000),
+      });
+      deleteUser(db, owner.id);
+      expect(isHubAdmin(db, friend.id)).toBe(false);
+      expect(countHubAdmins(db)).toBe(0);
+      // …even though they are now positionally "first".
+      expect(getFirstAdminId(db)).toBe(friend.id);
     } finally {
       cleanup();
     }

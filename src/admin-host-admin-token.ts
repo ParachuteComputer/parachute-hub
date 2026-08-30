@@ -25,9 +25,10 @@
  *   - this endpoint requires a valid `parachute_hub_session` cookie, which
  *     was set by `/login` after a password check.
  *
- * **First-admin gate (multi-user Phase 1 follow-up).** A valid session is
- * necessary but NOT sufficient. The session must belong to the hub admin
- * (the earliest-created user row, per `getFirstAdminId` in users.ts).
+ * **Hub-admin gate (multi-user Phase 1 follow-up).** A valid session is
+ * necessary but NOT sufficient. The session must belong to a hub admin
+ * (`users.hub_role = 'admin'`, per `isHubAdmin` in users.ts — since hub#881
+ * that is any promoted admin, not only the earliest-created row).
  * Without this gate, any signed-in friend account created via PR 2's
  * `/api/users` could hit this endpoint and walk away with a JWT carrying
  * `parachute:host:admin` + `parachute:host:auth` — a full-admin privesc,
@@ -57,7 +58,7 @@ import {
   parseSessionCookie,
   touchSession,
 } from "./sessions.ts";
-import { isFirstAdmin } from "./users.ts";
+import { isHubAdmin } from "./users.ts";
 
 /** Short TTL — page-snapshot threats can't carry the token forever. */
 export const HOST_ADMIN_TOKEN_TTL_SECONDS = 10 * 60;
@@ -90,7 +91,7 @@ export async function handleHostAdminToken(
   // `parachute:host:admin` + `parachute:host:auth` — full admin access.
   // The 403 here is mirrored on the SPA side in `web/ui/src/lib/auth.ts`:
   // 403 → redirect to `/account/` (the friend's home).
-  if (!isFirstAdmin(deps.db, session.userId)) {
+  if (!isHubAdmin(deps.db, session.userId)) {
     return jsonError(
       403,
       "not_admin",

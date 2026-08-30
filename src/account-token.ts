@@ -66,7 +66,7 @@ import {
   parseSessionCookie,
   touchSession,
 } from "./sessions.ts";
-import { isFirstAdmin } from "./users.ts";
+import { isHubAdmin } from "./users.ts";
 
 /** Short TTL — page-snapshot threats can't carry the token forever. Matches the
  * host-admin mint's 10-min window; the app re-mints when it's about to lapse. */
@@ -116,7 +116,7 @@ export async function handleAccountToken(
   // session but must not mint the account superset (host:admin + host:auth is a
   // full-admin privesc). On a single-operator box first-admin ≡ the account, so
   // this gate IS the account gate. Mirror the host-admin mint's 403 shape.
-  if (!isFirstAdmin(deps.db, session.userId)) {
+  if (!isHubAdmin(deps.db, session.userId)) {
     return jsonError(
       403,
       "not_admin",
