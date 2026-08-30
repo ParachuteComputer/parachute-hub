@@ -71,9 +71,73 @@ describe("decidePublish", () => {
     expect(d).toMatchObject({ publish: false });
   });
 
-  test("first-ever release of a package publishes", () => {
-    const d = decidePublish("0.1.0", { versionExists: false }, { branch: "main" });
+  test("a never-published package SKIPS on a branch push — a first publish is deliberate", () => {
+    // surface#220 verbatim, same hole here: a 404 package used to read
+    // "0.1.0 is not on npm" → should_publish=true, and the OIDC publish 404'd.
+    const d = decidePublish(
+      "0.1.0",
+      { versionExists: false, publishedVersions: [] },
+      { branch: "main" },
+    );
+    expect(d).toMatchObject({ publish: false });
+    expect("reason" in d && d.reason).toMatch(/first publish is a deliberate act/);
+    expect("reason" in d && d.reason).toMatch(/cannot create a package/);
+  });
+
+  test("an rc of a never-published package skips too — it's the package, not the channel", () => {
+    const d = decidePublish(
+      "0.1.0-rc.1",
+      { versionExists: false, publishedVersions: [] },
+      { branch: "next" },
+    );
+    expect(d).toMatchObject({ publish: false });
+    expect("reason" in d && d.reason).toMatch(/nothing is published under this name yet/);
+  });
+
+  test("omitted publishedVersions with no dist-tag reads as never-published — skip, don't publish", () => {
+    const d = decidePublish("0.1.0-rc.1", { versionExists: false });
+    expect(d).toMatchObject({ publish: false });
+    expect("reason" in d && d.reason).toMatch(/nothing is published under this name yet/);
+  });
+
+  test("a never-published package on an rc TAG PUSH still tries — a human said release this", () => {
+    const d = decidePublish(
+      "0.1.0-rc.1",
+      { versionExists: false, publishedVersions: [] },
+      { isTagPush: true },
+    );
     expect(d).toMatchObject({ publish: true });
+    expect("reason" in d && d.reason).toMatch(/explicit tag push/);
+  });
+
+  test("a never-published STABLE on a tag push is still refused by the from-main gate", () => {
+    const d = decidePublish(
+      "0.1.0",
+      { versionExists: false, publishedVersions: [] },
+      { isTagPush: true },
+    );
+    expect(d).toMatchObject({ publish: false });
+    expect("reason" in d && d.reason).toMatch(/from main only/);
+  });
+
+  test("an existing package is unaffected — one published version is enough", () => {
+    const d = decidePublish(
+      "0.1.0-rc.2",
+      {
+        versionExists: false,
+        currentDistTagVersion: "0.1.0-rc.1",
+        publishedVersions: ["0.1.0-rc.1"],
+      },
+      { branch: "next" },
+    );
+    expect(d).toMatchObject({ publish: true });
+    expect("reason" in d && d.reason).toMatch(/is not on npm/);
+  });
+
+  test("an unreadable registry is still a REFUSAL, not a never-published skip", () => {
+    const ambiguous = decidePublish("0.1.0-rc.1", { ambiguous: true }, { branch: "next" });
+    expect(ambiguous).toMatchObject({ refuse: true });
+    expect("refuse" in ambiguous && ambiguous.reason).toMatch(/refusing to guess/);
   });
 
   test("REFUSES to move a dist-tag backwards — the parallel-merge hazard", () => {
@@ -341,10 +405,17 @@ describe("readRegistry", () => {
     expect(v).toMatchObject({ currentDistTagVersion: "0.7.8" });
   });
 
-  test("a never-published package is not ambiguous — it's a first release", async () => {
+  test("a never-published package is not ambiguous — a 404 is knowledge", async () => {
     const v = await readRegistry("@openparachute/new", "0.1.0", (() =>
       json({}, 404)) as unknown as typeof fetch);
-    expect(v).toMatchObject({ versionExists: false });
+    expect(v).toMatchObject({ versionExists: false, publishedVersions: [] });
+    expect(v).not.toHaveProperty("ambiguous");
+  });
+
+  test("the 404 view composes into a skip — the two halves of surface#220 line up", async () => {
+    const v = await readRegistry("@openparachute/account-client", "0.1.0", (() =>
+      json({}, 404)) as unknown as typeof fetch);
+    expect(decidePublish("0.1.0", v, { branch: "main" })).toMatchObject({ publish: false });
   });
 
   test("a 5xx is ambiguous", async () => {
