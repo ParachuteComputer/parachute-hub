@@ -217,6 +217,17 @@ export interface LinkPubkeyOpts {
   proofEvent: string;
   /** Id of that event (`nostrEventId`). */
   proofEventId?: string;
+  /**
+   * Three-valued, and the distinction is load-bearing on a re-verify (hub#862):
+   *
+   *   - `undefined` — "leave whatever is stored alone". A re-verify that
+   *     carries no label keeps the label the user set on an earlier link.
+   *   - `null` — "clear it". An explicit erase.
+   *   - a string — set it.
+   *
+   * On a FIRST link there is nothing to preserve, so `undefined` and `null`
+   * both land as a null label.
+   */
   label?: string | null;
   now?: Date;
 }
@@ -239,8 +250,11 @@ export type LinkPubkeyResult =
  *   3. Refuse a NEW key past the per-user cap. A re-verify of an existing key
  *      is exempt (it adds no row).
  *   4. Insert, or update-in-place when the same user re-verifies the same key.
- *      A re-verify refreshes `label`, `last_verified_at`, and the stored proof;
- *      `linked_at` is preserved as the original link time.
+ *      A re-verify refreshes `last_verified_at` and the stored proof;
+ *      `linked_at` is preserved as the original link time, and so is `label`
+ *      unless the caller supplied one (hub#862 — see `LinkPubkeyOpts.label`).
+ *      The label is the user's own annotation, not something the proof
+ *      establishes, so a ceremony that says nothing about it must not erase it.
  *
  * **A challenge that validated in step 1 stays consumed even when steps 2–3
  * refuse.** That is deliberate: the signed event has been presented, so it is
@@ -254,7 +268,11 @@ export type LinkPubkeyResult =
 export function linkPubkey(db: Database, opts: LinkPubkeyOpts): LinkPubkeyResult {
   const now = opts.now ?? new Date();
   const stamp = now.toISOString();
-  const label = opts.label ?? null;
+  // `undefined` means "unspecified" here, NOT "null" — the re-verify branch
+  // below reads it back to decide between keeping and overwriting the stored
+  // label. `?? null` is only correct on the insert branch, where there is no
+  // prior label to keep.
+  const label = opts.label;
   const proofEventId = opts.proofEventId ?? "";
 
   const run = db.transaction((): LinkPubkeyResult => {
@@ -282,15 +300,16 @@ export function linkPubkey(db: Database, opts: LinkPubkeyOpts): LinkPubkeyResult
           .get(opts.userId) ?? { n: 0 }
       ).n;
       if (count >= MAX_PUBKEYS_PER_USER) return { ok: false, reason: "too_many_pubkeys" };
+      const newLabel = label ?? null;
       db.prepare(
         `INSERT INTO user_pubkeys
            (pubkey, user_id, label, proof_event, proof_event_id, linked_at, last_verified_at)
          VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      ).run(opts.pubkey, opts.userId, label, opts.proofEvent, proofEventId, stamp, stamp);
+      ).run(opts.pubkey, opts.userId, newLabel, opts.proofEvent, proofEventId, stamp, stamp);
       retainAttributionProof(db, {
         subject: opts.userId,
         pubkey: opts.pubkey,
-        label,
+        label: newLabel,
         proofEvent: opts.proofEvent,
         proofEventId,
         linkedAt: stamp,
@@ -302,7 +321,7 @@ export function linkPubkey(db: Database, opts: LinkPubkeyOpts): LinkPubkeyResult
         link: {
           pubkey: opts.pubkey,
           userId: opts.userId,
-          label,
+          label: newLabel,
           proofEventId,
           linkedAt: stamp,
           lastVerifiedAt: stamp,
@@ -310,15 +329,19 @@ export function linkPubkey(db: Database, opts: LinkPubkeyOpts): LinkPubkeyResult
       };
     }
 
+    // hub#862: an unspecified label leaves the stored one standing. The row
+    // already exists, so "no label in this request" is the ceremony being
+    // silent about the label, not the user asking for it to be blank.
+    const nextLabel = label === undefined ? existing.label : label;
     db.prepare(
       `UPDATE user_pubkeys
          SET label = ?, proof_event = ?, proof_event_id = ?, last_verified_at = ?
        WHERE pubkey = ? AND user_id = ?`,
-    ).run(label, opts.proofEvent, proofEventId, stamp, opts.pubkey, opts.userId);
+    ).run(nextLabel, opts.proofEvent, proofEventId, stamp, opts.pubkey, opts.userId);
     retainAttributionProof(db, {
       subject: opts.userId,
       pubkey: opts.pubkey,
-      label,
+      label: nextLabel,
       proofEvent: opts.proofEvent,
       proofEventId,
       linkedAt: existing.linked_at,
@@ -330,7 +353,7 @@ export function linkPubkey(db: Database, opts: LinkPubkeyOpts): LinkPubkeyResult
       link: {
         pubkey: opts.pubkey,
         userId: opts.userId,
-        label,
+        label: nextLabel,
         proofEventId,
         linkedAt: existing.linked_at,
         lastVerifiedAt: stamp,

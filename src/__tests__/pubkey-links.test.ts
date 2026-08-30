@@ -387,6 +387,45 @@ describe("linkPubkey", () => {
     expect(listUserPubkeys(db, alice)).toHaveLength(1);
   });
 
+  // hub#862. A re-verify proves possession; it says nothing about the label
+  // unless the caller supplies one. `undefined` must therefore preserve, while
+  // an explicit `null` still clears — otherwise there is no way to erase.
+  test("a re-link with no label preserves the stored one; an explicit null clears it", async () => {
+    const alice = await user("alice");
+    const relink = (label: string | null | undefined, at: Date) => {
+      const c = issuePubkeyChallenge(db, alice, at);
+      return linkPubkey(db, {
+        userId: alice,
+        pubkey: PK_A,
+        challenge: c.challenge,
+        proofEvent: proof(PK_A, c.challenge),
+        ...(label === undefined ? {} : { label }),
+        now: at,
+      });
+    };
+    const stored = () => listUserPubkeys(db, alice)[0]?.label;
+
+    const first = relink("laptop", new Date(1_700_000_000_000));
+    expect(first.ok).toBe(true);
+    expect(stored()).toBe("laptop");
+
+    // The bug: this used to land as label = null.
+    const silent = relink(undefined, new Date(1_700_000_500_000));
+    expect(silent.ok && silent.relinked).toBe(true);
+    expect(silent.ok && silent.link.label).toBe("laptop");
+    expect(stored()).toBe("laptop");
+    // The retained proof archive keeps the same label, not a null one.
+    expect(attributionProofsForSubject(db, alice)[0]?.label).toBe("laptop");
+
+    // A new label still overwrites.
+    expect(relink("desktop", new Date(1_700_001_000_000)).ok).toBe(true);
+    expect(stored()).toBe("desktop");
+
+    // And an explicit null still erases.
+    expect(relink(null, new Date(1_700_001_500_000)).ok).toBe(true);
+    expect(stored()).toBeNull();
+  });
+
   test("enforces the per-user cap", async () => {
     const alice = await user("alice");
     const now = new Date();
