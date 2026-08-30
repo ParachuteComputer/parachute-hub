@@ -6,6 +6,28 @@ All notable changes to `@openparachute/hub` are documented here. The format foll
 >
 > This backfill covers the 0.6.x line only. Two pre-existing gaps remain undocumented and are **not** addressed here: the `0.5.13` stable itself (the file's newest entry is `0.5.13-rc.48`, never the stable) and the entire `0.5.14-rc` chain (rc.1–rc.21 on npm), which never promoted to a `0.5.14` stable — its work folded forward into 0.6.0.
 
+## [0.7.19-rc.1] - 2026-08-30
+
+**Account key-link ceremony UI and NIP-98 XFP trust boundary.** Two PRs
+on `next` after 0.7.18-rc.11. The 0.7.18 line suffix-dropped to `main`
+(hub#917); this starts the 0.7.19 rc train. Version bump only; no new
+code in this commit. Merging this to `next` publishes `@rc` (hub#911 —
+no next→main hop).
+
+- **Guided key-link stepper + summary-card Account page (#923, closes #880).**
+  Three-step link ceremony (statement → sign → confirm), NIP-07 primary
+  when present. Four sections as collapsible summary cards. UI-only;
+  ceremony semantics (challenge → sign → verify, first-link password)
+  unchanged.
+
+- **NIP-98 honors X-Forwarded-Proto only on non-loopback (#924, closes #915).**
+  `requestAbsoluteUrl` no longer upgrades on a forged XFP+Host from a
+  loopback peer. Real Tailscale Serve (XFF / `Tailscale-User-Login`) still
+  upgrades. `layerOf` extracted to `src/request-layer.ts` so NIP-98 can
+  consult it without a hub-server cycle.
+
+Do not suffix-drop 0.7.19 until this rc has lived.
+
 ## [0.7.18-rc.11] - 2026-08-29
 
 **Tag-record, canonical `/mcp` 401, and multiple hub admins.** Three PRs
