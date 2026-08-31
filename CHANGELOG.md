@@ -11,7 +11,10 @@ All notable changes to `@openparachute/hub` are documented here. The format foll
 **Stable promotion of 0.7.18-rc.11.** No new code. Suffix-drop only. npm `@rc`
 is 0.7.18-rc.11; this is the matching `@latest`. (An earlier promotion cut
 from rc.10 — hub#917 — was refused by the plan gate after rc.11 published on
-the same core; this entry supersedes its changelog text.)
+the same core; this entry supersedes its changelog text. The take-2 merge
+then left package.json byte-identical to main, so Release's paths filter
+never fired — the actual publish rode a retrigger merge that also added
+package.json `homepage`. Filter fixed for the future on the rc line.)
 
 The 0.7.18 line (rc.1-rc.11) ships key-as-account: a Nostr key is now a
 first-class hub identity. NIP-98 request auth (#882) and the account-MCP
