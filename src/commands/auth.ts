@@ -35,6 +35,7 @@ import {
   reapClient,
 } from "../clients.ts";
 import { CONFIG_DIR } from "../config.ts";
+import { GrantError, parseGrantPubkey } from "../grant-access.ts";
 import { listGrantsForUser, revokeGrant } from "../grants.ts";
 import { openHubDb } from "../hub-db.ts";
 import { resolveHubIssuer } from "../hub-issuer.ts";
@@ -56,7 +57,7 @@ import {
   issueOperatorToken,
   useOperatorTokenWithAutoRotate,
 } from "../operator-token.ts";
-import { bindPubkeyOperatorAttested, findPubkeyLink, isPubkeyHex } from "../pubkey-links.ts";
+import { bindPubkeyOperatorAttested, findPubkeyLink } from "../pubkey-links.ts";
 import { isNonRequestableScope } from "../scope-explanations.ts";
 import { rotateSigningKey } from "../signing-keys.ts";
 import { generateTotpSecret, otpauthUrlFor, verifyTotpCode } from "../totp.ts";
@@ -124,7 +125,7 @@ Usage:
   parachute auth link-pubkey --user <name> <pubkey>
                                        Bind a Nostr pubkey to an existing hub
                                        user (operator-attested; no SPA ceremony).
-                                       pubkey is 64-char lowercase hex.
+                                       pubkey is 64-char lowercase hex or npub1…
   parachute auth 2fa [status]          Show hub-login 2FA (TOTP) status
   parachute auth 2fa enroll [--username <name>]
                                        Enroll TOTP for hub login (prints the
@@ -1684,29 +1685,38 @@ function parseLinkPubkeyFlags(args: readonly string[]): LinkPubkeyFlags {
 }
 
 /**
- * `parachute auth link-pubkey --user owner <hex>` — operator bind.
+ * `parachute auth link-pubkey --user owner <hex|npub>` — operator bind.
  *
  * On-box privilege: the operator asserts this key belongs to this hub user.
  * No NIP-07 ceremony, no possession proof. That is the point — agents cannot
  * click the Account SPA, and the 5-minute challenge expires unconsumed.
+ *
+ * The key argument goes through `parseGrantPubkey`, the same operator-facing
+ * edge `grant-access` uses (hub#936), so an operator can paste the `npub1…`
+ * spelling Buzz and every other client shows them. Decoding is not a
+ * credential: the authority here is the on-box privilege, unchanged.
  */
 function runLinkPubkey(args: readonly string[], deps: AuthDeps): number {
   const flags = parseLinkPubkeyFlags(args);
   if (flags.error) {
     console.error(`parachute auth link-pubkey: ${flags.error}`);
-    console.error("usage: parachute auth link-pubkey --user <username|id> <pubkey-hex>");
+    console.error("usage: parachute auth link-pubkey --user <username|id> <pubkey-hex|npub>");
     return 1;
   }
   if (!flags.user) {
     console.error("parachute auth link-pubkey: --user is required");
-    console.error("usage: parachute auth link-pubkey --user <username|id> <pubkey-hex>");
+    console.error("usage: parachute auth link-pubkey --user <username|id> <pubkey-hex|npub>");
     return 1;
   }
-  const pubkey = flags.pubkey ?? "";
-  if (pubkey.startsWith("npub") || !isPubkeyHex(pubkey)) {
-    console.error(
-      "parachute auth link-pubkey: pubkey must be a 64-character lowercase-hex x-only key (not npub)",
-    );
+  let pubkey: string;
+  try {
+    // Same operator-facing edge as `grant-access` (hub#936): hex passes
+    // through, `npub1…` is decoded, everything else — including uppercase
+    // hex — is refused.
+    pubkey = parseGrantPubkey(flags.pubkey ?? "");
+  } catch (err) {
+    const msg = err instanceof GrantError ? err.message : String(err);
+    console.error(`parachute auth link-pubkey: ${msg}`);
     return 1;
   }
   const db = deps.dbPath ? openHubDb(deps.dbPath) : openHubDb();

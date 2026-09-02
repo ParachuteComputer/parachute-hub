@@ -94,8 +94,9 @@ function wordsToBytes(words: readonly number[]): Uint8Array | null {
  *
  * Returns `null` for anything that is not a checksum-valid `npub` carrying
  * exactly 32 bytes: wrong human-readable part (`nsec1…`, `note1…`), bad
- * checksum, illegal character, wrong payload length, any uppercase. The
- * caller owns the error message — this never throws.
+ * checksum, illegal character, wrong payload length (which the 63-char gate
+ * catches — see below), any uppercase. The caller owns the error message —
+ * this never throws.
  */
 export function decodeNpub(input: string): string | null {
   if (input.length !== NPUB_LENGTH) return null;
@@ -112,6 +113,12 @@ export function decodeNpub(input: string): string | null {
   if (polymod([...hrpExpand("npub"), ...words]) !== BECH32_CONST) return null;
 
   const bytes = wordsToBytes(words.slice(0, -6));
+  // `wordsToBytes` can still return null (non-canonical padding). The
+  // `PUBKEY_BYTES` half is belt, not brace: 63 chars fixes the payload at 52
+  // words = 32 bytes exactly, so a wrong-length npub is already rejected by
+  // the gate on the first line — this can never be the reason. Kept so the
+  // 32-byte contract is stated where the bytes are produced rather than
+  // inferred from an arithmetic identity three lines up.
   if (bytes === null || bytes.length !== PUBKEY_BYTES) return null;
 
   return Buffer.from(bytes).toString("hex");
