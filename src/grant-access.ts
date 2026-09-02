@@ -26,6 +26,7 @@
 import type { Database } from "bun:sqlite";
 import { randomBytes } from "node:crypto";
 import { composedVerbSatisfies, isComposedVaultVerb } from "@openparachute/door-contract";
+import { decodeNpub } from "./nip19.ts";
 import { bindPubkeyOperatorAttested, findPubkeyLink, isPubkeyHex } from "./pubkey-links.ts";
 import {
   UsernameTakenError,
@@ -89,20 +90,36 @@ function usernameForPubkey(pubkey: string): string {
   return `n${pubkey.slice(0, 31)}`;
 }
 
+/**
+ * Accept either wire form of an x-only key and return the hex one.
+ *
+ * Hex is what every table and every NIP-01 event carries; `npub1…` (NIP-19
+ * bech32) is what every human-facing nostr surface actually displays, so an
+ * admin or agent pasting a key has only the npub to paste. Decoding it here —
+ * at the operator-facing edge, once — keeps hex the single internal spelling.
+ *
+ * Uppercase hex stays rejected rather than normalized, per `pubkey-links.ts`.
+ * An npub is an encoding, not a proof: this changes what the caller may
+ * *type*, never what they may *do*.
+ */
 export function parseGrantPubkey(raw: unknown): string {
   if (typeof raw !== "string" || raw.length === 0) {
     throw new GrantError("invalid_pubkey", "pubkey is required.");
   }
-  if (raw.startsWith("npub")) {
-    throw new GrantError(
-      "invalid_pubkey",
-      "pubkey must be a 64-character lowercase-hex x-only key, not an npub.",
-    );
+  if (raw.startsWith("npub1")) {
+    const decoded = decodeNpub(raw);
+    if (decoded === null) {
+      throw new GrantError(
+        "invalid_pubkey",
+        "pubkey looks like an npub but is not a valid NIP-19 npub (bech32 checksum or length).",
+      );
+    }
+    return decoded;
   }
   if (!isPubkeyHex(raw)) {
     throw new GrantError(
       "invalid_pubkey",
-      "pubkey must be a 64-character lowercase-hex x-only public key.",
+      "pubkey must be a 64-character lowercase-hex x-only public key, or an npub1… (NIP-19) key.",
     );
   }
   return raw;

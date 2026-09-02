@@ -199,7 +199,10 @@ empty (`getFirstAdminId(db) === null`) auto-provision is refused
 hub's first account, which is its administrator. The same sentinel guards
 grant-first provisioning (`grant-access.ts:193`). The normal onboarding is
 therefore **grant-first**: an admin calls `grant-access` with the pubkey, which
-creates the key-only user and one `user_vaults` row.
+creates the key-only user and one `user_vaults` row. That argument (and
+`revoke-access`'s) takes **either** lowercase hex **or** an `npub1…` NIP-19
+key, which is decoded to hex before anything is written (`nip19.ts`) — the
+event `pubkey` field above stays hex-only.
 
 **Coverage** (`resolveCoverage`, `account-mcp.ts:180`, `authKind: "nostr"`):
 
