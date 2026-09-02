@@ -19,16 +19,38 @@ negotiation and no bearer fallback.
 
 | Endpoint | Methods | Handler | Notes |
 | --- | --- | --- | --- |
-| `/mcp`, `/mcp/*` | POST, DELETE, OPTIONS | `hub-server.ts:4285` → `handleAccountMcp` | **Canonical door.** Dispatched before the per-vault proxy and every services.json mount, so no module can claim it. |
-| `/account/mcp` | POST, DELETE, OPTIONS | `account-mcp-http.ts:403` | Same handler, legacy path. New clients should use `/mcp`. |
+| `/mcp`, `/mcp/*` | POST, DELETE; `OPTIONS` **only if the preflight itself carries the header** (§1.1) | `hub-server.ts:4285` → `handleAccountMcp` | **Canonical door.** Dispatched before the per-vault proxy and every services.json mount, so no module can claim it. |
+| `/account/mcp` | POST, DELETE, OPTIONS | `account-mcp-http.ts:403` | Same handler, legacy path, reached directly — so unauthenticated browser preflight *does* work here. New clients should otherwise use `/mcp`. |
 | every `requireScope`-gated admin route | per route | `admin-auth.ts:110` | `/api/users/*`, `/api/hub/*`, `/vaults`, `/admin/grants`, … — the host-admin REST surface accepts `Nostr` wherever it accepts a host-admin bearer. |
 
 At `/mcp` the branch is `isNostrAuthorization(req) || peekBearerAudience(req)
 === "account"` (`hub-server.ts:4293`); anything else — a vault-audience bearer,
 an API key — proxies to the vault daemon, which does **not** speak NIP-98 and
-answers `401 API key required`. `OPTIONS` is unauthenticated preflight
-(`preflight`, `account-mcp-http.ts:96`); CORS is wildcard, correct because
-nothing here is ambient-auth. Cookie sessions never open this door.
+answers `401 API key required`. Cookie sessions never open this door. Note that
+`forceChangePasswordGate` runs first (`hub-server.ts:4290`), before the NIP-98
+branch; it is a no-op for a cookie-less client.
+
+### 1.1 OPTIONS at `/mcp` is not an unauthenticated preflight
+
+The `/mcp` dispatch selects the account door **by the `Authorization` header**,
+and a CORS preflight by definition carries none. So an unauthenticated
+`OPTIONS /mcp` does not reach `handleAccountMcp` at all: `accountMcp` is false
+and the request falls through to `proxyToVaultDaemon` (`hub-server.ts:4306`),
+or to `vaultModuleNotRunning()` (`:4308`) if the daemon is down.
+`isCorsAllowedRoute` (`cors.ts:214`) covers only `/oauth/`, so nothing widens
+this.
+
+- **Practical consequence:** the vault daemon's preflight answers
+  `Access-Control-Allow-Headers: Content-Type, Authorization, X-API-Key,
+  Mcp-Session-Id` (`parachute-vault/src/server.ts:620`) — no
+  `Mcp-Protocol-Version`. A **browser-based** NIP-98 client that sends
+  `Mcp-Protocol-Version` therefore fails preflight at `/mcp` today. Use
+  `/account/mcp`, which reaches `handleAccountMcp` directly, or omit the
+  header. Non-browser clients (CLI agents) never preflight and are unaffected.
+- An `OPTIONS` that *does* carry `Authorization: Nostr …` is routed to the
+  door and answered by `preflight()` (`account-mcp-http.ts:404`) **before any
+  verification** — on that path the header is a routing selector only, and its
+  signature is never checked. Do not read a 204 there as proof of auth.
 
 ## 2. The event
 
@@ -99,7 +121,9 @@ cannot be replayed after eviction.
 
 The burn happens **before** the `u` / `method` / `payload` checks
 (`nostr-http-auth.ts:211`): **a failed request burns its id too.** Never retry
-with the same header. And because `created_at` has one-second resolution, two
+with the same header. The cache is a single module-level instance
+(`defaultReplay`, `nostr-http-auth.ts:95`) shared by `/mcp`, `/account/mcp`,
+and the admin routes — an id burned on one door is burned on all of them. And because `created_at` has one-second resolution, two
 byte-identical requests in the same second collide on id and the second is
 `replayed` — so add a random `nonce` tag to every event. The hub does not read
 `nonce`; it is covered by the id, which is the point. The reference client
@@ -120,6 +144,10 @@ unpadded) are both accepted** (verified empirically against the hub's runtime;
 the reference client emits standard padded base64,
 `nip98.ts:signAuthHeader`). The decoded bytes must be a JSON object passing
 `parseNostrEvent`; anything else is `malformed_authorization` / `invalid_event`.
+The decoder never throws — `Buffer.from` silently drops characters outside the
+alphabet — so the "not base64url" branch (`:113`) is unreachable and a garbage
+token instead decodes to junk bytes and fails at `JSON.parse` (`:118`), with
+the same `malformed_authorization` code.
 
 ## 4. Streamable HTTP requirements
 
@@ -136,7 +164,7 @@ failure preempts a transport failure:
 | 6 | body not JSON / not JSON-RPC 2.0 | `400`, code `-32700` (`:456`, `:463`) |
 | 7 | `Mcp-Protocol-Version` present, unsupported, on a non-`initialize` batch | `400` (`:469`) |
 | 8 | no requests in the batch (notifications only) | `202`, empty body (`:481`) |
-| — | otherwise | `200`, one JSON-RPC response (an array for a batch) |
+| — | otherwise | `200`, one JSON-RPC response object; an array **only** when the batch held 2+ requests — a one-request array gets a bare object back (`:497`) |
 
 **There are no sessions.** The hub never issues `Mcp-Session-Id` and never
 reads one — the string "session" does not appear in the request path of
@@ -178,13 +206,13 @@ creates the key-only user and one `user_vaults` row.
 by what this principal can actually call (`account-mcp.ts:439`) — `list-vaults`
 always, `create-vault` only if it may create, `grant-access` /
 `revoke-access` / `list-access` only if it can admin at least one covered vault
-— concatenated with a live `tools/list` forwarded from one covered vault
+— concatenated with a live `tools/list` forwarded from a covered vault
 (`listVaultModuleTools`). With zero covered vaults that second list is empty,
 so an auto-provisioned key sees exactly one tool.
 
 **The `vault` selector.** Every vault-shaped tool gets a `vault` string
 property injected, added to the schema's `required` array for every tool
-**except `query-notes`** (`injectVaultSelector`, `account-mcp-backend.ts`).
+**except `query-notes`** (`injectVaultSelector`, `account-mcp-backend.ts:157`).
 
 - `query-notes` with no `vault` fans out across every covered vault, returning
   `{ vaults_queried, results: [{ vault, notes | error }] }`; one failing vault
@@ -194,8 +222,11 @@ property injected, added to the schema's `required` array for every tool
   `invalid_vault` ("vault is required.") when absent and `vault_not_covered`
   when the name is outside coverage. The name is lowercased before matching.
   Both surface as JSON-RPC `-32602` with `data.error_type`.
-- The catalog is a **union**: a tool listed from your highest-verb vault may
-  answer `Unknown tool` against a vault where you hold a lower verb.
+- The vault-shaped catalog is **single-source, not merged**:
+  `listVaultToolsUncached` (`account-mcp-backend.ts:200`) walks covered vaults
+  highest-verb-first and returns the first `tools/list` that answers — it does
+  not union them. So a tool advertised from your highest-verb vault may answer
+  `Unknown tool` against a vault where you hold a lower verb.
 
 ## 6. Failure vocabulary
 
@@ -209,7 +240,7 @@ the legacy path (`challengePrmPath`, `:133`).
 | Code | Status | Meaning |
 | --- | --- | --- |
 | `missing_authorization` | 401 | no `Authorization` header |
-| `malformed_authorization` | 401 | not `Nostr <token>`, not base64, or not JSON |
+| `malformed_authorization` | 401 | header is not `Nostr <token>`, or the decoded bytes are not JSON (`nostr-http-auth.ts:118`). Never raised for bad base64 as such — see §3. |
 | `invalid_event` | 401 | failed NIP-01 shape/bounds validation |
 | `bad_signature` | 401 | id ≠ hash of payload, or Schnorr verify failed |
 | `wrong_kind` | 401 | `kind` ≠ 27235 |
@@ -249,14 +280,11 @@ Hub at `https://hub.example.ts.net`. Placeholders below are not real keys.
 
 ```sh
 URL=https://hub.example.ts.net/mcp
+LIST='{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+QUERY='{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"query-notes","arguments":{"vault":"uni","search":"nip98","limit":5}}}'
 
-# tools/list
-BODY='{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
-
-# query-notes on a named vault (drop "vault" to fan out across all covered vaults)
-BODY='{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"query-notes","arguments":{"vault":"uni","search":"nip98","limit":5}}}'
-
-# either one — a FRESH event per request, never a reused header
+# Run with either body. Each invocation signs a FRESH event; never reuse a header.
+BODY="$LIST"     # or: BODY="$QUERY" — drop "vault" to fan out across all covered vaults
 curl -sS "$URL" \
   -H "Authorization: Nostr $(python3 sign.py "$URL" POST "$BODY")" \
   -H 'Accept: application/json, text/event-stream' \
@@ -300,9 +328,12 @@ NIP-98 failure. Send a real `User-Agent`. Edge policy, not hub code.
 
 ## 8. Non-goals
 
-This is not OAuth. NIP-98 never goes through `/oauth/authorize`, mints no
-token, registers no client, asks for no consent — the signature *is* the
-credential, one per request. Nothing here narrows or composes scopes; a NIP-98
+This is not OAuth. NIP-98 never goes through `/oauth/authorize`, issues the
+caller no token, registers no client, asks for no consent — the signature *is*
+the credential, one per request. (The hub does mint a short-lived
+`vault:<name>:<verb>` bearer *internally*, per call, to make the hop to the
+vault daemon — `mintVaultMcpToken`, `account-mcp-backend.ts:65`. That
+credential is never the caller's and never leaves the hub.) Nothing here narrows or composes scopes; a NIP-98
 principal's authority is entirely its `user_pubkeys` link and its `user_vaults`
 rows.
 
