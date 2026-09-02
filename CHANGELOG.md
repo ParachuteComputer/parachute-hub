@@ -6,6 +6,57 @@ All notable changes to `@openparachute/hub` are documented here. The format foll
 >
 > This backfill covers the 0.6.x line only. Two pre-existing gaps remain undocumented and are **not** addressed here: the `0.5.13` stable itself (the file's newest entry is `0.5.13-rc.48`, never the stable) and the entire `0.5.14-rc` chain (rc.1–rc.21 on npm), which never promoted to a `0.5.14` stable — its work folded forward into 0.6.0.
 
+## [0.7.19-rc.3] - 2026-09-02
+
+**npub-shaped operator input, and per-agent attribution on the account-MCP
+hop token.** Four PRs on `next` after 0.7.19-rc.2, cut as a `next` → `main`
+batch. Version bump only; no new code in this commit. Merging this to `main`
+publishes `@rc` (this rc is ahead of `@latest` 0.7.18, so `@rc` stays a safe
+channel to point a box at).
+
+- **NIP-98 HTTP auth wire contract (#935).** `docs/contracts/nip98-http-auth.md`
+  writes down the rules agents were learning by being refused: payload-tag
+  symmetry (absent on an empty body, sha256-hex otherwise), the burn-on-failure
+  replay cache, the exact-string `u` tag behind a TLS-terminating proxy, and
+  the sessionless door. Every claim cited to the enforcing line in `src/`.
+  Includes the OPTIONS/preflight rule at `/mcp` — an unauthenticated preflight
+  does NOT reach the account door. Docs only.
+
+- **`grant-access` / `revoke-access` accept an npub (#936).** Every
+  human-facing nostr surface shows `npub1…`; these commands accepted only
+  64-char lowercase hex and explicitly refused the one spelling operators can
+  paste. `parseGrantPubkey` now decodes NIP-19 bech32 at the edge, so hex
+  stays the single internal spelling and nothing downstream changes.
+  Uppercase hex is still refused rather than normalized, matching
+  `pubkey-links.ts`. The ~40-line BIP-173 decoder (`src/nip19.ts`) is
+  deliberate over a new dependency in the door's closure.
+
+- **Account-MCP stamps the NIP-98 signing pubkey on the vault hop token
+  (#937).** Several agents, each with their own Nostr key, routinely link to
+  ONE hub user — so a vault deriving `created_by` / `last_updated_by` from
+  the hop token's `sub` could not tell them apart (observed 2026-09-02: two
+  agents wrote byte-identical attribution). `mintVaultMcpToken` now mints
+  `permissions: { principal_pubkey: "<64 lowercase hex>" }`, emitted **only**
+  for `authKind: "nostr"` — bearer / OAuth / password connections have no
+  signing key and stamping one would fabricate attribution. Nested under
+  `permissions` because that is scope-guard's documented verbatim passthrough;
+  a new top-level claim would be dropped by every consumer until scope-guard
+  cut a release. `sub` and `client_id` are unchanged — attribution, not an
+  identity swap. `hopCacheKey` gains the pubkey as a 5th component, which is
+  load-bearing under `PARACHUTE_ACCOUNT_MCP_HOP_TTL_SECONDS`: without it two
+  agents on one hub user would share a cache entry and the second would be
+  handed the first's pubkey, silently. The consumer half (vault turning the
+  claim into `created_via` / `last_updated_via`) lands in parachute-vault; a
+  hub emitting a claim an older vault ignores is a no-op.
+
+- **`auth link-pubkey` accepts an npub (#940, closes #938).** The last
+  operator-facing pubkey argument still refusing `npub1…` while
+  grant/revoke had decoded both spellings since #936. Routed through the same
+  `parseGrantPubkey` rather than a second copy of the policy; hex passes
+  through unchanged, uppercase hex stays refused.
+
+Do not suffix-drop 0.7.19 until this rc has lived.
+
 ## [0.7.19-rc.2] - 2026-08-30
 
 **Release-gate, hop reuse, first-publish skip, and linkage follow-ups.**
