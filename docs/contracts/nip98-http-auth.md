@@ -36,17 +36,22 @@ The `/mcp` dispatch selects the account door **by the `Authorization` header**,
 and a CORS preflight by definition carries none. So an unauthenticated
 `OPTIONS /mcp` does not reach `handleAccountMcp` at all: `accountMcp` is false
 and the request falls through to `proxyToVaultDaemon` (`hub-server.ts:4306`),
-or to `vaultModuleNotRunning()` (`:4308`) if the daemon is down.
-`isCorsAllowedRoute` (`cors.ts:214`) covers only `/oauth/`, so nothing widens
-this.
+or to `vaultModuleNotRunning()` (`:4308`) if no vault module is registered.
+(That second branch is narrower than "the daemon is down": `proxyToVaultDaemon`
+returns `undefined` only when services.json carries no `vault` row
+(`hub-server.ts:1075`). A loopback-exposure mismatch returns a plain 404
+(`:1076`–`:1078`), and a registered-but-crashed daemon still goes through
+`proxyRequest`.) `isCorsAllowedRoute` (`cors.ts:214`) covers only `/oauth/`, so
+nothing widens this.
 
 - **Practical consequence:** the vault daemon's preflight answers
   `Access-Control-Allow-Headers: Content-Type, Authorization, X-API-Key,
-  Mcp-Session-Id` (`parachute-vault/src/server.ts:620`) — no
-  `Mcp-Protocol-Version`. A **browser-based** NIP-98 client that sends
-  `Mcp-Protocol-Version` therefore fails preflight at `/mcp` today. Use
-  `/account/mcp`, which reaches `handleAccountMcp` directly, or omit the
-  header. Non-browser clients (CLI agents) never preflight and are unaffected.
+  Mcp-Session-Id` (`parachute-vault/src/server.ts:620`, as of parachute-vault
+  `next`, 2026-09-01) — no `Mcp-Protocol-Version`. A **browser-based** NIP-98
+  client that sends `Mcp-Protocol-Version` therefore fails preflight at `/mcp`
+  today. Use `/account/mcp`, which reaches `handleAccountMcp` directly, or omit
+  the header. Non-browser clients (CLI agents) never preflight and are
+  unaffected.
 - An `OPTIONS` that *does* carry `Authorization: Nostr …` is routed to the
   door and answered by `preflight()` (`account-mcp-http.ts:404`) **before any
   verification** — on that path the header is a routing selector only, and its
@@ -335,7 +340,8 @@ caller no token, registers no client, asks for no consent — the signature *is*
 the credential, one per request. (The hub does mint a short-lived
 `vault:<name>:<verb>` bearer *internally*, per call, to make the hop to the
 vault daemon — `mintVaultMcpToken`, `account-mcp-backend.ts:65`. That
-credential is never the caller's and never leaves the hub.)
+credential is never issued to the caller; it travels only the loopback hop to
+the vault daemon (`postVaultMcp`, `account-mcp-backend.ts:139`–`:145`).)
 
 Nothing here narrows or composes scopes; a NIP-98 principal's authority is
 entirely its `user_pubkeys` link and its `user_vaults` rows.
