@@ -62,6 +62,35 @@ no next→main hop).
 
 Do not suffix-drop 0.7.19 until this rc has lived.
 
+## [0.7.18] - 2026-08-30
+
+**Stable promotion of 0.7.18-rc.11.** No new code. Suffix-drop only. npm `@rc`
+is 0.7.18-rc.11; this is the matching `@latest`. (An earlier promotion cut
+from rc.10 — hub#917 — was refused by the plan gate after rc.11 published on
+the same core; this entry supersedes its changelog text. The take-2 merge
+then left package.json byte-identical to main, so Release's paths filter
+never fired — the actual publish rode a retrigger merge that also added
+package.json `homepage`. Filter fixed for the future on the rc line.)
+
+The 0.7.18 line (rc.1-rc.11) ships key-as-account: a Nostr key is now a
+first-class hub identity. NIP-98 request auth (#882) and the account-MCP
+door (#883); NIP-98 accepted at root `/mcp` plus grant-vault-access by
+pubkey (#888, #889); OAuth `account:vaults` and account-MCP at root `/mcp`
+(#892) with create-note / update-note / query-notes forwarding (#893, #896,
+#907); the consent-picker XOR (#901) and `account:self:*` extras minting
+alongside `account:vaults` (#904); account-MCP proxies vault MCP instead of
+cloning REST (#910); NIP-98 `u`-tag honors `X-Forwarded-Proto` behind a
+TLS-terminating proxy (#914); the 401 challenge at `/mcp` names the root
+PRM (#920, closes #899); multiple hub admins via `users.hub_role` (#921,
+closes #881). Also in this line: person-mint `users.id`, Account SPA,
+leftover CAS (#872, #874, #875); rc cuts publish directly from `next`
+(#911), stables publish from `main` only (#913), and tag-record fetches
+tags (#919).
+
+Auto-provision stays off by default: an unlinked key gets nothing unless
+granted or `PARACHUTE_NOSTR_AUTO_PROVISION=1`. Leaves #880 open (its UI
+rework, #923, rides the 0.7.19 line).
+
 ## [0.7.18-rc.11] - 2026-08-29
 
 **Tag-record, canonical `/mcp` 401, and multiple hub admins.** Three PRs
