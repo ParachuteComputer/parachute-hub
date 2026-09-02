@@ -746,11 +746,36 @@ const MIGRATIONS: readonly Migration[] = [
   },
 ];
 
+/**
+ * How long a write waits for another connection's lock before giving up
+ * (hub#861). SQLite — and therefore `bun:sqlite` — defaults `busy_timeout` to
+ * **0**, which means the very first `SQLITE_BUSY` fails the statement
+ * immediately. WAL keeps readers out of the way, but it still allows only one
+ * writer at a time, and the hub has several: the server's request handlers,
+ * the CLI running against the same `hub.db`, and background sweeps. With a
+ * zero timeout, a transaction that merely overlapped another writer's
+ * millisecond-long commit surfaced as a user-visible failure — on the pubkey
+ * linkage path, a spuriously-rejected `/verify` that also burned the
+ * single-use challenge, which is the shape hub#861 reported.
+ *
+ * Five seconds is the widely-used SQLite default-ish value: long enough that
+ * ordinary contention is invisible, short enough that a genuinely stuck writer
+ * still returns an error instead of hanging a request forever.
+ *
+ * The busy handler only helps where a lock is acquired outright, not where a
+ * transaction upgrades from read to write (SQLite returns `SQLITE_BUSY`
+ * immediately there, by design, to avoid deadlock). The hub's contended write
+ * transactions take their write lock on the first statement, so they get the
+ * wait.
+ */
+export const HUB_DB_BUSY_TIMEOUT_MS = 5000;
+
 export function openHubDb(path: string = hubDbPath()): Database {
   mkdirSync(dirname(path), { recursive: true });
   const db = new Database(path);
   db.exec("PRAGMA journal_mode = WAL");
   db.exec("PRAGMA foreign_keys = ON");
+  db.exec(`PRAGMA busy_timeout = ${HUB_DB_BUSY_TIMEOUT_MS}`);
   migrate(db);
   return db;
 }

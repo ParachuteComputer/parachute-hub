@@ -67,14 +67,23 @@ on:
     # pass those two and publish `@latest`. The `paths` filter below means
     # an ordinary feature merge (no version bump) never even runs this
     # workflow a second time — `pr-verify.yml` already tested it before merge.
+    #
+    # CHANGELOG.md is in the filter because a promotion merge can leave
+    # package.json byte-identical to main's tip: hub#926 re-promoted a
+    # version main already carried (0.7.18, from the refused #917 cut), so
+    # only the changelog differed and Release never fired. Every release
+    # cut touches the changelog; ordinary feature merges don't.
     branches:
       - main
       - next
     paths:
       - 'package.json'
+      - 'CHANGELOG.md'
       - 'packages/scope-guard/package.json'
+      - 'packages/scope-guard/CHANGELOG.md'
       - 'packages/depcheck/package.json'
       - 'packages/door-contract/package.json'
+      - 'packages/door-contract/CHANGELOG.md'
     tags:
       # Hub release tags
       - 'v[0-9]+.[0-9]+.[0-9]+'

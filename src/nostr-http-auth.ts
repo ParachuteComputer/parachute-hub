@@ -25,6 +25,7 @@ import {
   verifyNostrEvent,
 } from "./nostr-event.ts";
 import { bindPubkeyFromHttpAuth, findPubkeyLink } from "./pubkey-links.ts";
+import { layerOf, peerAddrOf } from "./request-layer.ts";
 import { isHttpsRequest } from "./request-protocol.ts";
 import {
   createUser,
@@ -137,10 +138,23 @@ export function extractNostrEvent(req: Request): NostrEvent {
  * stay on `req.url`. We do not honor `X-Forwarded-Host` here, and we do
  * not substitute stored `hub_origin` — loopback NIP-98 stays bound to
  * loopback.
+ *
+ * hub#915: `X-Forwarded-Proto` is honored only when `layerOf` has classified
+ * the request as non-loopback. A request that hits :1939 directly (loopback
+ * peer, no forwarding headers) can carry a forged XFP + Host; upgrading that
+ * would let a captured tailnet NIP-98 event replay against the loopback
+ * listener. Real Tailscale Serve stamps `X-Forwarded-For` (and usually
+ * `Tailscale-User-Login`), so those requests classify tailnet/public and
+ * still upgrade. Unknown peer (unit tests, no Server) fails closed to
+ * `public`, so the hub#914 tests keep passing. Production `hubFetch` binds
+ * the peer via `bindRequestPeer`; tests may pass `peerAddr` explicitly.
  */
-export function requestAbsoluteUrl(req: Request): string {
+export function requestAbsoluteUrl(req: Request, peerAddr?: string | null): string {
   const url = new URL(req.url);
-  if (isHttpsRequest(req) && url.protocol === "http:") {
+  if (url.protocol !== "http:") return req.url;
+  const peer = peerAddr !== undefined ? peerAddr : peerAddrOf(req);
+  // Direct `https:` URLs already returned above. Remaining signal is XFP.
+  if (layerOf(req, peer) !== "loopback" && isHttpsRequest(req)) {
     url.protocol = "https:";
     return url.href;
   }
@@ -163,6 +177,8 @@ export function verifyNostrHttpEvent(
     replay?: NostrReplayCache;
     /** Raw body bytes; required when the request has a body. */
     body?: Uint8Array;
+    /** Peer address; falls back to `bindRequestPeer` then unknown→public. */
+    peerAddr?: string | null;
   } = {},
 ): void {
   const now = opts.now?.() ?? new Date();
@@ -197,7 +213,7 @@ export function verifyNostrHttpEvent(
   }
 
   const u = tagValue(event, "u");
-  const expectedUrl = requestAbsoluteUrl(req);
+  const expectedUrl = requestAbsoluteUrl(req, opts.peerAddr);
   if (u !== expectedUrl) {
     throw new NostrHttpAuthError(
       401,
@@ -361,6 +377,7 @@ export async function authenticateNostrRequest(
     now?: () => Date;
     replay?: NostrReplayCache;
     body?: Uint8Array;
+    peerAddr?: string | null;
   },
 ): Promise<NostrPrincipal> {
   const event = extractNostrEvent(req);
@@ -368,6 +385,7 @@ export async function authenticateNostrRequest(
     now: opts.now,
     replay: opts.replay,
     body: opts.body,
+    peerAddr: opts.peerAddr,
   });
   return resolveNostrPrincipal(db, event, {
     autoProvision: opts.autoProvision,

@@ -7335,13 +7335,18 @@ describe("hubFetch root /mcp forwarding (vault 0.7.3 canonical root MCP)", () =>
     return { ...unsigned, id, sig };
   }
 
-  function nostrMcpReq(secret: Uint8Array, url: string, body: unknown): Request {
+  function nostrMcpReq(
+    secret: Uint8Array,
+    url: string,
+    body: unknown,
+    opts?: { signedUrl?: string; extraHeaders?: Record<string, string> },
+  ): Request {
     const encoded = JSON.stringify(body);
     const bytes = new TextEncoder().encode(encoded);
     const event = signNostrEvent(secret, {
       content: `${Date.now()}-${Math.random()}`,
       tags: [
-        ["u", url],
+        ["u", opts?.signedUrl ?? url],
         ["method", "POST"],
         ["payload", createHash("sha256").update(bytes).digest("hex")],
       ],
@@ -7353,6 +7358,7 @@ describe("hubFetch root /mcp forwarding (vault 0.7.3 canonical root MCP)", () =>
         accept: BOTH_ACCEPT,
         "content-type": "application/json",
         host: new URL(url).host,
+        ...opts?.extraHeaders,
       },
       body: encoded,
     });
@@ -7510,6 +7516,79 @@ describe("hubFetch root /mcp forwarding (vault 0.7.3 canonical root MCP)", () =>
       expect(res.status).toBe(200);
       const body = (await res.json()) as { result?: { serverInfo?: { name?: string } } };
       expect(body.result?.serverInfo?.name).toBe("parachute-account");
+      expect(upstream.requests().length).toBe(0);
+    } finally {
+      db.close();
+      upstream.stop();
+      h.cleanup();
+    }
+  });
+
+  test("loopback peer + forged XFP does not accept a captured https u-tag (hub#915)", async () => {
+    const h = makeHarness();
+    const upstream = startRecordingUpstream();
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      writeManifest({ services: [canonicalVaultRow(upstream.port)] }, h.manifestPath);
+      await createUser(db, "owner", "pw", { passwordChanged: true });
+      const fetcher = hubFetch(h.dir, { getDb: () => db, manifestPath: h.manifestPath });
+      const httpUrl = "http://uni.taildf9ce2.ts.net/mcp";
+      const httpsUrl = "https://uni.taildf9ce2.ts.net/mcp";
+      const secret = hexToBytes("22".repeat(32));
+      const res = await fetcher(
+        nostrMcpReq(
+          secret,
+          httpUrl,
+          { jsonrpc: "2.0", id: 1, method: "initialize" },
+          {
+            signedUrl: httpsUrl,
+            extraHeaders: { "x-forwarded-proto": "https" },
+          },
+        ),
+        fakeServer("127.0.0.1"),
+      );
+      expect(res.status).toBe(401);
+      const body = (await res.json()) as { error_description?: string };
+      expect(body.error_description).toBe("Nostr event u tag must equal this request URL");
+      expect(upstream.requests().length).toBe(0);
+    } finally {
+      db.close();
+      upstream.stop();
+      h.cleanup();
+    }
+  });
+
+  test("Tailscale Serve XFP+XFF on loopback peer still reconstructs https (hub#915)", async () => {
+    const h = makeHarness();
+    const upstream = startRecordingUpstream();
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      writeManifest({ services: [canonicalVaultRow(upstream.port)] }, h.manifestPath);
+      await createUser(db, "owner", "pw", { passwordChanged: true });
+      const fetcher = hubFetch(h.dir, { getDb: () => db, manifestPath: h.manifestPath });
+      const httpUrl = "http://uni.taildf9ce2.ts.net/mcp";
+      const httpsUrl = "https://uni.taildf9ce2.ts.net/mcp";
+      const secret = hexToBytes("33".repeat(32));
+      const res = await fetcher(
+        nostrMcpReq(
+          secret,
+          httpUrl,
+          { jsonrpc: "2.0", id: 1, method: "initialize" },
+          {
+            signedUrl: httpsUrl,
+            extraHeaders: {
+              "x-forwarded-proto": "https",
+              "x-forwarded-for": "100.64.0.12",
+              "tailscale-user-login": "aaron@example.com",
+            },
+          },
+        ),
+        fakeServer("127.0.0.1"),
+      );
+      // URL reconstructed; pubkey is unlinked — not a u-tag mismatch.
+      expect(res.status).toBe(401);
+      const body = (await res.json()) as { error_description?: string };
+      expect(body.error_description).toBe("Nostr pubkey is not linked to a hub user");
       expect(upstream.requests().length).toBe(0);
     } finally {
       db.close();

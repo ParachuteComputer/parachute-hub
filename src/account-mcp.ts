@@ -19,7 +19,9 @@
  * query-notes (the one account overlay) fans out through a 60s
  * `vault:<name>:read` mint to each vault's MCP `query-notes`. A failed
  * vault becomes that vault's `{ vault, error }` — never a whole-call
- * failure.
+ * failure. Opt-in reuse: `PARACHUTE_ACCOUNT_MCP_HOP_TTL_SECONDS` (1..599)
+ * mints once per (user, vault, verb) and reuses until TTL; unset keeps
+ * the per-call 60s hop. See `account-mcp-hop.ts` (hub#918). Default off.
  */
 import type { Database } from "bun:sqlite";
 import {
@@ -64,6 +66,20 @@ export interface AccountMcpPrincipal {
   scopes: string[];
   authKind: AccountMcpAuthKind;
   clientId: string | undefined;
+  /**
+   * The Nostr pubkey that SIGNED this request (64 lowercase hex, NIP-01 form).
+   *
+   * Set only on the NIP-98 path (hub#937). Bearer / password / OAuth
+   * connections leave it `undefined` — there is no key to name, and inventing
+   * one would fabricate attribution.
+   *
+   * Several agents, each with their own key, routinely link to ONE hub user.
+   * `userId` therefore cannot tell them apart; this can. It is carried
+   * separately from `clientId` (which the NIP-98 door also formats as
+   * `nostr:<pubkey>`) so downstream code never has to string-parse an
+   * identifier whose format is a display choice.
+   */
+  pubkey?: string;
   /** First-admin, or a Bearer that already carries host:admin. */
   isHubAdmin: boolean;
   /** Present on Bearer (null only for NIP-98). host:admin is a synthetic wildcard. */
@@ -337,7 +353,9 @@ const grantAccessTool: AccountMcpTool = {
     properties: {
       pubkey: {
         type: "string",
-        description: "64-character lowercase-hex x-only Nostr public key.",
+        description:
+          "Nostr public key, hex or npub: either a 64-character lowercase-hex x-only " +
+          "key or an npub1… (NIP-19 bech32) key. The npub is decoded to hex.",
       },
       vault: { type: "string", description: "Installed vault name." },
       role: {
@@ -374,7 +392,9 @@ const revokeAccessTool: AccountMcpTool = {
     properties: {
       pubkey: {
         type: "string",
-        description: "64-character lowercase-hex x-only Nostr public key.",
+        description:
+          "Nostr public key, hex or npub: either a 64-character lowercase-hex x-only " +
+          "key or an npub1… (NIP-19 bech32) key. The npub is decoded to hex.",
       },
       vault: { type: "string", description: "Installed vault name." },
     },

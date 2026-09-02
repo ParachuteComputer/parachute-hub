@@ -1,8 +1,9 @@
+import { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { hubDbPath, migrate, openHubDb } from "../hub-db.ts";
+import { HUB_DB_BUSY_TIMEOUT_MS, hubDbPath, migrate, openHubDb } from "../hub-db.ts";
 
 interface Harness {
   configDir: string;
@@ -65,6 +66,35 @@ describe("openHubDb + migrate", () => {
         expect(versions).toContain(2);
       } finally {
         db2.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  // hub#861. Every hub write — the pubkey-linkage challenge-consume + link
+  // commit among them — runs on a connection from here, so the busy posture is
+  // set once, at open, rather than per call site.
+  test("opens with a non-zero busy_timeout so a contended write waits", () => {
+    const h = makeHarness();
+    try {
+      const db = openHubDb(h.dbPath);
+      try {
+        expect(HUB_DB_BUSY_TIMEOUT_MS).toBeGreaterThan(0);
+        expect(db.query<{ timeout: number }, []>("PRAGMA busy_timeout").get()?.timeout).toBe(
+          HUB_DB_BUSY_TIMEOUT_MS,
+        );
+      } finally {
+        db.close();
+      }
+      // Control: the pin above is not a tautology. A connection opened without
+      // our pragma reports 0 — SQLite's default, and the pre-fix behavior, in
+      // which the first SQLITE_BUSY fails the statement outright.
+      const bare = new Database(h.dbPath);
+      try {
+        expect(bare.query<{ timeout: number }, []>("PRAGMA busy_timeout").get()?.timeout).toBe(0);
+      } finally {
+        bare.close();
       }
     } finally {
       h.cleanup();

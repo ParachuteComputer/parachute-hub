@@ -17,11 +17,17 @@
 import { COMPOSED_VERB_RANK, type ComposedVaultVerb } from "@openparachute/door-contract";
 import type { AccountVaultMeta } from "./account-api.ts";
 import {
+  hopCacheKey,
+  lookupHopToken,
+  parseAccountMcpHopTtl,
+  storeHopToken,
+} from "./account-mcp-hop.ts";
+import {
   ACCOUNT_MCP_CLIENT_ID,
+  type AccountMcpPrincipal,
   type AccountToolContext,
   AccountToolError,
   FANOUT_TIMEOUT_MS,
-  FANOUT_TOKEN_TTL_SECONDS,
   HUB_NATIVE_TOOL_NAMES,
   installedVaults,
   resolveCoverage,
@@ -57,11 +63,73 @@ export function vaultMcpUrl(vault: AccountVaultMeta): string {
   return `${origin.replace(/\/$/, "")}/vault/${vault.name}/mcp`;
 }
 
+/** NIP-01 pubkey shape: 32 bytes, lowercase hex. */
+const NOSTR_PUBKEY_RE = /^[0-9a-f]{64}$/;
+
+/**
+ * The attribution claim carried on a vault hop token (hub#937).
+ *
+ * Several agents, each holding their own Nostr key, routinely link to ONE hub
+ * user. The hop token's `sub` is that shared user, so a vault writing
+ * `created_by`/`last_updated_by` from `sub` cannot tell two agents apart.
+ * This names the key that actually signed the NIP-98 request; the vault turns
+ * it into `created_via`/`last_updated_via` = `nostr:<pubkey>`.
+ *
+ * Why nested under `permissions` rather than a top-level claim:
+ * `@openparachute/scope-guard` (what vault, scribe, and agent all validate
+ * with) returns a FIXED claim surface — `sub`, `scopes`, `aud`, `jti`,
+ * `client_id`, `vault_scope`, `permissions` — and DROPS everything else. A new
+ * top-level claim would be invisible to every consumer until scope-guard cut
+ * a release and each one upgraded. `permissions` is scope-guard's documented
+ * verbatim passthrough, so it is the one carrier that works today.
+ *
+ * Emitted ONLY for a NIP-98-authenticated principal. A password / cookie /
+ * OAuth Bearer connection has no signing key, and stamping one would fabricate
+ * attribution. Contract: parachute-vault `docs/contracts/nostr-principal-attribution.md`.
+ */
+export function principalAttributionClaims(
+  principal: AccountMcpPrincipal,
+): { permissions: { principal_pubkey: string } } | null {
+  if (principal.authKind !== "nostr") return null;
+  const pubkey = principal.pubkey;
+  // Defensive and, via the real door, unreachable: `parseNostrEvent`
+  // (`nostr-event.ts:106,131`) already rejects any event whose `pubkey` is not
+  // `^[0-9a-f]{64}$`, before signature verification. Kept as a belt-and-braces
+  // guard for direct callers; if it ever fires, attribution degrades silently
+  // to the generic credential class.
+  // The NIP-98 path only reaches here with a verified event pubkey,
+  // but a malformed value must be dropped rather than shipped — the vault
+  // fails soft on a bad claim and we should not make it exercise that path.
+  if (typeof pubkey !== "string" || !NOSTR_PUBKEY_RE.test(pubkey)) return null;
+  return { permissions: { principal_pubkey: pubkey } };
+}
+
 export async function mintVaultMcpToken(
   ctx: AccountToolContext,
   vault: AccountVaultMeta,
   verb: ComposedVaultVerb,
+  env: NodeJS.ProcessEnv = process.env,
 ): Promise<string> {
+  const hop = parseAccountMcpHopTtl(env);
+  const nowMs = (ctx.now?.() ?? new Date()).getTime();
+  const attribution = principalAttributionClaims(ctx.principal);
+  // hub#937: the cache key MUST include the signer. Two agents on the same hub
+  // user share (userId, vault, verb, issuer), so without this the first
+  // agent's token — carrying the first agent's pubkey — would be handed to the
+  // second, reintroducing the exact misattribution this change fixes (and
+  // silently, since the token is otherwise valid). `null` for non-NIP-98
+  // connections keeps their key byte-identical to before.
+  const key = hopCacheKey(
+    ctx.principal.userId,
+    vault.name,
+    verb,
+    ctx.issuer,
+    attribution?.permissions.principal_pubkey ?? null,
+  );
+  if (hop.reuse) {
+    const cached = lookupHopToken(key, nowMs);
+    if (cached) return cached;
+  }
   const sign = ctx.signToken ?? signAccessToken;
   const minted = await sign(ctx.db, {
     sub: ctx.principal.userId,
@@ -69,10 +137,20 @@ export async function mintVaultMcpToken(
     audience: `vault.${vault.name}`,
     clientId: ACCOUNT_MCP_CLIENT_ID,
     issuer: ctx.issuer,
-    ttlSeconds: FANOUT_TOKEN_TTL_SECONDS,
+    ttlSeconds: hop.ttlSeconds,
     vaultScope: [vault.name],
+    // NOTE: `extraClaims` is set to the attribution object WHOLESALE. That is
+    // safe only while this mint has exactly one `permissions` producer. If a
+    // future change gives the hop token tag-scoping, it MUST merge into
+    // `permissions` rather than assign a second `extraClaims` — vault reads an
+    // absent `scoped_tags` as UNSCOPED (`vault/src/auth.ts:470`), so clobbering
+    // it would WIDEN the token to the full vault, not fail closed.
+    ...(attribution ? { extraClaims: attribution } : {}),
     ...(ctx.now !== undefined ? { now: ctx.now } : {}),
   });
+  if (hop.reuse) {
+    storeHopToken(key, minted.token, nowMs + hop.ttlSeconds * 1000, nowMs);
+  }
   return minted.token;
 }
 

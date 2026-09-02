@@ -13,8 +13,9 @@ import type { Database } from "bun:sqlite";
  *     vault_not_covered fail-closed; sort/include_content/order_by/offset
  *     forwarded to vault REST;
  *   - grant-access: grant-first creates a key-only user; one-row upsert;
- *     friend write can grant their vault, read cannot; owner unrestricted
- *     is a no-op; revoke leaves the user; list-access is pubkey-shaped;
+ *     npub argument decodes to hex; friend write can grant their vault, read
+ *     cannot; owner unrestricted is a no-op; revoke leaves the user;
+ *     list-access is pubkey-shaped;
  *   - create-note / update-note: vault required; write-audience mint;
  *     catalog-hidden below write; PATCH encodes path ids;
  *   - descriptor advertises account_mcp_endpoint (see account-api.test).
@@ -26,6 +27,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { schnorr } from "@noble/curves/secp256k1.js";
 import { handleAccountCapabilities } from "../account-api.ts";
+import { ACCOUNT_MCP_HOP_TTL_ENV, _resetAccountMcpHopCacheForTests } from "../account-mcp-hop.ts";
 import {
   accountMcpProtectedResource,
   challengePrmPath,
@@ -59,6 +61,8 @@ const FRIEND_SECRET = hexToBytes("22".repeat(32));
 const FRIEND_PUBKEY = bytesToHex(schnorr.getPublicKey(FRIEND_SECRET));
 const OTHER_SECRET = hexToBytes("33".repeat(32));
 const OTHER_PUBKEY = bytesToHex(schnorr.getPublicKey(OTHER_SECRET));
+/** NIP-19 bech32 spelling of OTHER_PUBKEY — what a human-facing client shows. */
+const OTHER_NPUB = "npub183e2mk60muy6l98se9xhl6f28p48uux03gwctytrs6aj2dw8kxcsw0rcm2";
 
 function sha256Hex(bytes: Uint8Array): string {
   return createHash("sha256").update(bytes).digest("hex");
@@ -1900,6 +1904,42 @@ describe("account MCP — grant-access", () => {
     }
   });
 
+  test("grant-access accepts an npub and stores the decoded hex", async () => {
+    // Every human-facing nostr surface shows npubs; the hub stores hex. The
+    // decode happens at this edge, so nothing downstream ever sees bech32.
+    const h = await makeHarness();
+    try {
+      const granted = await handleAccountMcp(
+        nostrReq(
+          OWNER_SECRET,
+          rpc("tools/call", {
+            name: "grant-access",
+            arguments: { pubkey: OTHER_NPUB, vault: "beta", role: "read" },
+          }),
+        ),
+        mcpDeps(h),
+      );
+      const payload = parseTool(
+        (await granted.json()) as { result: { content: Array<{ text: string }> } },
+      ) as { pubkey: string; user_id: string };
+      expect(payload.pubkey).toBe(OTHER_PUBKEY);
+      expect(findPubkeyLink(h.db, OTHER_PUBKEY)?.userId).toBe(payload.user_id);
+      expect(vaultVerbsForUserVault(h.db, payload.user_id, "beta")).toEqual(["read"]);
+
+      // The same key signing NIP-98 resolves to the user the npub created.
+      const listed = await handleAccountMcp(
+        nostrReq(OTHER_SECRET, rpc("tools/call", { name: "list-vaults", arguments: {} })),
+        mcpDeps(h),
+      );
+      const coverage = parseTool(
+        (await listed.json()) as { result: { content: Array<{ text: string }> } },
+      ) as { vaults: Array<{ name: string }> };
+      expect(coverage.vaults.map((v) => v.name)).toEqual(["beta"]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
   test("second grant upserts role and does not wipe other vaults", async () => {
     const h = await makeHarness();
     try {
@@ -2369,6 +2409,72 @@ describe("account MCP — grant-access", () => {
       ).toBe("username_taken");
       expect(findPubkeyLink(h.db, OTHER_PUBKEY)).toBeNull();
     } finally {
+      h.cleanup();
+    }
+  });
+});
+
+describe("account MCP — hop JWT reuse (hub#918)", () => {
+  function restoreHopEnv(prev: string | undefined): void {
+    if (prev === undefined) delete process.env[ACCOUNT_MCP_HOP_TTL_ENV];
+    else process.env[ACCOUNT_MCP_HOP_TTL_ENV] = prev;
+    _resetAccountMcpHopCacheForTests();
+  }
+
+  function countingFetch(): { bearers: Set<string>; fetchImpl: typeof fetch } {
+    const bearers = new Set<string>();
+    const fetchImpl = (input: string | URL | Request, init?: RequestInit) => {
+      const headers = input instanceof Request ? input.headers : new Headers(init?.headers);
+      const auth = headers.get("authorization");
+      if (auth) bearers.add(auth);
+      return routeVaultMcp(input, init);
+    };
+    return { bearers, fetchImpl: fetchImpl as typeof fetch };
+  }
+
+  test("default: two list-tags calls mint a fresh hop JWT per vault RPC", async () => {
+    const h = await makeHarness();
+    const prev = process.env[ACCOUNT_MCP_HOP_TTL_ENV];
+    delete process.env[ACCOUNT_MCP_HOP_TTL_ENV];
+    _resetAccountMcpHopCacheForTests();
+    const { bearers, fetchImpl } = countingFetch();
+    try {
+      const token = await bearer(h, [HOST_ADMIN_SCOPE]);
+      for (let i = 0; i < 2; i++) {
+        const res = await handleAccountMcp(
+          bearerReq(token, rpc("tools/call", { name: "list-tags", arguments: { vault: "beta" } })),
+          mcpDeps(h, { fetchImpl }),
+        );
+        expect(res.status).toBe(200);
+      }
+      // Each tools/call does tools/list (catalog) then tools/call — 4 RPCs,
+      // 4 unregistered 60s mints. That is today's hop, and why manage-token
+      // never sees a repeated principal.
+      expect(bearers.size).toBe(4);
+    } finally {
+      restoreHopEnv(prev);
+      h.cleanup();
+    }
+  });
+
+  test("TTL=300: two list-tags calls share one hop JWT", async () => {
+    const h = await makeHarness();
+    const prev = process.env[ACCOUNT_MCP_HOP_TTL_ENV];
+    process.env[ACCOUNT_MCP_HOP_TTL_ENV] = "300";
+    _resetAccountMcpHopCacheForTests();
+    const { bearers, fetchImpl } = countingFetch();
+    try {
+      const token = await bearer(h, [HOST_ADMIN_SCOPE]);
+      for (let i = 0; i < 2; i++) {
+        const res = await handleAccountMcp(
+          bearerReq(token, rpc("tools/call", { name: "list-tags", arguments: { vault: "beta" } })),
+          mcpDeps(h, { fetchImpl }),
+        );
+        expect(res.status).toBe(200);
+      }
+      expect(bearers.size).toBe(1);
+    } finally {
+      restoreHopEnv(prev);
       h.cleanup();
     }
   });

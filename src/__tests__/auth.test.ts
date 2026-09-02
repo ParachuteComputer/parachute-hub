@@ -2449,6 +2449,11 @@ describe("parachute auth revoke-token", () => {
 describe("parachute auth link-pubkey", () => {
   const OWNER_PUB = "11".repeat(32);
   const OTHER_PUB = "22".repeat(32);
+  /** NIP-19 spec vector — this npub is defined to be this hex. */
+  const SPEC_NPUB = "npub10elfcs4fr0l0r8af98jlmgdh9c8tcxjvz9qkw038js35mp4dma8qzvjptg";
+  const SPEC_HEX = "7e7e9c42a91bfef19fa929e5fda1b72e0ebc1a4c1141673e2794234d86addf4e";
+  /** NIP-19 spec vector for a *secret* key — right bech32, wrong HRP. */
+  const SPEC_NSEC = "nsec1vl029mgpspedva04g90vltkh6fvh240zqtv9k0t9af8935ke9laqsnlfe5";
 
   test("binds a hex pubkey to --user owner", async () => {
     const tmp = makeTmp();
@@ -2480,22 +2485,80 @@ describe("parachute auth link-pubkey", () => {
     }
   });
 
-  test("refuses npub and mixed-case hex", async () => {
+  test("accepts an npub and links the decoded hex (hub#938)", async () => {
     const tmp = makeTmp();
     try {
       const deps: AuthDeps = { dbPath: tmp.dbPath, isInteractive: () => false };
       await captureOutput(() =>
         auth(["set-password", "--username", "owner", "--password", "pw"], deps),
       );
-      const npub = await captureOutput(() =>
+      const { code, stdout, stderr } = await captureOutput(() =>
+        auth(["link-pubkey", "--user", "owner", SPEC_NPUB], deps),
+      );
+      expect(stderr).toBe("");
+      expect(code).toBe(0);
+      // The stored + reported key is hex, never the bech32 spelling.
+      expect(stdout).toContain(SPEC_HEX);
+      expect(stdout).not.toContain(SPEC_NPUB);
+      const db = openHubDb(tmp.dbPath);
+      try {
+        const { findPubkeyLink } = await import("../pubkey-links.ts");
+        expect(findPubkeyLink(db, SPEC_HEX)).not.toBeNull();
+      } finally {
+        db.close();
+      }
+    } finally {
+      tmp.cleanup();
+    }
+  });
+
+  test("refuses nsec, a bad-checksum npub, and mixed-case hex", async () => {
+    const tmp = makeTmp();
+    try {
+      const deps: AuthDeps = { dbPath: tmp.dbPath, isInteractive: () => false };
+      await captureOutput(() =>
+        auth(["set-password", "--username", "owner", "--password", "pw"], deps),
+      );
+      // Right bech32, wrong HRP: a secret key must never be read as a pubkey.
+      const nsec = await captureOutput(() =>
+        auth(["link-pubkey", "--user", "owner", SPEC_NSEC], deps),
+      );
+      expect(nsec.code).toBe(1);
+      expect(nsec.stderr).toContain("lowercase-hex");
+      expect(nsec.stderr).not.toContain(SPEC_NSEC);
+
+      // One flipped character in the payload — checksum-invalid npub.
+      const flipped = `npub1${SPEC_NPUB.slice(5, 10)}q${SPEC_NPUB.slice(11)}`;
+      expect(flipped.length).toBe(SPEC_NPUB.length);
+      expect(flipped).not.toBe(SPEC_NPUB);
+      const bad = await captureOutput(() =>
+        auth(["link-pubkey", "--user", "owner", flipped], deps),
+      );
+      expect(bad.code).toBe(1);
+      expect(bad.stderr).toContain("npub");
+      expect(bad.stderr).toContain("checksum");
+
+      // Too short to be an npub at all.
+      const stub = await captureOutput(() =>
         auth(["link-pubkey", "--user", "owner", "npub1qqqqqqq"], deps),
       );
-      expect(npub.code).toBe(1);
-      expect(npub.stderr).toContain("lowercase-hex");
+      expect(stub.code).toBe(1);
+
+      // Uppercase hex stays refused — pubkey-links never normalizes case.
       const mixed = await captureOutput(() =>
         auth(["link-pubkey", "--user", "owner", "AA".repeat(32)], deps),
       );
       expect(mixed.code).toBe(1);
+      expect(mixed.stderr).toContain("lowercase-hex");
+
+      const db = openHubDb(tmp.dbPath);
+      try {
+        const { pubkeysForUser } = await import("../pubkey-links.ts");
+        const owner = listUsers(db)[0]!;
+        expect(pubkeysForUser(db, owner.id)).toHaveLength(0);
+      } finally {
+        db.close();
+      }
     } finally {
       tmp.cleanup();
     }
