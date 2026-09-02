@@ -12,6 +12,9 @@ jobs:
   typecheck-unit-tests:
     name: typecheck + unit tests
     runs-on: ubuntu-latest
+    # Bun's per-test watchdog below names a stalled test. This outer bound also
+    # catches runner/runtime deadlocks where Bun cannot fire that watchdog.
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v6
       - uses: oven-sh/setup-bun@v2
@@ -35,4 +38,4 @@ jobs:
       - name: typecheck
         run: bun run typecheck
       - name: hub tests
-        run: bun test ./src
+        run: bun test --timeout 30000 ./src
