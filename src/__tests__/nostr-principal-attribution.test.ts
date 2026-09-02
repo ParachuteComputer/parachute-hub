@@ -1,5 +1,5 @@
 /**
- * Nostr principal attribution on the vault hop token (hub#936).
+ * Nostr principal attribution on the vault hop token (hub#937).
  *
  * The problem: several agents, each holding their own Nostr key, routinely
  * link to ONE hub user. The account-MCP → vault hop token's `sub` is that
@@ -106,7 +106,7 @@ describe("hopCacheKey — the signer separates otherwise-identical keys", () => 
     expect(a).not.toBe(b);
   });
 
-  test("omitting the pubkey reproduces the pre-hub#936 key byte-for-byte", () => {
+  test("omitting the pubkey reproduces the pre-hub#937 key byte-for-byte", () => {
     const legacy = hopCacheKey("u", "uni", "read", "http://127.0.0.1:1939");
     expect(legacy).toBe(hopCacheKey("u", "uni", "read", "http://127.0.0.1:1939", null));
     expect(legacy).toBe("u\0uni\0read\0http://127.0.0.1:1939");

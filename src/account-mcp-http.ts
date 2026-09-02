@@ -262,7 +262,7 @@ async function authenticate(
       scopes: principal.scopes,
       authKind: "nostr",
       clientId: `nostr:${principal.pubkey}`,
-      // hub#936: the signer, carried structurally so the vault hop mint can
+      // hub#937: the signer, carried structurally so the vault hop mint can
       // stamp it as an attribution claim without re-parsing `clientId`.
       pubkey: principal.pubkey,
       isHubAdmin: principal.isHubAdmin,

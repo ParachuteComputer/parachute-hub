@@ -67,7 +67,7 @@ export function vaultMcpUrl(vault: AccountVaultMeta): string {
 const NOSTR_PUBKEY_RE = /^[0-9a-f]{64}$/;
 
 /**
- * The attribution claim carried on a vault hop token (hub#936).
+ * The attribution claim carried on a vault hop token (hub#937).
  *
  * Several agents, each holding their own Nostr key, routinely link to ONE hub
  * user. The hop token's `sub` is that shared user, so a vault writing
@@ -108,7 +108,7 @@ export async function mintVaultMcpToken(
   const hop = parseAccountMcpHopTtl(env);
   const nowMs = (ctx.now?.() ?? new Date()).getTime();
   const attribution = principalAttributionClaims(ctx.principal);
-  // hub#936: the cache key MUST include the signer. Two agents on the same hub
+  // hub#937: the cache key MUST include the signer. Two agents on the same hub
   // user share (userId, vault, verb, issuer), so without this the first
   // agent's token — carrying the first agent's pubkey — would be handed to the
   // second, reintroducing the exact misattribution this change fixes (and

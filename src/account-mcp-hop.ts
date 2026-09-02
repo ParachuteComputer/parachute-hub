@@ -78,14 +78,14 @@ export function accountMcpHopTtlSeconds(env: NodeJS.ProcessEnv = process.env): n
 /**
  * Cache key for a reusable hop token.
  *
- * `principalPubkey` (hub#936) is load-bearing, not decorative: the vault hop
+ * `principalPubkey` (hub#937) is load-bearing, not decorative: the vault hop
  * token now carries a `permissions.principal_pubkey` attribution claim, and
  * several agents holding DIFFERENT Nostr keys routinely link to the SAME hub
  * user. Those agents share `(userId, vaultName, verb, issuer)` exactly, so
  * without the pubkey in the key one agent would be handed a cached token
  * stamped with another agent's signer — a silent misattribution, since the
  * token is otherwise perfectly valid. `null` (every non-NIP-98 connection)
- * reproduces the pre-hub#936 key byte-for-byte.
+ * reproduces the pre-hub#937 key byte-for-byte.
  */
 export function hopCacheKey(
   userId: string,

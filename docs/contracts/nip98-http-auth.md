@@ -235,7 +235,7 @@ property injected, added to the schema's `required` array for every tool
   not union them. So a tool advertised from your highest-verb vault may answer
   `Unknown tool` against a vault where you hold a lower verb.
 
-**Write attribution — the hop token names your key (hub#936).** The vault hop
+**Write attribution — the hop token names your key (hub#937).** The vault hop
 token's `sub` is the hub USER, and several agents with different keys routinely
 link to one user, so `sub` alone cannot tell them apart. `mintVaultMcpToken`
 (`account-mcp-backend.ts`) therefore stamps the *signing* pubkey on every hop

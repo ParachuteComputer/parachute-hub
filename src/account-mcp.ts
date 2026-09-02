@@ -69,7 +69,7 @@ export interface AccountMcpPrincipal {
   /**
    * The Nostr pubkey that SIGNED this request (64 lowercase hex, NIP-01 form).
    *
-   * Set only on the NIP-98 path (hub#936). Bearer / password / OAuth
+   * Set only on the NIP-98 path (hub#937). Bearer / password / OAuth
    * connections leave it `undefined` — there is no key to name, and inventing
    * one would fabricate attribution.
    *
