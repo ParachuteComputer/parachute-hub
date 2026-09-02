@@ -66,6 +66,20 @@ export interface AccountMcpPrincipal {
   scopes: string[];
   authKind: AccountMcpAuthKind;
   clientId: string | undefined;
+  /**
+   * The Nostr pubkey that SIGNED this request (64 lowercase hex, NIP-01 form).
+   *
+   * Set only on the NIP-98 path (hub#937). Bearer / password / OAuth
+   * connections leave it `undefined` — there is no key to name, and inventing
+   * one would fabricate attribution.
+   *
+   * Several agents, each with their own key, routinely link to ONE hub user.
+   * `userId` therefore cannot tell them apart; this can. It is carried
+   * separately from `clientId` (which the NIP-98 door also formats as
+   * `nostr:<pubkey>`) so downstream code never has to string-parse an
+   * identifier whose format is a display choice.
+   */
+  pubkey?: string;
   /** First-admin, or a Bearer that already carries host:admin. */
   isHubAdmin: boolean;
   /** Present on Bearer (null only for NIP-98). host:admin is a synthetic wildcard. */
