@@ -418,8 +418,10 @@ What it does:
       drifted off its canonical slot, or two services sharing one port
       (legacy services.json written before the validation gate). A
       third-party service with no canonical port is never flagged.
-    - operator.token exists, parses, and its issuer matches the hub (the
-      recurring "not signed in to the hub" / issuer-mismatch class).
+    - operator.token exists, parses, its issuer matches the hub (the
+      recurring "not signed in to the hub" / issuer-mismatch class), and
+      its registry row has not been revoked (a revoked-but-valid-looking
+      token 401s every module-ops call while the file still parses).
     - Each first-party module bin is executable (catches the lost-+x-bit
       start-failure class).
     - Migration: legacy detached install? known cruft at the ecosystem root?

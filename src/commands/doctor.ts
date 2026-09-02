@@ -42,7 +42,8 @@
  * network/manager/db call — same discipline as `status.ts`.
  */
 
-import { readFileSync } from "node:fs";
+import { Database } from "bun:sqlite";
+import { existsSync, readFileSync } from "node:fs";
 import { createInterface } from "node:readline/promises";
 import {
   type MissingDependencyError,
@@ -53,6 +54,7 @@ import { decodeJwt } from "jose";
 import { CONFIG_DIR, SERVICES_MANIFEST_PATH } from "../config.ts";
 import { type ExposeState, readExposeState } from "../expose-state.ts";
 import { HUB_SVC, readHubPort } from "../hub-control.ts";
+import { hubDbPath } from "../hub-db.ts";
 import {
   HIJACK_INCIDENT_REF,
   type HubInstanceRecord,
@@ -790,6 +792,40 @@ function checkPortDrift(manifestPath: string): CheckResult {
 }
 
 /**
+ * `tokens.revoked_at` for a jti, read from hub.db — or null when the answer
+ * is unavailable for ANY reason (no DB file, table/column absent because
+ * migrations haven't run, DB locked, row missing, row not revoked). Doctor
+ * must run on a box with no hub.db at all, so "can't tell" and "not revoked"
+ * deliberately collapse to the same null.
+ *
+ * `readonly: true` for the same reason `vault/auth-status.ts` uses it:
+ * `openHubDb()` would run migrations as a side effect, and doctor is a
+ * read-only probe that must not mutate the operator's DB — nor contend for a
+ * write lock with the live hub.
+ */
+function defaultProbeRevokedAt(dbPath: string, jti: string): string | null {
+  if (!existsSync(dbPath)) return null;
+  let db: Database | undefined;
+  try {
+    db = new Database(dbPath, { readonly: true });
+    const row = db
+      .query<{ revoked_at: string | null }, [string]>(
+        "SELECT revoked_at FROM tokens WHERE jti = ? LIMIT 1",
+      )
+      .get(jti);
+    return row?.revoked_at ?? null;
+  } catch {
+    return null;
+  } finally {
+    try {
+      db?.close();
+    } catch {
+      // ignore
+    }
+  }
+}
+
+/**
  * operator.token exists, parses, and its `iss` matches a hub-legitimate issuer.
  *
  * Absent token → PASS/info (a box that hasn't created its first admin yet, or
@@ -804,13 +840,24 @@ function checkPortDrift(manifestPath: string): CheckResult {
  *   - `iss` is foreign to that set → FAIL: the recurring "not signed in to the
  *     hub" / issuer-mismatch class (hub#481). Fix is `start hub` (self-heals)
  *     or `auth rotate-operator`.
+ *   - registry row for the token's `jti` has `revoked_at` set → FAIL
+ *     (hub#931). This is the shape that read as healthy for hours on the
+ *     mini: a structurally-valid, correctly-issued JWT whose row had been
+ *     revoked, so every module-ops call 401'd while doctor said green.
+ *     An `iss` match alone was never proof the credential still works.
  *
  * Deliberately a DECODE-only `iss` check, not a full signature/JWKS validation:
  * doctor must run without a live hub or DB, and an unsigned-but-decodable token
  * still tells us the issuer-mismatch story. The known-issuer set is the same
  * one the real validation layers `iss` against on top of the signature check.
+ * The revocation lookup is likewise best-effort — no hub.db, no `jti` claim,
+ * or an unreadable DB means "can't tell", which stays out of the way of the
+ * `iss` verdict rather than manufacturing a failure.
  */
-function checkOperatorToken(configDir: string): CheckResult {
+function checkOperatorToken(
+  configDir: string,
+  probeRevokedAt: (dbPath: string, jti: string) => string | null = defaultProbeRevokedAt,
+): CheckResult {
   const path = operatorTokenPath(configDir);
   let token: string;
   try {
@@ -834,9 +881,11 @@ function checkOperatorToken(configDir: string): CheckResult {
   }
 
   let iss: string | undefined;
+  let jti: string | undefined;
   try {
     const payload = decodeJwt(token);
     iss = typeof payload.iss === "string" ? payload.iss : undefined;
+    jti = typeof payload.jti === "string" && payload.jti.length > 0 ? payload.jti : undefined;
   } catch {
     return {
       name: "operator-token",
@@ -854,6 +903,22 @@ function checkOperatorToken(configDir: string): CheckResult {
       detail: "operator.token has no `iss` claim",
       fix: "parachute auth rotate-operator",
     };
+  }
+
+  // Registry check BEFORE the issuer verdict: a revoked credential is the
+  // more specific — and more actionable — failure, and unlike `iss` it can't
+  // be self-healed by `start hub`.
+  if (jti) {
+    const revokedAt = probeRevokedAt(hubDbPath(configDir), jti);
+    if (revokedAt) {
+      return {
+        name: "operator-token",
+        title: "operator.token valid + issuer matches",
+        status: "fail",
+        detail: `operator.token (jti=${jti}) was REVOKED at ${revokedAt} — the JWT still parses and its issuer may still match, but the hub rejects it, so module-ops (start/stop/restart/upgrade) will 401`,
+        fix: "parachute auth rotate-operator",
+      };
+    }
   }
 
   // Build the issuer set the live auth path validates against (loopback aliases

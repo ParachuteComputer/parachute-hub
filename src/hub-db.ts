@@ -11,7 +11,9 @@
  * additive `tokens.subject_pubkey` attribution snapshot (v17, hub#833
  * phase 1), the durable attribution proof archive (v18, hub#860), and a
  * live `tokens.user_id` backfill where `subject` already equals a
- * `users.id` (v19, hub#833 per-account mint).
+ * `users.id` (v19, hub#833 per-account mint), and the additive
+ * `tokens.revoked_by` / `tokens.revoked_via` revocation-actor columns
+ * (v21, hub#931).
  *
  * Each open() runs `migrate()` to bring the schema up to date. A
  * `schema_version` table records every applied migration so re-opens are
@@ -742,6 +744,28 @@ const MIGRATIONS: readonly Migration[] = [
       UPDATE users
          SET hub_role = 'admin'
        WHERE id = (SELECT id FROM users ORDER BY created_at ASC LIMIT 1);
+    `,
+  },
+  {
+    version: 21,
+    sql: `
+      -- Who revoked this token, and over which surface (hub#931). Before
+      -- this migration a revoked row recorded only \`revoked_at\`, so a
+      -- credential that died mid-upgrade left NO trace of the actor — the
+      -- CLI path in particular wrote nothing anywhere.
+      --
+      --   * revoked_by (TEXT) — the actor. HTTP records the bearer's
+      --     \`sub\`; the CLI records \`cli:<unix user>\`.
+      --   * revoked_via (TEXT) — 'cli' | 'http'. TEXT, not a flag, so a
+      --     third surface can land without a migration.
+      --
+      -- Both nullable with NO backfill and NO default: every pre-v21 row,
+      -- and every revoke by an internal sweep that names no actor
+      -- (\`revokeTokensNamingVault\`, refresh rotation), keeps NULL. Same
+      -- posture as \`tokens.subject_pubkey\` (v17) — we do not fabricate
+      -- attribution we never had. NULL means "unrecorded", not "nobody".
+      ALTER TABLE tokens ADD COLUMN revoked_by TEXT;
+      ALTER TABLE tokens ADD COLUMN revoked_via TEXT;
     `,
   },
 ];
