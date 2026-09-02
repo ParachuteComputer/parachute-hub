@@ -123,9 +123,11 @@ The burn happens **before** the `u` / `method` / `payload` checks
 (`nostr-http-auth.ts:211`): **a failed request burns its id too.** Never retry
 with the same header. The cache is a single module-level instance
 (`defaultReplay`, `nostr-http-auth.ts:95`) shared by `/mcp`, `/account/mcp`,
-and the admin routes — an id burned on one door is burned on all of them. And because `created_at` has one-second resolution, two
-byte-identical requests in the same second collide on id and the second is
-`replayed` — so add a random `nonce` tag to every event. The hub does not read
+and the admin routes — an id burned on one door is burned on all of them.
+
+Because `created_at` has one-second resolution, two byte-identical requests in
+the same second collide on id and the second is `replayed` — so add a random
+`nonce` tag to every event. The hub does not read
 `nonce`; it is covered by the id, which is the point. The reference client
 treats it as mandatory (`nip98.ts:buildAuthEvent`).
 
@@ -333,9 +335,10 @@ caller no token, registers no client, asks for no consent — the signature *is*
 the credential, one per request. (The hub does mint a short-lived
 `vault:<name>:<verb>` bearer *internally*, per call, to make the hop to the
 vault daemon — `mintVaultMcpToken`, `account-mcp-backend.ts:65`. That
-credential is never the caller's and never leaves the hub.) Nothing here narrows or composes scopes; a NIP-98
-principal's authority is entirely its `user_pubkeys` link and its `user_vaults`
-rows.
+credential is never the caller's and never leaves the hub.)
+
+Nothing here narrows or composes scopes; a NIP-98 principal's authority is
+entirely its `user_pubkeys` link and its `user_vaults` rows.
 
 The hub's OAuth 2.1 door is a separate contract on the same URL, keyed by an
 `aud=account` bearer: [`oauth-scopes.md`](./oauth-scopes.md) (scope grammar and
