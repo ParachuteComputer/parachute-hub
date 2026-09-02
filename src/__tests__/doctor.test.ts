@@ -3,6 +3,8 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type CheckResult, type DoctorDeps, doctor } from "../commands/doctor.ts";
+import { hubDbPath, openHubDb } from "../hub-db.ts";
+import { recordTokenMint, revokeTokenByJti } from "../jwt-sign.ts";
 import { writePid } from "../process-state.ts";
 
 /**
@@ -47,17 +49,41 @@ function seedCurrentManifest(manifestPath: string): void {
 }
 
 /** A hand-rolled (unsigned) JWT — doctor DECODES `iss`, never verifies it. */
-function fakeOperatorToken(iss: string): string {
+function fakeOperatorToken(iss: string, jti?: string): string {
   const b64 = (o: unknown) => Buffer.from(JSON.stringify(o)).toString("base64url");
   return [
     b64({ alg: "none", typ: "JWT" }),
-    b64({ iss, aud: "operator", sub: "u1", pa_scope_set: "admin" }),
+    b64({ iss, aud: "operator", sub: "u1", pa_scope_set: "admin", ...(jti ? { jti } : {}) }),
     "sig",
   ].join(".");
 }
 
-function seedOperatorToken(configDir: string, iss = "http://127.0.0.1:1939"): void {
-  writeFileSync(join(configDir, "operator.token"), `${fakeOperatorToken(iss)}\n`, { mode: 0o600 });
+function seedOperatorToken(configDir: string, iss = "http://127.0.0.1:1939", jti?: string): void {
+  writeFileSync(join(configDir, "operator.token"), `${fakeOperatorToken(iss, jti)}\n`, {
+    mode: 0o600,
+  });
+}
+
+/**
+ * Seed a real hub.db with ONE tokens row for `jti`, optionally already
+ * revoked. Used by the hub#931 checks — doctor reads `tokens.revoked_at`
+ * out of the registry, so the test needs a genuine migrated DB, not a stub.
+ */
+function seedTokenRow(configDir: string, jti: string, revoked: boolean): void {
+  const db = openHubDb(hubDbPath(configDir));
+  try {
+    recordTokenMint(db, {
+      jti,
+      createdVia: "operator_mint",
+      subject: "operator",
+      clientId: "parachute-hub",
+      scopes: ["parachute:host:auth"],
+      expiresAt: new Date("2027-01-01T00:00:00Z").toISOString(),
+    });
+    if (revoked) revokeTokenByJti(db, jti, new Date("2026-06-26T00:00:00Z"));
+  } finally {
+    db.close();
+  }
 }
 
 /**
@@ -254,6 +280,56 @@ describe("doctor — failure modes (each detected in isolation; others stay gree
       expect(op?.fix).toContain("start hub");
       expect(code).toBe(1);
       expectNoUnexpectedNonPass(checks, ["operator-token"]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  // hub#931. The observed shape on the mini: a structurally-valid,
+  // correctly-issued operator.token whose registry row had been revoked.
+  // doctor said issuer-matches → green, while every module-ops call 401'd.
+  test("revoked operator token → operator-token FAILs even though `iss` matches", async () => {
+    const h = makeHarness();
+    try {
+      seedCurrentManifest(h.manifestPath);
+      seedOperatorToken(h.configDir, "http://127.0.0.1:1939", "revoked-jti-931");
+      seedTokenRow(h.configDir, "revoked-jti-931", true);
+      const { code, checks } = await runDoctor(h, healthyDeps());
+      const op = byName(checks, "operator-token");
+      expect(op?.status).toBe("fail");
+      expect(op?.detail).toContain("REVOKED");
+      expect(op?.detail).toContain("revoked-jti-931");
+      expect(op?.fix).toContain("rotate-operator");
+      expect(code).toBe(1);
+      expectNoUnexpectedNonPass(checks, ["operator-token"]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("un-revoked operator token with a registry row → operator-token still PASSES", async () => {
+    const h = makeHarness();
+    try {
+      seedCurrentManifest(h.manifestPath);
+      seedOperatorToken(h.configDir, "http://127.0.0.1:1939", "live-jti-931");
+      seedTokenRow(h.configDir, "live-jti-931", false);
+      const { code, checks } = await runDoctor(h, healthyDeps());
+      expect(byName(checks, "operator-token")?.status).toBe("pass");
+      expect(code).toBe(0);
+      expectNoUnexpectedNonPass(checks, []);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("operator token with a jti but no hub.db → operator-token PASSES (can't tell ≠ broken)", async () => {
+    const h = makeHarness();
+    try {
+      seedCurrentManifest(h.manifestPath);
+      seedOperatorToken(h.configDir, "http://127.0.0.1:1939", "orphan-jti-931");
+      const { code, checks } = await runDoctor(h, healthyDeps());
+      expect(byName(checks, "operator-token")?.status).toBe("pass");
+      expect(code).toBe(0);
     } finally {
       h.cleanup();
     }
