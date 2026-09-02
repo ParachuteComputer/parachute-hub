@@ -235,6 +235,34 @@ property injected, added to the schema's `required` array for every tool
   not union them. So a tool advertised from your highest-verb vault may answer
   `Unknown tool` against a vault where you hold a lower verb.
 
+**Write attribution — the hop token names your key (hub#936).** The vault hop
+token's `sub` is the hub USER, and several agents with different keys routinely
+link to one user, so `sub` alone cannot tell them apart. `mintVaultMcpToken`
+(`account-mcp-backend.ts`) therefore stamps the *signing* pubkey on every hop
+token minted for a NIP-98 principal:
+
+```json
+{ "permissions": { "principal_pubkey": "<64 lowercase hex>" } }
+```
+
+- **NIP-98 only.** A Bearer / OAuth / password connection has no signing key
+  and never carries the claim — stamping one would fabricate attribution.
+- **Nested under `permissions` on purpose.** `@openparachute/scope-guard`
+  (what vault, scribe, and agent all validate with) returns a fixed claim
+  surface and drops everything else; `permissions` is its documented verbatim
+  passthrough, so it is the only carrier that reaches a consumer today without
+  a scope-guard release.
+- The hop-reuse cache (`PARACHUTE_ACCOUNT_MCP_HOP_TTL_SECONDS`) keys on the
+  pubkey as well as `(user, vault, verb, issuer)` — otherwise one agent's
+  cached token, carrying that agent's pubkey, would be handed to another agent
+  on the same hub user.
+- Consumer side: parachute-vault turns it into `created_via` /
+  `last_updated_via` = `nostr:<pubkey>` and leaves `created_by` as the hub
+  user. Contract:
+  [`parachute-vault/docs/contracts/nostr-principal-attribution.md`](https://github.com/ParachuteComputer/parachute-vault/blob/main/docs/contracts/nostr-principal-attribution.md).
+  Parsing there is fail-SOFT — a malformed value degrades to the generic
+  credential class rather than rejecting the write.
+
 ## 6. Failure vocabulary
 
 `NostrHttpAuthFailure` (`nostr-http-auth.ts:47`). Every member is constructed

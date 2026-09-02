@@ -7,7 +7,7 @@
  * ledger never sees the same principal twice.
  *
  * `PARACHUTE_ACCOUNT_MCP_HOP_TTL_SECONDS=N` (1..599): mint once per
- * `(user, vault, verb, issuer)` and reuse until TTL. Capped strictly
+ * `(user, vault, verb, issuer, nostr-pubkey)` and reuse until TTL. Capped strictly
  * below `REGISTERED_MINT_TTL_THRESHOLD_SECONDS` (600) so these hops stay
  * unregistered fire-and-forget. A longer hop needs a tokens-table row —
  * not this module.
@@ -75,13 +75,27 @@ export function accountMcpHopTtlSeconds(env: NodeJS.ProcessEnv = process.env): n
   return parseAccountMcpHopTtl(env).ttlSeconds;
 }
 
+/**
+ * Cache key for a reusable hop token.
+ *
+ * `principalPubkey` (hub#936) is load-bearing, not decorative: the vault hop
+ * token now carries a `permissions.principal_pubkey` attribution claim, and
+ * several agents holding DIFFERENT Nostr keys routinely link to the SAME hub
+ * user. Those agents share `(userId, vaultName, verb, issuer)` exactly, so
+ * without the pubkey in the key one agent would be handed a cached token
+ * stamped with another agent's signer — a silent misattribution, since the
+ * token is otherwise perfectly valid. `null` (every non-NIP-98 connection)
+ * reproduces the pre-hub#936 key byte-for-byte.
+ */
 export function hopCacheKey(
   userId: string,
   vaultName: string,
   verb: string,
   issuer: string,
+  principalPubkey: string | null = null,
 ): string {
-  return `${userId}\0${vaultName}\0${verb}\0${issuer}`;
+  const base = `${userId}\0${vaultName}\0${verb}\0${issuer}`;
+  return principalPubkey === null ? base : `${base}\0${principalPubkey}`;
 }
 
 function sweepExpired(nowMs: number): void {
