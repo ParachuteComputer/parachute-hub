@@ -92,7 +92,12 @@ export function principalAttributionClaims(
 ): { permissions: { principal_pubkey: string } } | null {
   if (principal.authKind !== "nostr") return null;
   const pubkey = principal.pubkey;
-  // Defensive: the NIP-98 path only reaches here with a verified event pubkey,
+  // Defensive and, via the real door, unreachable: `parseNostrEvent`
+  // (`nostr-event.ts:106,131`) already rejects any event whose `pubkey` is not
+  // `^[0-9a-f]{64}$`, before signature verification. Kept as a belt-and-braces
+  // guard for direct callers; if it ever fires, attribution degrades silently
+  // to the generic credential class.
+  // The NIP-98 path only reaches here with a verified event pubkey,
   // but a malformed value must be dropped rather than shipped — the vault
   // fails soft on a bad claim and we should not make it exercise that path.
   if (typeof pubkey !== "string" || !NOSTR_PUBKEY_RE.test(pubkey)) return null;
@@ -134,6 +139,12 @@ export async function mintVaultMcpToken(
     issuer: ctx.issuer,
     ttlSeconds: hop.ttlSeconds,
     vaultScope: [vault.name],
+    // NOTE: `extraClaims` is set to the attribution object WHOLESALE. That is
+    // safe only while this mint has exactly one `permissions` producer. If a
+    // future change gives the hop token tag-scoping, it MUST merge into
+    // `permissions` rather than assign a second `extraClaims` — vault reads an
+    // absent `scoped_tags` as UNSCOPED (`vault/src/auth.ts:470`), so clobbering
+    // it would WIDEN the token to the full vault, not fail closed.
     ...(attribution ? { extraClaims: attribution } : {}),
     ...(ctx.now !== undefined ? { now: ctx.now } : {}),
   });
