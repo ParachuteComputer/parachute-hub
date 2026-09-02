@@ -11,9 +11,10 @@
  * additive `tokens.subject_pubkey` attribution snapshot (v17, hub#833
  * phase 1), the durable attribution proof archive (v18, hub#860), and a
  * live `tokens.user_id` backfill where `subject` already equals a
- * `users.id` (v19, hub#833 per-account mint), and the additive
- * `tokens.revoked_by` / `tokens.revoked_via` revocation-actor columns
- * (v21, hub#931).
+ * `users.id` (v19, hub#833 per-account mint), stored hub roles on the users
+ * row (v20, hub#881), the additive `tokens.revoked_by` /
+ * `tokens.revoked_via` revocation-actor columns (v21, hub#931), and grant
+ * attribution on `user_vaults` (v22).
  *
  * Each open() runs `migrate()` to bring the schema up to date. A
  * `schema_version` table records every applied migration so re-opens are
@@ -768,6 +769,38 @@ const MIGRATIONS: readonly Migration[] = [
       ALTER TABLE tokens ADD COLUMN revoked_via TEXT;
     `,
   },
+  {
+    version: 22,
+    sql: `
+      -- Grant attribution on \`user_vaults\` (hub lockdown). Until now a row
+      -- said WHO HAS access and nothing about WHO GAVE IT: an operator
+      -- looking at an unexpected assignment had no way to tell whether the
+      -- owner made it, a write-role assignee re-granted it, or it arrived
+      -- through the admin API. Three nullable columns, no backfill:
+      --
+      --   * granted_by_user_id (TEXT NULL) — the hub account that granted.
+      --   * granted_by_pubkey  (TEXT NULL) — the Nostr key that SIGNED the
+      --     granting request, when there was one (NIP-98 only). Several
+      --     agents with their own keys routinely link to one hub user, so
+      --     the user id alone cannot name the actor; this can.
+      --   * granted_via        (TEXT NULL) — 'mcp' | 'cli' | 'api'. No CHECK
+      --     constraint: this is an attribution label, never an authority
+      --     input, so an unrecognised value is a display concern, not a
+      --     privilege one.
+      --
+      -- Deliberately NO backfill. Every pre-existing row was written before
+      -- the hub recorded a grantor, so any value we invented here would be a
+      -- fabricated audit trail. NULL reads as "unknown", which is true.
+      -- \`doctor\`'s grants-attributed check therefore only looks at rows
+      -- created AFTER this migration's applied_at.
+      --
+      -- Nullable rather than NOT NULL DEFAULT: a writer that doesn't know
+      -- about these columns should leave "unknown", not claim an actor.
+      ALTER TABLE user_vaults ADD COLUMN granted_by_user_id TEXT;
+      ALTER TABLE user_vaults ADD COLUMN granted_by_pubkey TEXT;
+      ALTER TABLE user_vaults ADD COLUMN granted_via TEXT;
+    `,
+  },
 ];
 
 /**
@@ -793,6 +826,15 @@ const MIGRATIONS: readonly Migration[] = [
  * wait.
  */
 export const HUB_DB_BUSY_TIMEOUT_MS = 5000;
+
+/**
+ * Migration that added `user_vaults.granted_by_user_id` / `granted_by_pubkey`
+ * / `granted_via`. `doctor`'s `grants-attributed` check reads this version's
+ * `schema_version.applied_at` to know which rows COULD have carried a grantor
+ * — rows older than it are unattributed because the hub wasn't recording yet,
+ * which is not a finding.
+ */
+export const GRANT_ATTRIBUTION_MIGRATION = 22;
 
 export function openHubDb(path: string = hubDbPath()): Database {
   mkdirSync(dirname(path), { recursive: true });

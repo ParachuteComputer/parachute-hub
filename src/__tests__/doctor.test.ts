@@ -2,10 +2,16 @@ import { describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { type CheckResult, type DoctorDeps, doctor } from "../commands/doctor.ts";
+import {
+  type CheckResult,
+  type DoctorDeps,
+  type GrantsSnapshot,
+  doctor,
+} from "../commands/doctor.ts";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
 import { recordTokenMint, revokeTokenByJti } from "../jwt-sign.ts";
 import { writePid } from "../process-state.ts";
+import { createUser, upsertUserVault } from "../users.ts";
 
 /**
  * Doctor tests. The headline is the fresh-install-green guard (#717): a
@@ -948,6 +954,216 @@ describe("doctor — loopback-hijack check (hub#737)", () => {
         }),
       );
       expect(byName(checks, "loopback-hijack")?.status).toBe("pass");
+    } finally {
+      h.cleanup();
+    }
+  });
+});
+
+describe("doctor — Grants group (inventory + two advisories)", () => {
+  /** A snapshot row with sane defaults; each test overrides what it drives. */
+  function row(over: Partial<GrantsSnapshot["rows"][number]> = {}): GrantsSnapshot["rows"][number] {
+    return {
+      vault: "beta",
+      userId: "u1",
+      username: "alice",
+      role: "member",
+      hubAdmin: false,
+      grantedByUserId: "owner",
+      grantedByPubkey: "a".repeat(64),
+      grantedVia: "mcp",
+      createdAt: "2026-06-27T00:00:00.000Z",
+      ...over,
+    };
+  }
+
+  test("no hub.db → one benign PASS, and the fresh-install-green guard holds", async () => {
+    const h = makeHarness();
+    try {
+      seedCurrentManifest(h.manifestPath);
+      seedOperatorToken(h.configDir);
+      // No readGrants override: the REAL reader runs against a configDir with
+      // no hub.db at all — the truly-fresh case.
+      const { code, checks } = await runDoctor(h, healthyDeps());
+      expect(byName(checks, "grants")?.status).toBe("pass");
+      expect(checks.filter((c) => c.status !== "pass")).toEqual([]);
+      expect(code).toBe(0);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("renders one row per assignment, with grantor and door", async () => {
+    const h = makeHarness();
+    try {
+      seedCurrentManifest(h.manifestPath);
+      seedOperatorToken(h.configDir);
+      const { code, checks } = await runDoctor(
+        h,
+        healthyDeps({
+          readGrants: () => ({
+            attributionSince: "2026-06-01T00:00:00.000Z",
+            rows: [row(), row({ vault: "personal", username: "bob", userId: "u2" })],
+          }),
+        }),
+      );
+      const beta = byName(checks, "grant:beta:alice");
+      expect(beta?.status).toBe("pass");
+      expect(beta?.title).toBe("beta → alice");
+      expect(beta?.detail).toContain("role=member");
+      expect(beta?.detail).toContain(`granted_by_pubkey=${"a".repeat(64)}`);
+      expect(beta?.detail).toContain("granted_via=mcp");
+      expect(beta?.detail).toContain("created_at=2026-06-27T00:00:00.000Z");
+      expect(byName(checks, "grant:personal:bob")?.status).toBe("pass");
+      expect(byName(checks, "grants-least-privilege")?.status).toBe("pass");
+      expect(byName(checks, "grants-attributed")?.status).toBe("pass");
+      expectNoUnexpectedNonPass(checks, []);
+      expect(code).toBe(0);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("a non-admin write assignment WARNs least-privilege (exit still 0)", async () => {
+    const h = makeHarness();
+    try {
+      seedCurrentManifest(h.manifestPath);
+      seedOperatorToken(h.configDir);
+      const { code, checks } = await runDoctor(
+        h,
+        healthyDeps({
+          readGrants: () => ({
+            attributionSince: "2026-06-01T00:00:00.000Z",
+            rows: [row({ role: "write" }), row({ vault: "personal", username: "bob" })],
+          }),
+        }),
+      );
+      const lp = byName(checks, "grants-least-privilege");
+      expect(lp?.status).toBe("warn");
+      expect(lp?.detail).toContain("alice@beta");
+      expect(lp?.detail).toContain("holds admin via write; consider role member");
+      // Advisory only — a warning never fails the run.
+      expect(code).toBe(0);
+      expectNoUnexpectedNonPass(checks, ["grants-least-privilege"]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("a hub admin's write row does NOT trip least-privilege", async () => {
+    // Hub admins are unrestricted by construction; the row adds nothing.
+    const h = makeHarness();
+    try {
+      seedCurrentManifest(h.manifestPath);
+      seedOperatorToken(h.configDir);
+      const { checks } = await runDoctor(
+        h,
+        healthyDeps({
+          readGrants: () => ({
+            attributionSince: "2026-06-01T00:00:00.000Z",
+            rows: [row({ role: "write", hubAdmin: true })],
+          }),
+        }),
+      );
+      expect(byName(checks, "grants-least-privilege")?.status).toBe("pass");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("attribution: post-migration rows without a grantor WARN; pre-migration rows do not", async () => {
+    const h = makeHarness();
+    try {
+      seedCurrentManifest(h.manifestPath);
+      seedOperatorToken(h.configDir);
+      const { checks } = await runDoctor(
+        h,
+        healthyDeps({
+          readGrants: () => ({
+            attributionSince: "2026-06-01T00:00:00.000Z",
+            rows: [
+              // Older than the migration — the hub genuinely wasn't recording.
+              row({
+                username: "old",
+                createdAt: "2026-01-01T00:00:00.000Z",
+                grantedByUserId: null,
+                grantedByPubkey: null,
+                grantedVia: null,
+              }),
+              // Written after it with nothing recorded at all.
+              row({
+                username: "new",
+                createdAt: "2026-06-27T00:00:00.000Z",
+                grantedByUserId: null,
+                grantedByPubkey: null,
+                grantedVia: null,
+              }),
+            ],
+          }),
+        }),
+      );
+      const attributed = byName(checks, "grants-attributed");
+      expect(attributed?.status).toBe("warn");
+      expect(attributed?.detail).toContain("new@beta");
+      expect(attributed?.detail).not.toContain("old@beta");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("a keyless (Bearer/CLI/API) grant counts as attributed — no false positive", async () => {
+    const h = makeHarness();
+    try {
+      seedCurrentManifest(h.manifestPath);
+      seedOperatorToken(h.configDir);
+      const { checks } = await runDoctor(
+        h,
+        healthyDeps({
+          readGrants: () => ({
+            attributionSince: "2026-06-01T00:00:00.000Z",
+            rows: [row({ grantedByPubkey: null, grantedVia: "cli" })],
+          }),
+        }),
+      );
+      expect(byName(checks, "grants-attributed")?.status).toBe("pass");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("the REAL reader reads a real hub.db read-only and reports its rows", async () => {
+    // Exercises the actual SQL + the readonly open, not just the seam.
+    const h = makeHarness();
+    try {
+      seedCurrentManifest(h.manifestPath);
+      seedOperatorToken(h.configDir);
+      const db = openHubDb(hubDbPath(h.configDir));
+      const owner = await createUser(db, "owner", "correct-horse-battery-staple", {
+        passwordChanged: true,
+      });
+      const alice = await createUser(db, "alice", "correct-horse-battery-staple", {
+        allowMulti: true,
+        passwordChanged: true,
+      });
+      upsertUserVault(db, alice.id, "beta", "write", () => new Date(), {
+        grantedByUserId: owner.id,
+        grantedByPubkey: "b".repeat(64),
+        grantedVia: "mcp",
+      });
+      db.close();
+
+      const { code, checks } = await runDoctor(h, healthyDeps());
+      const rendered = byName(checks, "grant:beta:alice");
+      expect(rendered?.status).toBe("pass");
+      expect(rendered?.detail).toContain("role=write");
+      expect(rendered?.detail).toContain(`granted_by_pubkey=${"b".repeat(64)}`);
+      expect(rendered?.detail).toContain("granted_via=mcp");
+      // The owner is a hub admin with no user_vaults row — nothing rendered.
+      expect(byName(checks, "grant:beta:owner")).toBeUndefined();
+      // write on a non-admin trips the advisory; attribution is complete.
+      expect(byName(checks, "grants-least-privilege")?.status).toBe("warn");
+      expect(byName(checks, "grants-attributed")?.status).toBe("pass");
+      expect(code).toBe(0);
     } finally {
       h.cleanup();
     }
