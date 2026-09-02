@@ -339,7 +339,9 @@ const grantAccessTool: AccountMcpTool = {
     properties: {
       pubkey: {
         type: "string",
-        description: "64-character lowercase-hex x-only Nostr public key.",
+        description:
+          "Nostr public key, hex or npub: either a 64-character lowercase-hex x-only " +
+          "key or an npub1… (NIP-19 bech32) key. The npub is decoded to hex.",
       },
       vault: { type: "string", description: "Installed vault name." },
       role: {
@@ -376,7 +378,9 @@ const revokeAccessTool: AccountMcpTool = {
     properties: {
       pubkey: {
         type: "string",
-        description: "64-character lowercase-hex x-only Nostr public key.",
+        description:
+          "Nostr public key, hex or npub: either a 64-character lowercase-hex x-only " +
+          "key or an npub1… (NIP-19 bech32) key. The npub is decoded to hex.",
       },
       vault: { type: "string", description: "Installed vault name." },
     },
