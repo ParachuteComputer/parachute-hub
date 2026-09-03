@@ -87,7 +87,14 @@ export const POST_LOGIN_DEFAULT = "/admin/vaults";
  */
 const FORCE_CHANGE_PASSWORD_PATH = "/account/change-password";
 
-function safeNext(raw: string | null): string {
+/**
+ * Normalize a caller-supplied post-login destination to a same-origin path.
+ *
+ * Exported (hub#B/1-3) so the Nostr key door (`nostr-login.ts`) sanitizes its
+ * `next` with the SAME function the password doors use rather than a second
+ * implementation that could drift on the open-redirect rule.
+ */
+export function safeNext(raw: string | null): string {
   if (!raw) return POST_LOGIN_DEFAULT;
   // Only allow same-origin paths — never honor an absolute URL or scheme.
   if (!raw.startsWith("/") || raw.startsWith("//")) return POST_LOGIN_DEFAULT;
@@ -275,8 +282,16 @@ export async function handleAdminLoginPost(
  *
  * `extraCookies` lets the 2FA path also clear the pending-login cookie in the
  * same response.
+ *
+ * Exported (hub#B/1-3) so the Nostr key door (`nostr-login.ts`) mints through
+ * this exact path — same cookie, same 90-day rolling TTL, same
+ * force-change-password / friend-rewrite redirect rules, by construction
+ * rather than by copying them. It re-dresses the 302 as JSON for its
+ * `fetch()`-driven callers, reusing the Set-Cookie and the resolved target
+ * verbatim. `createSession` deliberately keeps its short, auditable call-site
+ * list; this is a shared minting path, not a fifth one.
  */
-function mintSessionAndRedirect(
+export function mintSessionAndRedirect(
   db: Database,
   req: Request,
   user: User,
