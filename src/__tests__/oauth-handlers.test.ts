@@ -4,6 +4,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  type TokenResponse,
   checkAuthorizationServerMetadata,
   checkProtectedResourceMetadata,
   checkTokenResponseInvariants,
@@ -2409,21 +2410,23 @@ describe("handleToken — full OAuth dance", () => {
         loadServicesManifest: fixtureLoadServicesManifest,
       });
       expect(tokenRes.status).toBe(200);
-      const tokenBody = (await tokenRes.json()) as {
-        access_token: string;
+      const tokenBody = (await tokenRes.json()) as TokenResponse & {
         refresh_token: string;
-        token_type: string;
-        expires_in: number;
-        scope: string;
         services: Record<string, { url: string; version: string }>;
       };
       expect(tokenBody.token_type).toBe("Bearer");
       expect(tokenBody.scope).toBe("vault:default:read");
+      expect(tokenBody.vault).toBe("default");
       expect(tokenBody.refresh_token.length).toBeGreaterThan(20);
       // H1.2 — door-contract conformance: token_type/expires_in/scope/access_token
       // invariants against a REAL `POST /oauth/token` success body (V1.4/C1.4 twin
       // coverage, hub half).
-      expect(checkTokenResponseInvariants(tokenBody, "vault:default:read")).toEqual([]);
+      expect(
+        checkTokenResponseInvariants(
+          tokenBody as unknown as Record<string, unknown>,
+          "vault:default:read",
+        ),
+      ).toEqual([]);
 
       // JWT must verify against the hub's signing keys, with the right sub +
       // aud (named `vault:default:read` → "vault.default" — RFC 8707-style
@@ -2527,6 +2530,9 @@ describe("handleToken — full OAuth dance", () => {
 
       const first = await exchange();
       expect(first.status).toBe(200);
+      const firstBody = (await first.json()) as TokenResponse;
+      expect(firstBody.scope).toBe("surface:read");
+      expect(firstBody).not.toHaveProperty("vault");
       const second = await exchange();
       expect(second.status).toBe(400);
       const err = (await second.json()) as Record<string, unknown>;
@@ -2580,7 +2586,8 @@ describe("handleToken — full OAuth dance", () => {
         }),
         { issuer: ISSUER },
       );
-      const initial = (await tokenRes.json()) as { refresh_token: string };
+      const initial = (await tokenRes.json()) as TokenResponse & { refresh_token: string };
+      expect(initial.vault).toBe("default");
 
       const refreshForm = new URLSearchParams({
         grant_type: "refresh_token",
@@ -2598,8 +2605,9 @@ describe("handleToken — full OAuth dance", () => {
         { issuer: ISSUER, now: () => rotateAt },
       );
       expect(refreshRes.status).toBe(200);
-      const rotated = (await refreshRes.json()) as { refresh_token: string };
+      const rotated = (await refreshRes.json()) as TokenResponse & { refresh_token: string };
       expect(rotated.refresh_token).not.toBe(initial.refresh_token);
+      expect(rotated.vault).toBe("default");
 
       // Old refresh token replayed PAST the one-generation grace window
       // should fail (revoked) — the immediate-predecessor grace (hub#685)
