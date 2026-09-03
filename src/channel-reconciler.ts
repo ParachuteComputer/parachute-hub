@@ -68,15 +68,19 @@
  * any mode this build does not recognise — fail-closed at the reader, the same
  * posture `vaultVerbsForRole` takes on a role it doesn't know.
  *
- * ## Poll only, in this PR
+ * ## Poll, plus a live edge
  *
- * The design pairs a 60-second poll with a live subscription to kinds
- * 44100/44101 (member added/removed) as an invalidation edge, cutting worst-
- * case revocation from ~70s to ~90s-worst/one-round-trip-typical. This module
- * ships the poll. The subscription is a follow-up: it needs a long-lived
- * authenticated websocket to every bound relay, which is a supervision problem
- * (reconnect, backoff, one socket per relay) rather than a reconcile problem,
- * and it changes only WHEN {@link reconcileBinding} runs, never what it does.
+ * The design pairs a 60-second poll with a live subscription as an
+ * invalidation edge, cutting worst-case revocation from ~70s to one round
+ * trip in the common case. This module owns the poll;
+ * `channel-subscription.ts` owns the websocket half and calls back in here.
+ * It changes only WHEN {@link reconcileBinding} runs, never what it does — a
+ * live event causes a roster fetch, and the roster is still the only thing
+ * that decides a grant.
+ *
+ * The two share ONE re-entrancy guard ({@link startChannelReconciler}'s
+ * `running`), so a burst of relay events cannot stack a second pass on top of
+ * a poll that is already walking the same rows.
  */
 import type { Database } from "bun:sqlite";
 import { loadBuzzReaderKey } from "./buzz-reader-key.ts";
@@ -86,6 +90,13 @@ import {
   type RosterRole,
   fetchChannelRoster,
 } from "./channel-roster.ts";
+import {
+  type ChannelBindingKey,
+  type ChannelSubscriptionDeps,
+  type ChannelSubscriptions,
+  type SubscriptionState,
+  startChannelSubscriptions,
+} from "./channel-subscription.ts";
 import {
   type ChannelVault,
   isChannelVaultMode,
@@ -480,7 +491,10 @@ function logFailure(
  * Never throws: one binding's unexpected error is logged and counted, and the
  * remaining bindings still run.
  */
-export async function runReconcileOnce(deps: ReconcilerDeps): Promise<ReconcileRunResult> {
+export async function runReconcileOnce(
+  deps: ReconcilerDeps,
+  only?: readonly ChannelBindingKey[],
+): Promise<ReconcileRunResult> {
   const log = deps.log ?? ((line: string) => console.log(line));
   const key = loadBuzzReaderKey(deps.rosterOptions?.env, deps.rosterOptions?.configDir);
   if (!key.ok) {
@@ -490,7 +504,16 @@ export async function runReconcileOnce(deps: ReconcilerDeps): Promise<ReconcileR
       bindings: [],
     };
   }
-  const bindings = listChannelVaults(deps.db).filter((b) => b.mode === "sync");
+  let bindings = listChannelVaults(deps.db).filter((b) => b.mode === "sync");
+  if (only !== undefined) {
+    // A live-subscription-driven pass touches only the bindings the relay
+    // said changed. The `sync` filter still applies and the rows are still
+    // re-read from the DB, so a binding frozen or detached between the event
+    // and this call is correctly skipped rather than reconciled from a stale
+    // snapshot.
+    const wanted = new Set(only.map((k) => `${k.relayHost} ${k.channelId}`));
+    bindings = bindings.filter((b) => wanted.has(`${b.relayHost} ${b.channelId}`));
+  }
   if (bindings.length === 0) return { ran: false, reason: "no_sync_bindings", bindings: [] };
 
   const results: ReconcileBindingResult[] = [];
@@ -527,7 +550,14 @@ export async function runReconcileOnce(deps: ReconcilerDeps): Promise<ReconcileR
 
 /** Handle to stop a running reconciler (shutdown + test cleanup). */
 export interface ChannelReconciler {
+  /** Stops the poll timer AND every live subscription socket. */
   stop(): void;
+  /**
+   * Live-subscription state per relay host. Empty when subscriptions are off
+   * (`liveSubscriptions: false`) or when no `sync` binding exists yet.
+   * Diagnostics only — nothing reads it to decide access.
+   */
+  subscriptionStates(): Map<string, SubscriptionState>;
 }
 
 export interface ChannelReconcilerDeps<H = unknown> extends ReconcilerDeps {
@@ -537,6 +567,17 @@ export interface ChannelReconcilerDeps<H = unknown> extends ReconcilerDeps {
   setIntervalFn?: (cb: () => void, ms: number) => H;
   /** Injectable clear (default `clearInterval`). */
   clearIntervalFn?: (handle: H) => void;
+  /**
+   * The live subscription half. Omit for the real thing; pass overrides
+   * (a loopback `wsUrlFor`, shorter backoffs) to point it at a fake; pass
+   * `false` to run poll-only.
+   *
+   * `false` exists for tests that are about the timer and would otherwise
+   * dial a real relay host out of a fixture — it is not an operator surface,
+   * and there is deliberately no env var for it: a subscription that fails is
+   * already inert, so an operator who wants poll-only already has it.
+   */
+  liveSubscriptions?: false | Partial<ChannelSubscriptionDeps>;
 }
 
 /**
@@ -585,11 +626,15 @@ export function startChannelReconciler<H = ReturnType<typeof setInterval>>(
   // hold ACROSS ticks rather than resetting every minute.
   const limiter = deps.limiter ?? createFailureLogLimiter();
 
+  // THE re-entrancy guard — one flag, shared by the timer and the live
+  // subscription. `tryRun` returning false is how the subscription learns a
+  // pass is in flight; it re-arms its debounce rather than stacking a second
+  // pass on the same rows.
   let running = false;
-  const handle = setIntervalFn(() => {
-    if (running) return;
+  function tryRun(only?: readonly ChannelBindingKey[]): boolean {
+    if (running) return false;
     running = true;
-    void runReconcileOnce({ ...deps, limiter })
+    void runReconcileOnce({ ...deps, limiter }, only)
       .catch((err: unknown) => {
         const detail = err instanceof Error ? err.message : String(err);
         log(`parachute hub: channel reconcile pass threw unexpectedly (${detail}); ignoring.`);
@@ -597,6 +642,35 @@ export function startChannelReconciler<H = ReturnType<typeof setInterval>>(
       .finally(() => {
         running = false;
       });
+    return true;
+  }
+
+  // Started before the timer so the sockets are up for the first minute
+  // rather than after it. `null` here (no key — already checked above, or a
+  // deliberate `false`) simply means poll-only; nothing downstream cares.
+  const subscriptions: ChannelSubscriptions | null =
+    deps.liveSubscriptions === false
+      ? null
+      : startChannelSubscriptions({
+          db: deps.db,
+          log,
+          limiter,
+          requestReconcile: tryRun,
+          ...(deps.rosterOptions?.env !== undefined ? { env: deps.rosterOptions.env } : {}),
+          ...(deps.rosterOptions?.configDir !== undefined
+            ? { configDir: deps.rosterOptions.configDir }
+            : {}),
+          ...(deps.now !== undefined ? { now: deps.now } : {}),
+          ...deps.liveSubscriptions,
+        });
+
+  const handle = setIntervalFn(() => {
+    // Bindings attached or detached at runtime by the CLI go live on the next
+    // tick rather than instantly — the hub has no change feed on its own
+    // tables, and a poll interval of staleness on a socket set is invisible
+    // next to the poll the socket is accelerating.
+    subscriptions?.refresh();
+    tryRun();
   }, intervalMs);
   // A membership poll is a background chore; it must not be the reason the
   // process stays alive.
@@ -605,6 +679,10 @@ export function startChannelReconciler<H = ReturnType<typeof setInterval>>(
   return {
     stop() {
       clearIntervalFn(handle);
+      subscriptions?.stop();
+    },
+    subscriptionStates() {
+      return subscriptions?.states() ?? new Map();
     },
   };
 }
