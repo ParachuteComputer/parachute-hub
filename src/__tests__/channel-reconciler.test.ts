@@ -644,6 +644,9 @@ describe("startChannelReconciler", () => {
     let intervalMs = 0;
     const reconciler = startChannelReconciler({
       ...depsFor(relay),
+      // Poll-only: this test is about the timer, and the live half would
+      // otherwise dial the real `buzz.techne.coop` out of a fixture.
+      liveSubscriptions: false,
       setIntervalFn: (cb, ms) => {
         tick = cb;
         intervalMs = ms;
@@ -684,6 +687,7 @@ describe("startChannelReconciler", () => {
       log: (l) => logs.push(l),
       rosterOptions: { env },
       fetchRoster: blockingFetchRoster,
+      liveSubscriptions: false,
       setIntervalFn: (cb) => {
         tick = cb;
         return 1;

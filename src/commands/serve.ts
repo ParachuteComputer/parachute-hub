@@ -809,7 +809,8 @@ export async function serve(opts: ServeOpts = {}): Promise<{
     reconciler = startChannelReconciler({ db: dbHolder.get(), log });
     if (reconciler) {
       log(
-        "parachute serve: channel membership sync armed (60s poll over `sync` channel bindings).",
+        "parachute serve: channel membership sync armed (60s poll over `sync` channel bindings, " +
+          "plus a live relay subscription that reconciles on membership change).",
       );
     }
   }
