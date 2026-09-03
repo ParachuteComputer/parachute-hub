@@ -397,6 +397,34 @@ If you want the CLI (and every service you install) to use a config directory ot
 export PARACHUTE_HOME=/some/other/path
 ```
 
+## Buzz reader key (channel-attached vaults)
+
+Attaching a Buzz channel to a vault (`parachute vault attach-channel`) lets the hub
+turn channel membership into vault access. To do that the hub has to read the
+channel's member list from the relay, and Buzz only serves that to an
+authenticated Nostr pubkey — so the hub needs one key of its own, seated in the
+community.
+
+Put it in a file, one line, either an `nsec1…` or a bare 64-character hex secret
+key (`#` comments and blank lines are ignored):
+
+```sh
+install -m 600 /dev/null ~/.parachute/buzz-reader.nsec
+printf 'nsec1…\n' > ~/.parachute/buzz-reader.nsec     # or set it in your editor
+```
+
+Override the location with `PARACHUTE_BUZZ_NSEC_FILE=/path/to/key`.
+
+**A path, not the key itself.** There is deliberately no `PARACHUTE_BUZZ_NSEC`
+inline variable: a process environment is readable by any process with the same
+uid, is inherited by every module the hub supervises, and is printed verbatim by
+crash reporters and container-inspection commands. A `chmod 600` file is none of
+those things. The hub never logs the key, never puts it in an error message, and
+never passes it on a command line.
+
+A hub with no key configured is the normal case — channel-attached vaults are
+opt-in, and the roster fetch simply reports `not_configured`.
+
 ## Already have parachute-vault installed?
 
 Install the hub and `parachute vault ...` forwards to your existing `parachute-vault` binary:
