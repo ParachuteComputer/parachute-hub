@@ -24,6 +24,11 @@
  *   - Exposure checks only run when expose-state says the box is exposed;
  *     a loopback-only box reads "loopback only" as benign info (PASS), never
  *     a warning.
+ *   - The Grants group inventories `user_vaults` and warns only on positively
+ *     detected conditions (a non-admin `write` row, which carries re-grant
+ *     authority; a post-migration row with no recorded grantor). No hub.db,
+ *     or no assignments, is benign info (PASS) — a box that has never granted
+ *     anything is a normal box.
  *
  * The headline guarantee is the fresh-install fixture test: a sandboxed
  * PARACHUTE_HOME with a minimal-but-current services.json + a valid
@@ -54,7 +59,7 @@ import { decodeJwt } from "jose";
 import { CONFIG_DIR, SERVICES_MANIFEST_PATH } from "../config.ts";
 import { type ExposeState, readExposeState } from "../expose-state.ts";
 import { HUB_SVC, readHubPort } from "../hub-control.ts";
-import { hubDbPath } from "../hub-db.ts";
+import { GRANT_ATTRIBUTION_MIGRATION, hubDbPath } from "../hub-db.ts";
 import {
   HIJACK_INCIDENT_REF,
   type HubInstanceRecord,
@@ -105,7 +110,7 @@ export interface CheckResult {
 }
 
 /** A logical group of checks in the human report. */
-const GROUP_ORDER = ["Hub", "Modules", "Configuration", "Migration", "Exposure"] as const;
+const GROUP_ORDER = ["Hub", "Modules", "Configuration", "Grants", "Migration", "Exposure"] as const;
 type Group = (typeof GROUP_ORDER)[number];
 
 interface GroupedCheck extends CheckResult {
@@ -185,6 +190,39 @@ export interface DoctorDeps {
    * so the check degrades to the instance comparison alone. Tests inject a count.
    */
   countHubListeners?: (port: number) => number | undefined;
+  /**
+   * Read the `user_vaults` assignments (+ the attribution migration's
+   * applied_at) out of `hub.db` for the Grants group. Default opens the DB
+   * **read-only** — doctor never migrates and never writes — and returns
+   * `null` when there is no DB yet or it cannot be read, which the check
+   * renders as benign "nothing granted", never a failure. Tests inject a
+   * snapshot so the group runs without a real hub.db.
+   */
+  readGrants?: (configDir: string) => GrantsSnapshot | null;
+}
+
+/** One `user_vaults` assignment, as the Grants group reports it. */
+export interface GrantAssignment {
+  vault: string;
+  userId: string;
+  username: string;
+  role: string;
+  /** Hub-wide admins are unrestricted by construction — excluded from the least-privilege check. */
+  hubAdmin: boolean;
+  grantedByUserId: string | null;
+  grantedByPubkey: string | null;
+  grantedVia: string | null;
+  createdAt: string;
+}
+
+export interface GrantsSnapshot {
+  rows: GrantAssignment[];
+  /**
+   * `schema_version.applied_at` for {@link GRANT_ATTRIBUTION_MIGRATION}, or
+   * `null` when the migration hasn't run. Rows created before this stamp
+   * predate attribution and are not flagged for lacking it.
+   */
+  attributionSince: string | null;
 }
 
 export interface DoctorOpts {
@@ -272,6 +310,70 @@ function defaultCountHubListeners(port: number): number | undefined {
   }
 }
 
+/**
+ * Read `user_vaults` out of `hub.db` for the Grants group.
+ *
+ * READ-ONLY on purpose, twice over: the `Database` is opened `readonly` so
+ * doctor cannot run a migration as a side effect of diagnosing (the hub owns
+ * schema movement), and any failure — no DB yet, a schema older than the
+ * attribution columns, a locked or corrupt file — returns `null` rather than
+ * throwing, so the check degrades to "nothing to report" instead of turning a
+ * diagnostic into a crash. Same posture as every other probe here.
+ */
+function defaultReadGrants(configDir: string): GrantsSnapshot | null {
+  const path = hubDbPath(configDir);
+  if (!existsSync(path)) return null;
+  let db: Database | undefined;
+  try {
+    db = new Database(path, { readonly: true });
+    const applied = db
+      .query<{ applied_at: string }, [number]>(
+        "SELECT applied_at FROM schema_version WHERE version = ?",
+      )
+      .get(GRANT_ATTRIBUTION_MIGRATION);
+    const rows = db
+      .query<
+        {
+          vault_name: string;
+          user_id: string;
+          username: string;
+          role: string;
+          hub_role: string;
+          granted_by_user_id: string | null;
+          granted_by_pubkey: string | null;
+          granted_via: string | null;
+          created_at: string;
+        },
+        []
+      >(
+        `SELECT uv.vault_name, uv.user_id, u.username, uv.role, u.hub_role,
+                uv.granted_by_user_id, uv.granted_by_pubkey, uv.granted_via, uv.created_at
+           FROM user_vaults uv
+           JOIN users u ON u.id = uv.user_id
+          ORDER BY uv.vault_name ASC, u.username ASC`,
+      )
+      .all();
+    return {
+      attributionSince: applied?.applied_at ?? null,
+      rows: rows.map((r) => ({
+        vault: r.vault_name,
+        userId: r.user_id,
+        username: r.username,
+        role: r.role,
+        hubAdmin: r.hub_role === "admin",
+        grantedByUserId: r.granted_by_user_id,
+        grantedByPubkey: r.granted_by_pubkey,
+        grantedVia: r.granted_via,
+        createdAt: r.created_at,
+      })),
+    };
+  } catch {
+    return null;
+  } finally {
+    db?.close();
+  }
+}
+
 /** Both ends of the pipe must be a TTY for an interactive confirm to make sense. */
 function defaultIsInteractive(): boolean {
   return Boolean(process.stdin.isTTY && process.stdout.isTTY);
@@ -301,6 +403,7 @@ interface ResolvedDeps {
   readInstanceRecord: (configDir: string) => HubInstanceRecord | null;
   probeLoopbackInstance: (port: number) => Promise<LoopbackProbe>;
   countHubListeners: (port: number) => number | undefined;
+  readGrants: (configDir: string) => GrantsSnapshot | null;
 }
 
 function resolveDeps(d: DoctorDeps | undefined): ResolvedDeps {
@@ -318,6 +421,7 @@ function resolveDeps(d: DoctorDeps | undefined): ResolvedDeps {
     readInstanceRecord: d?.readInstanceRecord ?? readHubInstanceFile,
     probeLoopbackInstance: d?.probeLoopbackInstance ?? probeLoopbackInstance,
     countHubListeners: d?.countHubListeners ?? defaultCountHubListeners,
+    readGrants: d?.readGrants ?? defaultReadGrants,
   };
 }
 
@@ -1117,6 +1221,118 @@ function checkMigration(
   return out;
 }
 
+/**
+ * Who holds what on which vault, and two advisories about it.
+ *
+ * The inventory is the point: `user_vaults` is the only place a hub records
+ * "this account may reach this vault", and until now the only way to read it
+ * was to open `hub.db` by hand. Every assignment renders as one PASS row —
+ * an inventory line, not a verdict.
+ *
+ * Two checks sit on top:
+ *
+ *   - `grants-least-privilege` (WARN) — `role = 'write'` maps to
+ *     `["read","write","admin"]` (`vaultVerbsForRole`), and `admin` is exactly
+ *     what `callerCanAdminVault` reads, so every write-role assignee can grant
+ *     that vault to anyone. That is usually not what the operator meant;
+ *     `member` is read+write with no re-grant. Hub admins are skipped — they
+ *     are unrestricted by construction, so the row says nothing extra.
+ *   - `grants-attributed` (WARN) — a row written AFTER the attribution
+ *     migration with no grantor at all. Rows older than the migration are not
+ *     flagged: the hub genuinely wasn't recording, so "unknown" is the honest
+ *     value and flagging it would be the "unfamiliar = broken" bug this file
+ *     exists to avoid. A row with a hub user id but no pubkey (Bearer / CLI /
+ *     API grant — no key signed it) counts as attributed; demanding a pubkey
+ *     there would false-positive on every non-NIP-98 door.
+ *
+ * No hub.db, or an unreadable one → one benign PASS. A box that has never
+ * granted anything is a normal box.
+ */
+function checkGrants(configDir: string, deps: ResolvedDeps): CheckResult[] {
+  const snapshot = deps.readGrants(configDir);
+  if (snapshot === null) {
+    return [
+      {
+        name: "grants",
+        title: "Vault grants",
+        status: "pass",
+        detail: "no readable hub database — nothing granted on this box yet",
+      },
+    ];
+  }
+  if (snapshot.rows.length === 0) {
+    return [
+      {
+        name: "grants",
+        title: "Vault grants",
+        status: "pass",
+        detail: "no vault assignments recorded",
+      },
+    ];
+  }
+
+  const out: CheckResult[] = [];
+  for (const r of snapshot.rows) {
+    out.push({
+      name: `grant:${r.vault}:${r.username}`,
+      title: `${r.vault} → ${r.username}`,
+      status: "pass",
+      detail:
+        `role=${r.role} granted_by_pubkey=${r.grantedByPubkey ?? "-"} ` +
+        `granted_via=${r.grantedVia ?? "-"} created_at=${r.createdAt}`,
+    });
+  }
+
+  const broad = snapshot.rows.filter((r) => !r.hubAdmin && r.role === "write");
+  out.push(
+    broad.length === 0
+      ? {
+          name: "grants-least-privilege",
+          title: "Least privilege",
+          status: "pass",
+          detail: "no non-admin assignment carries the re-granting `write` role",
+        }
+      : {
+          name: "grants-least-privilege",
+          title: "Least privilege",
+          status: "warn",
+          detail: `${broad
+            .map((r) => `${r.username}@${r.vault}`)
+            .join(", ")} holds admin via write; consider role member`,
+        },
+  );
+
+  const since = snapshot.attributionSince;
+  const unattributed = snapshot.rows.filter(
+    (r) =>
+      since !== null &&
+      r.createdAt >= since &&
+      r.grantedByPubkey === null &&
+      r.grantedByUserId === null,
+  );
+  out.push(
+    unattributed.length === 0
+      ? {
+          name: "grants-attributed",
+          title: "Grant attribution",
+          status: "pass",
+          detail:
+            since === null
+              ? "attribution migration has not run yet — nothing expected to carry a grantor"
+              : "every grant made since attribution landed records who made it",
+        }
+      : {
+          name: "grants-attributed",
+          title: "Grant attribution",
+          status: "warn",
+          detail: `${unattributed
+            .map((r) => `${r.username}@${r.vault}`)
+            .join(", ")} granted since attribution landed but record no grantor`,
+        },
+  );
+  return out;
+}
+
 // ---------------------------------------------------------------------------
 // Tier 2 checks (guarded hard — never FAIL on not-configured)
 // ---------------------------------------------------------------------------
@@ -1255,6 +1471,7 @@ async function runChecks(
   const portDrift = checkPortDrift(manifestPath);
   const operator = checkOperatorToken(configDir);
   const migration = checkMigration(configDir, manifestPath, deps);
+  const grants = checkGrants(configDir, deps);
   const versionDrift = checkVersionDrift(manifest);
 
   const grouped: GroupedCheck[] = [];
@@ -1264,6 +1481,7 @@ async function runChecks(
   add("Hub", [hub, hijack]);
   add("Modules", [...modules, ...bins]);
   add("Configuration", [manifestCheck, portDrift, operator]);
+  add("Grants", grants);
   add("Migration", migration);
   add("Exposure", [exposure, versionDrift]);
   return grouped;

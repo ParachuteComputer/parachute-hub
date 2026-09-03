@@ -204,6 +204,24 @@ creates the key-only user and one `user_vaults` row. That argument (and
 key, which is decoded to hex before anything is written (`nip19.ts`) — the
 event `pubkey` field above stays hex-only.
 
+**The role written on that row** is one of `read`, `member`, or `write`
+(`GRANTABLE_ROLES`, `grant-access.ts`), mapped to verbs by `vaultVerbsForRole`
+(`users.ts`):
+
+| Role | Verbs | May grant/revoke/list access |
+| --- | --- | --- |
+| `read` | `read` | no |
+| `member` | `read`, `write` | **no** — no `admin` verb |
+| `write` | `read`, `write`, `admin` | yes (full vault authority) |
+
+`member` is the least-privilege choice for a principal that should *use* a
+vault without being able to hand it to anyone else; `write` is unchanged and
+still implies vault admin. Each row also records its grantor —
+`granted_by_user_id`, `granted_by_pubkey` (the signing key, NIP-98 only), and
+`granted_via` (`mcp` | `cli` | `api`) — surfaced on `list-access` rows as
+`granted_by_pubkey` / `granted_via`, both `null` for grants made before the
+hub recorded a grantor.
+
 **Coverage** (`resolveCoverage`, `account-mcp.ts:180`, `authKind: "nostr"`):
 
 | Principal | Vaults | `create-vault` |
