@@ -318,6 +318,71 @@ export function mintSessionAndRedirect(
 }
 
 /**
+ * GET `/login/2fa` — render the second-factor form for a caller who was
+ * REDIRECTED here rather than handed the form inline (hub#B/4).
+ *
+ * ## The gap this closes
+ *
+ * Until now `/login/2fa` was POST-only, and that was correct while the only
+ * way to reach it was a password POST: both password doors render
+ * `renderTotpChallenge` themselves in the response to the password, so the
+ * browser never navigates to `/login/2fa` without a form to submit.
+ *
+ * The Nostr key door can't do that. Its caller is a `fetch()`, not a form
+ * post, so `nostr-login.ts` answers a 2FA-enrolled member with
+ * `{requires_2fa: true, redirect: "/login/2fa"}` and the script navigates
+ * there — landing, before this handler, on a bare `405 method not allowed`
+ * with the member half-authenticated and no way forward. hub#949 documented
+ * that as a known gap for this row. This is the GET that closes it.
+ *
+ * ## What it does and does not do
+ *
+ * It is a RENDERER, not a step. It resolves the pending login with the SAME
+ * `getPendingLogin` the POST uses — no second store, no second cookie — and
+ * `getPendingLogin` deliberately does not consume, so landing here (or
+ * reloading, or hitting back) leaves the half-login exactly as the key door
+ * left it and the member can still submit their code. Nothing is minted,
+ * nothing is spent, no factor is checked: all of that stays in the POST.
+ *
+ * No pending login (expired, never created, someone typed the URL) → 302 to
+ * `/login` rather than an error page. There is nothing to say beyond "start
+ * again", and the start is a page, not a message. We do NOT clear the pending
+ * cookie on the way: it is `Path=/login`, `HttpOnly`, five-minute-lived, and a
+ * GET that resolved nothing has no business mutating state.
+ *
+ * No rate limiter: this renders a static form and touches no secret. The POST
+ * keeps its own limiter, which is where code-grinding is actually bounded.
+ *
+ * `next` precedence mirrors the POST's exactly — the pending login's stored
+ * `next` (resolved at key-verify time, and the only one the member's original
+ * request implied) wins unless it is the bare default, in which case a `?next=`
+ * on the URL is honoured through `safeNext`.
+ */
+export function handleAdminLoginTotpGet(db: Database, req: Request): Response {
+  const url = new URL(req.url);
+  const urlNext = safeNext(url.searchParams.get("next"));
+  const pendingToken = parsePendingLoginCookie(req.headers.get("cookie"));
+  const pending = getPendingLogin(pendingToken);
+  if (!pending) {
+    // Carry the caller's intended destination back to the password door so a
+    // restart still lands where they were headed.
+    return redirect(
+      urlNext === POST_LOGIN_DEFAULT ? "/login" : `/login?next=${encodeURIComponent(urlNext)}`,
+    );
+  }
+  // Defensive, and the same pair the POST checks: a pending login whose user
+  // vanished or whose 2FA was disenrolled mid-flight can never be completed,
+  // so don't render a form that is guaranteed to fail.
+  const user = getUserById(db, pending.userId);
+  if (!user || !isTotpEnrolled(db, user.id)) return redirect("/login");
+
+  const next = pending.next && pending.next !== POST_LOGIN_DEFAULT ? pending.next : urlNext;
+  const csrf = ensureCsrfToken(req);
+  const extra: Record<string, string> = csrf.setCookie ? { "set-cookie": csrf.setCookie } : {};
+  return htmlResponse(renderTotpChallenge({ next, csrfToken: csrf.token }), 200, extra);
+}
+
+/**
  * POST `/login/2fa` — the second-factor step (hub#473).
  *
  * Reached only after a correct password POST for a 2FA-enrolled user handed
