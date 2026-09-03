@@ -3,7 +3,13 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { HUB_DB_BUSY_TIMEOUT_MS, hubDbPath, migrate, openHubDb } from "../hub-db.ts";
+import {
+  GRANT_ATTRIBUTION_MIGRATION,
+  HUB_DB_BUSY_TIMEOUT_MS,
+  hubDbPath,
+  migrate,
+  openHubDb,
+} from "../hub-db.ts";
 
 interface Harness {
   configDir: string;
@@ -709,15 +715,15 @@ describe("migration v23 — channel_vaults (channel-attached vaults PR 1)", () =
       const db = openHubDb(h.dbPath);
       try {
         // Stand up the pre-v23 shape — same drop-the-artifact / unmark-the-
-        // version fixture the v10 / v13 / v20 tests use. On `next` the highest
-        // migration before this one is v21; hub#945 lands v22 ahead of it, so
-        // this proves "applies on a DB at the previous head" either way.
+        // version fixture the v10 / v13 / v20 tests use. The highest
+        // migration before this one is grant attribution (v22, hub#945) —
+        // pin against its exported constant so this doesn't drift.
         const head = db
           .query<{ v: number }, []>(
             "SELECT MAX(version) AS v FROM schema_version WHERE version < 23",
           )
           .get();
-        expect(head?.v).toBeGreaterThanOrEqual(21);
+        expect(head?.v).toBe(GRANT_ATTRIBUTION_MIGRATION);
         db.exec("DROP TABLE channel_vaults");
         db.exec("DELETE FROM schema_version WHERE version = 23");
 

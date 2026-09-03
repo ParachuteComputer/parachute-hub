@@ -95,7 +95,7 @@ import {
 } from "./channel-vaults.ts";
 import { GrantError, ensureUserForPubkey } from "./grant-access.ts";
 import { findPubkeyLink, pubkeysForUser } from "./pubkey-links.ts";
-import { isHubAdmin, removeUserVault, upsertUserVault } from "./users.ts";
+import { isHubAdmin, removeUserVault as removeUserVaultDefault, upsertUserVault } from "./users.ts";
 
 /** How often the hub polls each `sync` binding. Design §2: 60 seconds. */
 export const CHANNEL_RECONCILE_INTERVAL_MS = 60_000;
@@ -225,6 +225,13 @@ export interface ReconcilerDeps {
   limiter?: FailureLogLimiter;
   /** Quiet window for a repeated (binding, reason). */
   failureLogIntervalMs?: number;
+  /**
+   * Row-removal seam. Defaults to the real {@link removeUserVaultDefault}.
+   * Test-only in practice — exists so the removal sweep's all-or-nothing
+   * transaction (a thrown exception mid-sweep must leave every grant
+   * untouched) can be exercised without needing a real SQLite failure.
+   */
+  removeUserVault?: typeof removeUserVaultDefault;
 }
 
 interface ExistingRow {
@@ -391,16 +398,43 @@ export async function reconcileBinding(
   // only for users NONE of whose linked keys are in the roster (a hub account
   // may carry several keys — an agent's and a human's — and any one of them
   // being seated is enough to keep the access).
-  for (const row of rowsOwnedByBinding(db, binding.vault, via)) {
+  const removeVault = deps.removeUserVault ?? removeUserVaultDefault;
+  const candidates = rowsOwnedByBinding(db, binding.vault, via).filter((row) => {
     const keys = pubkeysForUser(db, row.user_id);
-    if (keys.some((k) => rosterKeys.has(k))) continue;
-    if (removeUserVault(db, row.user_id, binding.vault, now)) {
+    return !keys.some((k) => rosterKeys.has(k));
+  });
+  if (candidates.length > 0) {
+    // ONE transaction for the whole sweep — unlike the additions loop above
+    // (which cannot span a transaction: `ensureUserForPubkey` awaits argon2),
+    // removal is synchronous end to end, so the all-or-nothing property is
+    // free. A thrown exception partway through must not leave some grants
+    // revoked and others not: the next pass, 60 seconds later, gets a clean
+    // slate to retry the whole sweep from, same freeze-don't-half-drop
+    // posture as an unreachable relay.
+    let removedUserIds: string[] = [];
+    try {
+      db.transaction(() => {
+        removedUserIds = [];
+        for (const row of candidates) {
+          if (removeVault(db, row.user_id, binding.vault, now)) removedUserIds.push(row.user_id);
+        }
+      })();
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      out.errors++;
+      log(
+        `channel reconcile: removal sweep failed vault=${binding.vault} relay=${binding.relayHost} ` +
+          `channel=${binding.channelId} detail=${detail} (rolled back — no grants were removed)`,
+      );
+      removedUserIds = [];
+    }
+    for (const userId of removedUserIds) {
       out.removed++;
       // The row is gone by design (revoke is a delete, not a tombstone), so
       // this line is the only surviving record. Same key=value shape as
       // `revokeAccess`'s audit line.
       log(
-        `channel reconcile: vault access removed vault=${binding.vault} subject_user_id=${row.user_id} ` +
+        `channel reconcile: vault access removed vault=${binding.vault} subject_user_id=${userId} ` +
           `relay=${binding.relayHost} channel=${binding.channelId} reason=not_in_roster`,
       );
     }
