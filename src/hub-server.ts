@@ -127,6 +127,8 @@
  *   /api/modules/operations/:id   (GET)        → poll async op status
  *   /api/settings/hub-origin      (GET + PUT)  → canonical hub URL (host:admin)
  *   /api/settings/root-redirect   (GET + PUT)  → bare-`/` redirect target (host:admin)
+ *   /api/auth/nostr/challenge     (GET)        → sign-in nonce + event template (ANONYMOUS)
+ *   /api/auth/nostr/verify        (POST)       → signed kind-27235 → session cookie (ANONYMOUS)
  *   /api/auth/mint-token          (POST)       → CLI/automation token mint (bearer)
  *   /api/auth/revoke-token        (POST)       → revoke registry-row token by jti
  *   /api/auth/tokens              (GET)        → paginated registry list (carries the additive subject_pubkey snapshot)
@@ -365,6 +367,7 @@ import {
   readModuleManifest as defaultReadModuleManifest,
 } from "./module-manifest.ts";
 import { isNostrAuthorization } from "./nostr-http-auth.ts";
+import { handleNostrLogin } from "./nostr-login.ts";
 import { isLegacyNotesPath, logNotesRedirect, maybeRedirectNotes } from "./notes-redirect.ts";
 import {
   authorizationServerMetadata,
@@ -3628,6 +3631,37 @@ export function hubFetch(
           default:
             return new Response("not found", { status: 404 });
         }
+      }
+
+      // The human key door (design note "Human key door — sign in with a Nostr
+      // key"). The ONLY anonymous routes under /api/auth/* — everything else in
+      // this family is bearer-gated, and these two cannot be: their entire
+      // purpose is to establish a session for a member who has no password and
+      // no token, only a linked Nostr key.
+      //
+      // `hubBoundOrigins` comes from `linkageBoundOrigins`, NOT the general
+      // `oauthDeps(req).hubBoundOrigins()`. The general set includes the
+      // per-request (Host-derived) issuer, which an attacker can choose; if it
+      // were accepted as a `u` origin here, a signature over a statement naming
+      // the ATTACKER's host would be spendable at this hub, minting a session
+      // as the victim. hub#833 MEDIUM-1 drew that line for a durable proof; a
+      // session mint earns it at least as much. The cost is the same as for
+      // linkage: an unconfigured-but-Host-exposed hub must pin an origin (set
+      // hub_origin, or `parachute expose`) before the key door works from
+      // anywhere but loopback.
+      if (pathname === "/api/auth/nostr" || pathname.startsWith("/api/auth/nostr/")) {
+        if (!getDb) return dbNotConfigured();
+        const subpath = pathname.slice("/api/auth/nostr".length);
+        return handleNostrLogin(req, subpath, {
+          db: getDb(),
+          hubBoundOrigins: linkageBoundOrigins({
+            issuerSource: resolveIssuerSource(getDb(), configuredIssuer, loadExposeHubOrigin),
+            issuer: resolveIssuer(req, getDb(), configuredIssuer, loadExposeHubOrigin),
+            loopbackPort,
+            exposeHubOrigin: loadExposeHubOrigin(),
+            platformOrigin: process.env.RENDER_EXTERNAL_URL ?? flyDefaultOrigin(process.env),
+          }),
+        });
       }
 
       if (pathname === "/api/auth/mint-token") {

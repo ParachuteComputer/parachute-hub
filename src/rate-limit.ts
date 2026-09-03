@@ -180,6 +180,35 @@ export const PUBKEY_LINK_WINDOW_MS = 10 * 60 * 1000;
  * BIP-340 verifications (elliptic-curve work on attacker-shaped input).
  */
 export const PUBKEY_LINK_MAX_ATTEMPTS = 20;
+
+/**
+ * `/api/auth/nostr/{challenge,verify}` window — the human key door.
+ *
+ * Keyed by CLIENT IP, not by user-id, and that is forced rather than chosen:
+ * both routes are ANONYMOUS (the whole point of the door is that there is no
+ * session yet), so there is no identity to bucket on until after the signature
+ * verifies, which is exactly the work the limiter exists to bound.
+ */
+export const NOSTR_LOGIN_WINDOW_MS = 10 * 60 * 1000;
+/**
+ * Challenges per window per IP. A sign-in is one challenge; 30 covers a member
+ * reloading the page, fumbling their extension, and trying again on a second
+ * device, while bounding how fast one client can grow the process-local nonce
+ * Map. More generous than the linkage ceremony's 20 because a shared egress IP
+ * (a co-op office, a phone carrier NAT) pools several members here, where the
+ * linkage bucket is per-account.
+ */
+export const NOSTR_LOGIN_CHALLENGE_MAX_ATTEMPTS = 30;
+/**
+ * Verifies per window per IP. Deliberately a SEPARATE bucket from the
+ * challenge limiter, for the same reason the linkage ceremony splits its two:
+ * the honest flow is one challenge per one verify, so a shared bucket would
+ * halve the real budget and 429 a member halfway through their retries. Bounds
+ * sha256 + BIP-340 work on wholly unauthenticated, attacker-shaped input —
+ * this is the only gate in front of that work on this surface.
+ */
+export const NOSTR_LOGIN_VERIFY_MAX_ATTEMPTS = 20;
+
 /** Sentinel for the IP-extraction priority chain when nothing parsed. */
 export const UNKNOWN_IP_SENTINEL = "unknown";
 
@@ -388,6 +417,27 @@ export const pubkeyVerifyRateLimiter = new RateLimiter(
 );
 
 /**
+ * `GET /api/auth/nostr/challenge` rate limiter — per-IP, 30 / 10 min. Bounds
+ * unbounded growth of the process-local sign-in nonce Map from one client.
+ * See `NOSTR_LOGIN_CHALLENGE_MAX_ATTEMPTS`.
+ */
+export const nostrLoginChallengeRateLimiter = new RateLimiter(
+  NOSTR_LOGIN_CHALLENGE_MAX_ATTEMPTS,
+  NOSTR_LOGIN_WINDOW_MS,
+);
+
+/**
+ * `POST /api/auth/nostr/verify` rate limiter — per-IP, 20 / 10 min. SEPARATE
+ * bucket from the challenge limiter on purpose (see
+ * `NOSTR_LOGIN_VERIFY_MAX_ATTEMPTS`). This is the only gate in front of the
+ * door's BIP-340 verification work.
+ */
+export const nostrLoginVerifyRateLimiter = new RateLimiter(
+  NOSTR_LOGIN_VERIFY_MAX_ATTEMPTS,
+  NOSTR_LOGIN_WINDOW_MS,
+);
+
+/**
  * Backwards-compat shim for hub#188's call sites: the original
  * top-level `checkAndRecord` was the login limiter. New code should
  * reach into `loginRateLimiter.checkAndRecord` directly.
@@ -412,6 +462,8 @@ export function __resetForTests(): void {
   authIpCeilingRateLimiter.reset();
   pubkeyChallengeRateLimiter.reset();
   pubkeyVerifyRateLimiter.reset();
+  nostrLoginChallengeRateLimiter.reset();
+  nostrLoginVerifyRateLimiter.reset();
 }
 
 /**
