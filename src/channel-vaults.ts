@@ -249,3 +249,37 @@ export function removeChannelVaultsForVault(db: Database, vault: string): number
   const res = db.prepare("DELETE FROM channel_vaults WHERE vault = ?").run(vault);
   return Number(res.changes);
 }
+
+/**
+ * Trust-on-first-use pin of the relay's NIP-11 `self` pubkey.
+ *
+ * Writes only when the column is still NULL — the `WHERE relay_self_pubkey IS
+ * NULL` clause is the whole security property, not an optimization. A relay
+ * that starts advertising a different `self` must be REJECTED by the caller
+ * (`relay_key_changed`), never silently re-pinned: re-pinning would mean an
+ * attacker who can answer NIP-11 for one poll gets to sign rosters forever,
+ * which is exactly the substitution TOFU exists to notice.
+ *
+ * Returns `true` when this call did the pinning, `false` when the row was
+ * already pinned or does not exist. Concurrency-safe by construction: two
+ * pollers racing on an unpinned row both run a conditional UPDATE, the second
+ * one matches zero rows, and the caller compares what it fetched against the
+ * value now stored.
+ *
+ * Re-pinning after a deliberate relay key rotation is an operator action —
+ * detach and re-attach the channel — not something a fetcher may do.
+ */
+export function pinRelaySelfPubkey(
+  db: Database,
+  relayHost: string,
+  channelId: string,
+  pubkey: string,
+): boolean {
+  const res = db
+    .prepare(
+      `UPDATE channel_vaults SET relay_self_pubkey = ?
+        WHERE relay_host = ? AND channel_id = ? AND relay_self_pubkey IS NULL`,
+    )
+    .run(pubkey, relayHost, channelId);
+  return Number(res.changes) > 0;
+}

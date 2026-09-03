@@ -19,6 +19,7 @@ import {
   listChannelVaults,
   normalizeChannelId,
   normalizeRelayHost,
+  pinRelaySelfPubkey,
   removeChannelVault,
   removeChannelVaultsForVault,
   upsertChannelVault,
@@ -151,5 +152,35 @@ describe("upsert / get / list / remove", () => {
 
     expect(removeChannelVaultsForVault(db, "doomed")).toBe(2);
     expect(listChannelVaults(db).map((b) => b.vault)).toEqual(["keeper"]);
+  });
+});
+
+describe("pinRelaySelfPubkey", () => {
+  const KEY_A = "a".repeat(64);
+  const KEY_B = "b".repeat(64);
+
+  test("pins once on a NULL column and refuses to overwrite afterwards", () => {
+    upsertChannelVault(db, { relayHost: "a.example", channelId: "c1", vault: "v" });
+    expect(getChannelVault(db, "a.example", "c1")?.relaySelfPubkey).toBeNull();
+
+    expect(pinRelaySelfPubkey(db, "a.example", "c1", KEY_A)).toBe(true);
+    expect(getChannelVault(db, "a.example", "c1")?.relaySelfPubkey).toBe(KEY_A);
+
+    // The whole point of trust-on-first-use: a second, different key does not
+    // land, and the call reports that it changed nothing.
+    expect(pinRelaySelfPubkey(db, "a.example", "c1", KEY_B)).toBe(false);
+    expect(getChannelVault(db, "a.example", "c1")?.relaySelfPubkey).toBe(KEY_A);
+
+    // Re-pinning the SAME key is also a no-op — idempotent, not an error.
+    expect(pinRelaySelfPubkey(db, "a.example", "c1", KEY_A)).toBe(false);
+  });
+
+  test("is scoped to one binding and a missing row is false, not a throw", () => {
+    upsertChannelVault(db, { relayHost: "a.example", channelId: "c1", vault: "v" });
+    upsertChannelVault(db, { relayHost: "b.example", channelId: "c1", vault: "v" });
+
+    expect(pinRelaySelfPubkey(db, "a.example", "c1", KEY_A)).toBe(true);
+    expect(getChannelVault(db, "b.example", "c1")?.relaySelfPubkey).toBeNull();
+    expect(pinRelaySelfPubkey(db, "absent.example", "c9", KEY_A)).toBe(false);
   });
 });

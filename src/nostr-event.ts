@@ -118,11 +118,37 @@ function isHex64(v: unknown): v is string {
 }
 
 /**
+ * Per-call overrides for the size bounds. Every field defaults to the
+ * `MAX_*` constant above; a caller raises a bound only when it knows the
+ * event it is parsing is legitimately bigger than a linkage event.
+ *
+ * The one real caller is the channel roster fetcher: a NIP-29 kind 39002
+ * member list carries one `["p", <pubkey>, "", <role>]` tag PER MEMBER, so a
+ * 40-person channel blows straight through `MAX_EVENT_TAGS = 20`. The bounds
+ * still exist there — they are just sized for a roster instead of a
+ * three-tag auth event, and the amplification argument in the module header
+ * is unchanged: whatever the caller allows is what it is willing to hash.
+ */
+export interface NostrEventLimits {
+  maxContentLen?: number;
+  maxTags?: number;
+  maxTagElements?: number;
+  maxTagElementLen?: number;
+}
+
+/**
  * Shape-validate an untrusted value as a NIP-01 event. Does NOT verify the id
  * or the signature — call `verifyNostrEvent` for that. Every field is checked
  * for both type and bound; nothing is coerced, normalized, or defaulted.
  */
-export function parseNostrEvent(raw: unknown): ParseNostrEventResult {
+export function parseNostrEvent(
+  raw: unknown,
+  limits: NostrEventLimits = {},
+): ParseNostrEventResult {
+  const maxContentLen = limits.maxContentLen ?? MAX_EVENT_CONTENT_LEN;
+  const maxTags = limits.maxTags ?? MAX_EVENT_TAGS;
+  const maxTagElements = limits.maxTagElements ?? MAX_TAG_ELEMENTS;
+  const maxTagElementLen = limits.maxTagElementLen ?? MAX_TAG_ELEMENT_LEN;
   if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
     return { ok: false, reason: "not_an_object" };
   }
@@ -139,17 +165,17 @@ export function parseNostrEvent(raw: unknown): ParseNostrEventResult {
   if (typeof o.created_at !== "number" || !Number.isSafeInteger(o.created_at) || o.created_at < 0) {
     return { ok: false, reason: "created_at" };
   }
-  if (typeof o.content !== "string" || o.content.length > MAX_EVENT_CONTENT_LEN) {
+  if (typeof o.content !== "string" || o.content.length > maxContentLen) {
     return { ok: false, reason: "content" };
   }
-  if (!Array.isArray(o.tags) || o.tags.length > MAX_EVENT_TAGS) {
+  if (!Array.isArray(o.tags) || o.tags.length > maxTags) {
     return { ok: false, reason: "tags" };
   }
   const tags: string[][] = [];
   for (const tag of o.tags) {
-    if (!Array.isArray(tag) || tag.length > MAX_TAG_ELEMENTS) return { ok: false, reason: "tags" };
+    if (!Array.isArray(tag) || tag.length > maxTagElements) return { ok: false, reason: "tags" };
     for (const el of tag) {
-      if (typeof el !== "string" || el.length > MAX_TAG_ELEMENT_LEN) {
+      if (typeof el !== "string" || el.length > maxTagElementLen) {
         return { ok: false, reason: "tags" };
       }
     }
