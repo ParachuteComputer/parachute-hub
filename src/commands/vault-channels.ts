@@ -1,6 +1,7 @@
 /**
- * `parachute vault attach-channel | detach-channel | list-channels` — the
- * operator surface over the `channel_vaults` binding table (migration v23).
+ * `parachute vault attach-channel | detach-channel | list-channels |
+ * sync-channels` — the operator surface over the `channel_vaults` binding
+ * table (migration v23) and the membership reconciler that reads it.
  *
  * PR 1 of the design "Channel-attached vaults — membership becomes access".
  * The design calls the verb `attach-channel-vault`; the repo's CLI grammar is
@@ -24,8 +25,15 @@
  * `POST /vaults` — and this command presents the on-disk
  * `~/.parachute/operator.token` (read, never minted), whose default `admin`
  * scope-set carries it. That is the design's v1 answer to "who may attach":
- * a hub operator, not a channel owner. Nothing here grants vault access to
- * anyone; the reconciler that does lands in a later PR.
+ * a hub operator, not a channel owner.
+ *
+ * `sync-channels` (PR 5) is the one verb with an effect on access: it asks the
+ * hub to run one membership reconcile pass NOW instead of waiting out the
+ * 60-second poll, and prints what each binding did. It grants nothing the poll
+ * would not have granted a minute later — the authority is the relay's signed
+ * roster, never this command. The design calls the verb `sync`; the repo's CLI
+ * grammar is `parachute vault <verb>` and its siblings are already
+ * `list-channels` / `attach-channel`, so it is spelled `sync-channels`.
  */
 
 import { CONFIG_DIR } from "../config.ts";
@@ -41,7 +49,12 @@ import {
 } from "../module-ops-client.ts";
 
 /** Subcommands this module owns, as spelled under `parachute vault`. */
-export const CHANNEL_SUBCOMMANDS = ["attach-channel", "detach-channel", "list-channels"] as const;
+export const CHANNEL_SUBCOMMANDS = [
+  "attach-channel",
+  "detach-channel",
+  "list-channels",
+  "sync-channels",
+] as const;
 export type ChannelSubcommand = (typeof CHANNEL_SUBCOMMANDS)[number];
 
 export function isChannelSubcommand(value: string): value is ChannelSubcommand {
@@ -66,6 +79,7 @@ const USAGE = [
   "  parachute vault attach-channel --relay <host> --channel <uuid> [--vault <name>]",
   "  parachute vault detach-channel --relay <host> --channel <uuid>",
   "  parachute vault list-channels [--vault <name>]",
+  "  parachute vault sync-channels",
   "",
   "  --vault      vault instance name, which must already exist. Defaults to",
   "               ch-<first-8-of-channel>. Create it first with `parachute vault create`.",
@@ -153,12 +167,19 @@ function parseFlags(sub: ChannelSubcommand, args: readonly string[]): ParseOutco
     }
     return { ok: false, message: `unexpected argument "${a}"` };
   }
-  if (sub !== "list-channels") {
+  if (sub !== "list-channels" && sub !== "sync-channels") {
     if (!flags.relay) return { ok: false, message: "--relay <host> is required" };
     if (!flags.channel) return { ok: false, message: "--channel <uuid> is required" };
   }
   if (sub === "detach-channel" && flags.vault !== undefined) {
     return { ok: false, message: "detach-channel takes no --vault (the key is relay + channel)" };
+  }
+  if (sub === "sync-channels" && (flags.vault ?? flags.relay ?? flags.channel) !== undefined) {
+    // A pass is all-or-nothing on purpose: the reconciler's removal sweep is
+    // scoped per binding, so a filtered run would look like a partial answer
+    // to "is this hub in step with its relays?" when it is only a partial
+    // question. Cheap enough not to need a filter.
+    return { ok: false, message: "sync-channels takes no filters — it runs every `sync` binding" };
   }
   return { ok: true, flags };
 }
@@ -193,6 +214,22 @@ interface BindingWire {
   removed?: boolean;
 }
 
+/** One binding's reconcile outcome on the wire (`POST /api/channel-vaults/sync`). */
+interface SyncResultWire {
+  relay_host?: string;
+  channel_id?: string;
+  vault?: string;
+  status?: string;
+  reason?: string;
+  members?: number;
+  granted?: number;
+  removed?: number;
+  created_users?: number;
+  unchanged?: number;
+  deferred?: number;
+  errors?: number;
+}
+
 function str(v: unknown, fallback = ""): string {
   return typeof v === "string" ? v : fallback;
 }
@@ -219,6 +256,57 @@ function renderList(rows: BindingWire[], log: (l: string) => void): void {
       .trimEnd();
   log(line(header));
   for (const c of cells) log(line(c));
+}
+
+function num(v: unknown): number {
+  return typeof v === "number" && Number.isFinite(v) ? v : 0;
+}
+
+/**
+ * Render one reconcile pass. Every binding gets a line, including the frozen
+ * and failed ones — a silent skip is exactly what an operator would misread as
+ * "in sync".
+ */
+function renderSync(
+  ran: boolean,
+  reason: string | undefined,
+  rows: SyncResultWire[],
+  log: (l: string) => void,
+): void {
+  if (!ran) {
+    if (reason === "not_configured") {
+      log("No Buzz reader key is configured on this hub — nothing to sync.");
+      log("Put the hub's nsec in ~/.parachute/buzz-reader.nsec (one line, chmod 600), then retry.");
+    } else if (reason === "key_unreadable") {
+      log("The Buzz reader key exists but could not be read — check the file and its permissions.");
+    } else {
+      log("No channel is attached in `sync` mode on this hub. Nothing to sync.");
+    }
+    return;
+  }
+  const cells = rows.map((r) => [
+    str(r.relay_host),
+    str(r.channel_id),
+    str(r.vault),
+    r.status === "ok" ? "ok" : `${str(r.status, "?")}:${str(r.reason, "-")}`,
+    String(num(r.members)),
+    String(num(r.granted)),
+    String(num(r.removed)),
+    String(num(r.created_users)),
+  ]);
+  const header = ["RELAY", "CHANNEL", "VAULT", "STATUS", "MEMBERS", "GRANTED", "REMOVED", "NEW"];
+  const widths = header.map((h, i) => Math.max(h.length, ...cells.map((c) => (c[i] ?? "").length)));
+  const line = (c: readonly string[]) =>
+    c
+      .map((v, i) => v.padEnd(widths[i] ?? 0))
+      .join("  ")
+      .trimEnd();
+  log(line(header));
+  for (const c of cells) log(line(c));
+  if (rows.some((r) => r.status === "failed")) {
+    log("");
+    log("A failed binding keeps every grant it already had — `synced_at` stays stale (freeze).");
+  }
 }
 
 /**
@@ -269,6 +357,9 @@ export async function vaultChannels(
     const payload: Record<string, unknown> = { relay: flags.relay, channel: flags.channel };
     if (flags.vault !== undefined) payload.vault = flags.vault;
     body = JSON.stringify(payload);
+  } else if (sub === "sync-channels") {
+    url = `${url}/sync`;
+    body = "{}";
   } else if (sub === "detach-channel") {
     method = "DELETE";
     const q = new URLSearchParams({ relay: flags.relay ?? "", channel: flags.channel ?? "" });
@@ -308,6 +399,16 @@ export async function vaultChannels(
     if (sub === "list-channels") {
       const rows = (payload as { channel_vaults?: unknown } | undefined)?.channel_vaults;
       renderList(Array.isArray(rows) ? (rows as BindingWire[]) : [], log);
+      return 0;
+    }
+    if (sub === "sync-channels") {
+      const wire = (payload ?? {}) as { ran?: unknown; reason?: unknown; results?: unknown };
+      renderSync(
+        wire.ran === true,
+        typeof wire.reason === "string" ? wire.reason : undefined,
+        Array.isArray(wire.results) ? (wire.results as SyncResultWire[]) : [],
+        log,
+      );
       return 0;
     }
     const wire = (payload ?? {}) as BindingWire;

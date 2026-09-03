@@ -659,6 +659,12 @@ describe("migration v23 — channel_vaults (channel-attached vaults PR 1)", () =
           "relay_self_pubkey",
           "synced_at",
           "created_at",
+          // Appended by v24 (PR 5); asserted in full here because the ORDER of
+          // this list is the migration history, and an ALTER that landed
+          // somewhere other than the tail would mean a migration was edited in
+          // place rather than added.
+          "last_error",
+          "last_attempt_at",
         ]);
         // `mode` defaults to 'sync' so a writer that doesn't know the column
         // lands on the syncing (not the frozen) side, matching the CLI default.
@@ -777,6 +783,66 @@ describe("migration v23 — channel_vaults (channel-attached vaults PR 1)", () =
           .get();
         expect(row?.mode).toBe("sync");
         expect(row?.synced_at).toBeNull();
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+});
+
+describe("migration v24 — freeze diagnostics (channel-attached vaults PR 5)", () => {
+  test("adds two nullable, undefaulted columns and records the version", () => {
+    const h = makeHarness();
+    try {
+      const db = openHubDb(h.dbPath);
+      try {
+        const cols = db
+          .query<{ name: string; notnull: number; dflt_value: string | null }, []>(
+            "SELECT name, \"notnull\", dflt_value FROM pragma_table_info('channel_vaults')",
+          )
+          .all();
+        for (const name of ["last_error", "last_attempt_at"]) {
+          const col = cols.find((c) => c.name === name);
+          expect(col).toBeDefined();
+          // NULL is the honest value for a binding that has never been polled;
+          // a default (""/"unknown") would read as a recorded attempt.
+          expect(col?.notnull).toBe(0);
+          expect(col?.dflt_value).toBeNull();
+        }
+        expect(
+          db
+            .query<{ version: number }, []>("SELECT version FROM schema_version")
+            .all()
+            .map((r) => r.version),
+        ).toContain(24);
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("applies on a db standing at the previous head", () => {
+    const h = makeHarness();
+    try {
+      const db = openHubDb(h.dbPath);
+      try {
+        // Rebuild the pre-v24 shape: SQLite cannot DROP two columns and keep
+        // the composite PK cleanly, so drop the table, replay v23's DDL by
+        // hand, and unmark both versions.
+        db.exec("DROP TABLE channel_vaults");
+        db.exec("DELETE FROM schema_version WHERE version IN (23, 24)");
+        migrate(db);
+
+        const names = db
+          .query<{ name: string }, []>("SELECT name FROM pragma_table_info('channel_vaults')")
+          .all()
+          .map((r) => r.name);
+        expect(names).toContain("last_error");
+        expect(names).toContain("last_attempt_at");
       } finally {
         db.close();
       }

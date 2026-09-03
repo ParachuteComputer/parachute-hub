@@ -151,6 +151,9 @@
  *   /api/channel-vaults           (POST)       → attach a channel to an already-installed vault; 400 if the
  *                                                vault is not installed, 409 on a rebind (host:admin)
  *   /api/channel-vaults           (DELETE)     → detach ?relay=&channel= (host:admin)
+ *   /api/channel-vaults/sync      (POST)       → run one membership reconcile pass now; per-binding
+ *                                                counts, `ran:false` when no reader key / no sync
+ *                                                binding (host:admin)
  *   /login                        (GET + POST) → operator password login
  *   /login/2fa                    (POST)       → second-factor (TOTP/backup) step
  *                                                 (hub#473; reached after a correct
@@ -302,6 +305,7 @@ import {
   handleDetachChannelVault,
   handleGetChannelVault,
   handleListChannelVaults,
+  handleSyncChannelVaults,
 } from "./api-channel-vaults.ts";
 import { handleHubUpgrade, handleHubUpgradeStatus } from "./api-hub-upgrade.ts";
 import { handleApiHub } from "./api-hub.ts";
@@ -3938,6 +3942,17 @@ export function hubFetch(
       if (pathname === "/api/channel-vault") {
         if (!getDb) return dbNotConfigured();
         return handleGetChannelVault(req, {
+          db: getDb(),
+          issuer: oauthDeps(req).issuer,
+          knownIssuers: oauthDeps(req).hubBoundOrigins(),
+          manifestPath,
+        });
+      }
+      // One reconcile pass on demand (PR 5). Mounted ABOVE the plural route so
+      // the more specific path wins; both carry the same host:admin gate.
+      if (pathname === "/api/channel-vaults/sync") {
+        if (!getDb) return dbNotConfigured();
+        return handleSyncChannelVaults(req, {
           db: getDb(),
           issuer: oauthDeps(req).issuer,
           knownIssuers: oauthDeps(req).hubBoundOrigins(),

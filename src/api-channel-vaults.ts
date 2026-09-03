@@ -14,6 +14,7 @@
  *   GET    /api/channel-vaults[?vault=]          operator surfaces, all gated on
  *   POST   /api/channel-vaults                   `parachute:host:admin` — the
  *   DELETE /api/channel-vaults?relay=&channel=   SAME gate as POST /vaults. v1
+ *   POST   /api/channel-vaults/sync              (PR 5) run ONE reconcile pass now
  *          is operator-only on purpose (design §1, "Who creates it"): a channel
  *          must not be able to annex a hub's storage, so the authority to
  *          attach is the authority to create a vault, not membership of the
@@ -28,9 +29,14 @@
  * this endpoint free of the supervisor/services.json orchestration that
  * `POST /vaults` owns, so there is exactly one way to create a vault.
  *
- * Not here (PRs 4–5): the roster fetcher, the reconciler, and any write to
- * `user_vaults`. This endpoint set never grants anything, and never creates
- * anything.
+ * `POST /api/channel-vaults/sync` (PR 5) is the one route here that DOES write
+ * `user_vaults` — it drives `runReconcileOnce`, the same pass the hub's
+ * 60-second timer runs, and answers with the per-binding counts. It exists so
+ * an operator does not have to wait out a poll interval to see the effect of an
+ * attach (or of a membership change on the relay), and it lives behind the same
+ * host:admin gate as the rest of the plural surface. It grants nothing the
+ * timer would not have granted a minute later; the authority is the relay's
+ * signed roster either way.
  */
 import type { Database } from "bun:sqlite";
 import {
@@ -40,6 +46,7 @@ import {
   requireScope,
 } from "./admin-auth.ts";
 import { HOST_ADMIN_SCOPE, listVaultInstanceNames } from "./admin-vaults.ts";
+import { type ReconcileRunResult, runReconcileOnce } from "./channel-reconciler.ts";
 import {
   type ChannelVault,
   defaultChannelVaultName,
@@ -67,6 +74,12 @@ export interface ChannelVaultsDeps {
   manifestPath?: string;
   /** Test seam for the clock. */
   now?: () => Date;
+  /**
+   * Reconcile seam for `POST /api/channel-vaults/sync`. Defaults to the real
+   * {@link runReconcileOnce} against `deps.db`; tests inject a fake so the
+   * route's shape is asserted without a relay.
+   */
+  runReconcile?: (db: Database) => Promise<ReconcileRunResult>;
 }
 
 /** One binding on the wire. snake_case, matching `/api/vault-caps` + `/api/users`. */
@@ -338,5 +351,61 @@ export async function handleDetachChannelVault(
     channel_id: target.target.channelId,
     vault: before?.vault ?? null,
     removed,
+  });
+}
+
+/**
+ * POST /api/channel-vaults/sync — run one reconcile pass now (host:admin).
+ *
+ * Synchronous by design: a pass is bounded (two 10-second-timeout requests per
+ * binding, worst case) and the operator asked for the answer, not for a job id.
+ * The response is per-binding so `parachute vault sync-channels` can render a
+ * table — including the bindings that were SKIPPED (`frozen`) and the ones that
+ * FAILED, because "this relay is unreachable and its grants are frozen" is the
+ * fact the operator most needs and the one a bare 200 would hide.
+ *
+ * `ran: false` is not an error: a hub with no reader key, or with no `sync`
+ * binding, has nothing to do and says so with a reason word.
+ */
+export async function handleSyncChannelVaults(
+  req: Request,
+  deps: ChannelVaultsDeps,
+): Promise<Response> {
+  if (req.method !== "POST") return jsonError(405, "method_not_allowed", "use POST");
+  try {
+    await requireScope(deps.db, req, HOST_ADMIN_SCOPE, deps.knownIssuers ?? [deps.issuer]);
+  } catch (err) {
+    return adminAuthErrorResponse(err as AdminAuthError);
+  }
+
+  const run = deps.runReconcile ?? ((db: Database) => runReconcileOnce({ db }));
+  let result: ReconcileRunResult;
+  try {
+    result = await run(deps.db);
+  } catch (err) {
+    // `runReconcileOnce` swallows per-binding faults, so reaching here means a
+    // programmer error. Report it as a 500 rather than letting the route throw.
+    const detail = err instanceof Error ? err.message : String(err);
+    return jsonError(500, "server_error", `reconcile pass failed: ${detail}`);
+  }
+
+  return json(200, {
+    ran: result.ran,
+    ...(result.reason !== undefined ? { reason: result.reason } : {}),
+    results: result.bindings.map((b) => ({
+      relay_host: b.relayHost,
+      channel_id: b.channelId,
+      vault: b.vault,
+      status: b.status,
+      ...(b.reason !== undefined ? { reason: b.reason } : {}),
+      ...(b.detail !== undefined ? { detail: b.detail } : {}),
+      members: b.members,
+      granted: b.granted,
+      removed: b.removed,
+      created_users: b.createdUsers,
+      unchanged: b.unchanged,
+      deferred: b.deferred,
+      errors: b.errors,
+    })),
   });
 }

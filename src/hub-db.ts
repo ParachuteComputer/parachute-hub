@@ -855,6 +855,40 @@ const MIGRATIONS: readonly Migration[] = [
       CREATE INDEX channel_vaults_vault ON channel_vaults (vault);
     `,
   },
+  {
+    version: 24,
+    sql: `
+      -- Channel-attached vaults, PR 5: make a FROZEN binding legible.
+      --
+      -- The design's answer to "relay unreachable: freeze or drop?" is
+      -- freeze — the reconciler leaves every \`user_vaults\` row alone and
+      -- leaves \`synced_at\` stale. That is the right behaviour and the
+      -- WORST possible failure to diagnose: a hub whose roster stopped
+      -- updating looks exactly like a hub whose roster stopped changing.
+      -- \`synced_at\` alone says "not recently", never "and here is why".
+      --
+      --   * last_error (TEXT NULL) — the most recent \`RosterFailure\`
+      --     reason word (\`relay_unreachable\`, \`relay_rejected\`,
+      --     \`relay_key_changed\`, …). The REASON only: no response body,
+      --     no URL, no key material. Cleared to NULL on the next success,
+      --     so a non-NULL value always means "the last attempt failed".
+      --   * last_attempt_at (TEXT NULL) — when that attempt ran. Paired
+      --     with \`synced_at\`, the two answer "how long has this been
+      --     broken" without a log dig: attempting-but-failing shows a
+      --     fresh \`last_attempt_at\` against a stale \`synced_at\`.
+      --
+      -- Diagnostics, never authority: nothing reads either column to
+      -- decide what to grant. Writing them on a failed poll is therefore
+      -- NOT a violation of "on failure, touch nothing" — the invariant
+      -- that matters is that no grant row moves and \`synced_at\` does not
+      -- advance, and both hold.
+      --
+      -- Nullable, no backfill, no default: a pre-v24 binding never had an
+      -- attempt recorded, and NULL honestly says so.
+      ALTER TABLE channel_vaults ADD COLUMN last_error TEXT;
+      ALTER TABLE channel_vaults ADD COLUMN last_attempt_at TEXT;
+    `,
+  },
 ];
 
 /**

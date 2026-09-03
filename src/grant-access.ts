@@ -213,10 +213,29 @@ export function callerCanAdminVault(db: Database, caller: GrantCaller, vaultName
   return verbs?.includes("admin") === true;
 }
 
-async function ensureUserForPubkey(
+/**
+ * Resolve a pubkey to a hub user, creating a key-only account when the key is
+ * unknown ("grant-first"). Idempotent: an already-linked key returns its user
+ * and `created: false` WITHOUT touching the existing `user_pubkeys` row — the
+ * label a key was first bound under is history and must not be rewritten by
+ * whoever happens to grant next.
+ *
+ * Exported for the channel membership reconciler (PR 5), which needs exactly
+ * this — including the username-collision and lost-race handling, which is the
+ * fiddly part and must not be reimplemented — but binds new keys under a
+ * `channel:<relay-host>:<channel-id>` label instead of the default `grant`, so
+ * `user_pubkeys` records WHERE an account came from. The reconciler is the
+ * caller most likely to create accounts in bulk, and "this account exists
+ * because it was in that channel" is the fact an operator will want later.
+ *
+ * Throws {@link GrantError} — `no_hub_owner` on an empty hub, `username_taken`
+ * / `pubkey_taken` when the key cannot be given an account.
+ */
+export async function ensureUserForPubkey(
   db: Database,
   pubkey: string,
   now: () => Date,
+  opts: { label?: string } = {},
 ): Promise<{ userId: string; username: string; created: boolean }> {
   const existing = findPubkeyLink(db, pubkey);
   if (existing) {
@@ -291,7 +310,7 @@ async function ensureUserForPubkey(
   const bound = bindPubkeyOperatorAttested(db, {
     userId: user.id,
     pubkey,
-    label: "grant",
+    label: opts.label ?? "grant",
     now: now(),
   });
   if (!bound.ok) {

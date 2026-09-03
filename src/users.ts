@@ -228,15 +228,29 @@ export type VaultVerb = "read" | "write" | "admin";
  * How a `user_vaults` row was written (migration v21). Attribution, not
  * authority — nothing reads this to decide what a row may do.
  *
- *   - `mcp` — the `/account/mcp` `grant-access` tool (the only writer today).
+ *   - `mcp` — the `/account/mcp` `grant-access` tool.
  *   - `cli` — a local `parachute` invocation against `hub.db`.
  *   - `api` — a REST admin path (`/api/users`, invite redeem).
+ *   - `channel:<relay-host>:<channel-id>` — written by the channel membership
+ *     reconciler, one label per `channel_vaults` binding. This is the only
+ *     value with STRUCTURE, and it carries a second job: it is the reconciler's
+ *     PROVENANCE mark. A row it created can be identified — and therefore
+ *     removed when the member leaves — by exact match on this string, which is
+ *     precisely why a hand-made operator grant (`mcp` / `cli` / `api` / NULL)
+ *     can never be swept up by a roster it isn't in. Not a separate column
+ *     because "how did this row get here" is exactly the question v22 added
+ *     `granted_via` to answer, and a second column answering the same question
+ *     would eventually disagree with the first.
  *
  * NULL on every row that pre-dates the migration, and on any writer that
  * hasn't been taught to record it. NULL means "unknown", never "none".
+ *
+ * Attribution, never authority: the value is read for display and for the
+ * reconciler's own bookkeeping, and never to decide what a row may do. That is
+ * why an unrecognised value is safe.
  */
 export const GRANT_VIA_VALUES = ["mcp", "cli", "api"] as const;
-export type GrantVia = (typeof GRANT_VIA_VALUES)[number];
+export type GrantVia = (typeof GRANT_VIA_VALUES)[number] | `channel:${string}`;
 
 /**
  * Who made a `user_vaults` grant, recorded alongside it (migration v21).

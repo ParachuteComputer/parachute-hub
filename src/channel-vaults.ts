@@ -66,6 +66,14 @@ export interface ChannelVault {
   relaySelfPubkey: string | null;
   /** Last successful roster sync (PR 5). `null` means "never synced". */
   syncedAt: string | null;
+  /**
+   * Reason word from the most recent FAILED roster poll (`RosterFailure`),
+   * or `null` when the last attempt succeeded / none has run. Diagnostics
+   * only — nothing reads it to decide access. See migration v24.
+   */
+  lastError: string | null;
+  /** When the most recent poll ran, successful or not. */
+  lastAttemptAt: string | null;
   createdAt: string;
 }
 
@@ -76,6 +84,8 @@ interface Row {
   mode: string;
   relay_self_pubkey: string | null;
   synced_at: string | null;
+  last_error: string | null;
+  last_attempt_at: string | null;
   created_at: string;
 }
 
@@ -87,6 +97,8 @@ function rowToBinding(r: Row): ChannelVault {
     mode: r.mode,
     relaySelfPubkey: r.relay_self_pubkey,
     syncedAt: r.synced_at,
+    lastError: r.last_error ?? null,
+    lastAttemptAt: r.last_attempt_at ?? null,
     createdAt: r.created_at,
   };
 }
@@ -192,6 +204,8 @@ export function upsertChannelVault(
       mode: input.mode ?? DEFAULT_CHANNEL_VAULT_MODE,
       relaySelfPubkey: input.relaySelfPubkey ?? null,
       syncedAt: null,
+      lastError: null,
+      lastAttemptAt: null,
       createdAt: stamp,
     }
   );
@@ -281,5 +295,57 @@ export function pinRelaySelfPubkey(
         WHERE relay_host = ? AND channel_id = ? AND relay_self_pubkey IS NULL`,
     )
     .run(pubkey, relayHost, channelId);
+  return Number(res.changes) > 0;
+}
+
+/**
+ * Record a SUCCESSFUL reconcile pass: advance `synced_at`, stamp
+ * `last_attempt_at`, and clear `last_error`.
+ *
+ * Clearing the error is half the point of the column — a stale reason word
+ * left behind after a recovery would have an operator chasing an outage that
+ * ended an hour ago. Returns `true` when a row was updated.
+ */
+export function markChannelVaultSynced(
+  db: Database,
+  relayHost: string,
+  channelId: string,
+  at: Date = new Date(),
+): boolean {
+  const stamp = at.toISOString();
+  const res = db
+    .prepare(
+      `UPDATE channel_vaults
+          SET synced_at = ?, last_attempt_at = ?, last_error = NULL
+        WHERE relay_host = ? AND channel_id = ?`,
+    )
+    .run(stamp, stamp, relayHost, channelId);
+  return Number(res.changes) > 0;
+}
+
+/**
+ * Record a FAILED reconcile pass: stamp `last_attempt_at` and store the
+ * reason word.
+ *
+ * `synced_at` is deliberately NOT touched. That is the whole "freeze on relay
+ * outage" contract in one line: the grants stay, the last-known-good sync time
+ * stays visibly stale, and the reason says why. `reason` is a
+ * `RosterFailure`-shaped word and must never carry a response body, a URL, or
+ * anything derived from the reader key.
+ */
+export function markChannelVaultFailure(
+  db: Database,
+  relayHost: string,
+  channelId: string,
+  reason: string,
+  at: Date = new Date(),
+): boolean {
+  const res = db
+    .prepare(
+      `UPDATE channel_vaults
+          SET last_attempt_at = ?, last_error = ?
+        WHERE relay_host = ? AND channel_id = ?`,
+    )
+    .run(at.toISOString(), reason, relayHost, channelId);
   return Number(res.changes) > 0;
 }

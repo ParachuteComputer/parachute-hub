@@ -56,6 +56,7 @@ import {
   ensureExecutable,
 } from "@openparachute/depcheck";
 import { decodeJwt } from "jose";
+import { CHANNEL_GRANT_VIA_PREFIX } from "../channel-reconciler.ts";
 import { CONFIG_DIR, SERVICES_MANIFEST_PATH } from "../config.ts";
 import { type ExposeState, readExposeState } from "../expose-state.ts";
 import { HUB_SVC, readHubPort } from "../hub-control.ts";
@@ -215,8 +216,31 @@ export interface GrantAssignment {
   createdAt: string;
 }
 
+/**
+ * One `channel_vaults` binding in `sync` mode, as the Grants group reports it
+ * (channel-attached vaults PR 5). Read-only inventory: doctor never runs a
+ * reconcile pass, it reports the one the hub already ran.
+ */
+export interface ChannelSyncStatus {
+  relayHost: string;
+  channelId: string;
+  vault: string;
+  /** `user_vaults` rows on that vault carrying THIS binding's provenance. */
+  members: number;
+  /** Last SUCCESSFUL sync, or `null` for "never". */
+  syncedAt: string | null;
+  /** Reason word from the last failed poll, or `null` when the last one worked. */
+  lastError: string | null;
+  lastAttemptAt: string | null;
+}
+
 export interface GrantsSnapshot {
   rows: GrantAssignment[];
+  /**
+   * The `sync` bindings, or `[]` on a hub with none (and on a DB older than
+   * the migration that added the columns — an old DB is not a finding).
+   */
+  channels?: ChannelSyncStatus[];
   /**
    * `schema_version.applied_at` for {@link GRANT_ATTRIBUTION_MIGRATION}, or
    * `null` when the migration hasn't run. Rows created before this stamp
@@ -353,8 +377,49 @@ function defaultReadGrants(configDir: string): GrantsSnapshot | null {
           ORDER BY uv.vault_name ASC, u.username ASC`,
       )
       .all();
+    // Separate try: a hub.db that predates migration v24 has no `last_error`
+    // column, and a throw here would take the whole Grants group down with it.
+    // An older DB simply reports no channel bindings.
+    let channels: ChannelSyncStatus[] = [];
+    try {
+      channels = db
+        .query<
+          {
+            relay_host: string;
+            channel_id: string;
+            vault: string;
+            members: number;
+            synced_at: string | null;
+            last_error: string | null;
+            last_attempt_at: string | null;
+          },
+          [string]
+        >(
+          `SELECT cv.relay_host, cv.channel_id, cv.vault, cv.synced_at,
+                  cv.last_error, cv.last_attempt_at,
+                  (SELECT COUNT(*) FROM user_vaults uv
+                    WHERE uv.vault_name = cv.vault
+                      AND uv.granted_via = ? || cv.relay_host || ':' || cv.channel_id) AS members
+             FROM channel_vaults cv
+            WHERE cv.mode = 'sync'
+            ORDER BY cv.relay_host ASC, cv.channel_id ASC`,
+        )
+        .all(CHANNEL_GRANT_VIA_PREFIX)
+        .map((r) => ({
+          relayHost: r.relay_host,
+          channelId: r.channel_id,
+          vault: r.vault,
+          members: r.members,
+          syncedAt: r.synced_at,
+          lastError: r.last_error,
+          lastAttemptAt: r.last_attempt_at,
+        }));
+    } catch {
+      channels = [];
+    }
     return {
       attributionSince: applied?.applied_at ?? null,
+      channels,
       rows: rows.map((r) => ({
         vault: r.vault_name,
         userId: r.user_id,
@@ -1245,6 +1310,14 @@ function checkMigration(
  *     API grant — no key signed it) counts as attributed; demanding a pubkey
  *     there would false-positive on every non-NIP-98 door.
  *
+ * Channel-attached vaults (PR 5) add one line per `sync` binding underneath:
+ * vault, how many rows that binding currently owns, when it last synced, and
+ * the last failure reason if the most recent poll failed. WARN in exactly that
+ * last case — a frozen binding is working as designed (grants retained,
+ * `synced_at` stale) and is therefore invisible without being told, which is
+ * the whole reason to print it. A binding that has never synced on a hub with
+ * no reader key never records a failure, so opting out costs no warning.
+ *
  * No hub.db, or an unreadable one → one benign PASS. A box that has never
  * granted anything is a normal box.
  */
@@ -1260,6 +1333,7 @@ function checkGrants(configDir: string, deps: ResolvedDeps): CheckResult[] {
       },
     ];
   }
+  const channelChecks = channelSyncChecks(snapshot.channels ?? []);
   if (snapshot.rows.length === 0) {
     return [
       {
@@ -1268,6 +1342,7 @@ function checkGrants(configDir: string, deps: ResolvedDeps): CheckResult[] {
         status: "pass",
         detail: "no vault assignments recorded",
       },
+      ...channelChecks,
     ];
   }
 
@@ -1330,7 +1405,32 @@ function checkGrants(configDir: string, deps: ResolvedDeps): CheckResult[] {
             .join(", ")} granted since attribution landed but record no grantor`,
         },
   );
+  out.push(...channelChecks);
   return out;
+}
+
+/** One inventory line per `sync` channel binding. Read-only; never reconciles. */
+function channelSyncChecks(channels: readonly ChannelSyncStatus[]): CheckResult[] {
+  return channels.map((c) => {
+    const synced = c.syncedAt ?? "never";
+    const base = `vault=${c.vault} members=${c.members} synced_at=${synced}`;
+    if (c.lastError === null) {
+      return {
+        name: `channel-sync:${c.relayHost}:${c.channelId}`,
+        title: `${c.channelId} @ ${c.relayHost}`,
+        status: "pass",
+        detail: base,
+      };
+    }
+    return {
+      name: `channel-sync:${c.relayHost}:${c.channelId}`,
+      title: `${c.channelId} @ ${c.relayHost}`,
+      status: "warn",
+      detail:
+        `${base} last_error=${c.lastError} last_attempt_at=${c.lastAttemptAt ?? "-"} ` +
+        `— grants are frozen at the last good roster (${c.members} row(s) retained)`,
+    };
+  });
 }
 
 // ---------------------------------------------------------------------------
