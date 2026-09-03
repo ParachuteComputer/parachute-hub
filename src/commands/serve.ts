@@ -28,6 +28,7 @@ import { existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { selfHealScribeAuth } from "../auto-wire.ts";
 import { generateBootstrapToken } from "../bootstrap-token.ts";
+import { type ChannelReconciler, startChannelReconciler } from "../channel-reconciler.ts";
 // NOTE: CONFIG_DIR/WELL_KNOWN_DIR/SERVICES_MANIFEST_PATH are evaluated at
 // import time from process.env.PARACHUTE_HOME. The `env` parameter on
 // `serve()` cannot reroute them — set PARACHUTE_HOME before importing for
@@ -797,6 +798,22 @@ export async function serve(opts: ServeOpts = {}): Promise<{
     }
   }
 
+  // Channel membership sync (channel-attached vaults PR 5). Started here, on
+  // the real `parachute serve` path, for the same reason the DB watchdog is:
+  // this is the process a launchd / systemd unit actually runs. It returns
+  // `null` — and starts NO timer — unless a Buzz reader key is configured, so
+  // a hub that has not opted in pays nothing. Skipped under `skipModuleBoot`
+  // alongside every other real timer, so tests never spawn a 60-second poll.
+  let reconciler: ChannelReconciler | null = null;
+  if (!opts.skipModuleBoot) {
+    reconciler = startChannelReconciler({ db: dbHolder.get(), log });
+    if (reconciler) {
+      log(
+        "parachute serve: channel membership sync armed (60s poll over `sync` channel bindings).",
+      );
+    }
+  }
+
   // Boot already-installed modules from services.json — now that we own the
   // hub port (above), we're guaranteed to be the sole supervisor. In a
   // container, this is the path that re-spawns vault / notes / scribe after a
@@ -841,6 +858,7 @@ export async function serve(opts: ServeOpts = {}): Promise<{
         await supervisor.stop(state.short);
       }
       selfProbe?.stop();
+      reconciler?.stop();
       livenessTimer.stop();
       // Both sockets come down. Leaving the guard bound after a restart would
       // make the hub's own next boot race itself for 127.0.0.1:<port>.

@@ -46,6 +46,7 @@ Usage:
                                     not the raw mechanics-only delete.
                                     \`vault attach-channel|detach-channel|list-channels\`
                                     are hub-side: they bind a Buzz channel to a vault.
+                                    \`vault sync-channels\` runs one membership reconcile pass now.
 
 Flags:
   --help, -h                        show this help (also per-subcommand: \`parachute <cmd> --help\`)

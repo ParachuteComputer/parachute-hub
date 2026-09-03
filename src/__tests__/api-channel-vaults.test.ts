@@ -22,6 +22,7 @@ import {
   handleDetachChannelVault,
   handleGetChannelVault,
   handleListChannelVaults,
+  handleSyncChannelVaults,
 } from "../api-channel-vaults.ts";
 import { getChannelVault, upsertChannelVault } from "../channel-vaults.ts";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
@@ -380,5 +381,99 @@ describe("DELETE /api/channel-vaults — detach", () => {
     );
     expect(res.status).toBe(200);
     expect(await res.json()).toMatchObject({ removed: false, vault: null });
+  });
+});
+
+describe("POST /api/channel-vaults/sync — one reconcile pass on demand", () => {
+  /** A pass that reports one ok binding, without touching a relay. */
+  function fakeRun(calls: number[]) {
+    return async () => {
+      calls.push(1);
+      return {
+        ran: true,
+        bindings: [
+          {
+            relayHost: RELAY,
+            channelId: CHANNEL,
+            vault: "existing",
+            status: "ok" as const,
+            members: 2,
+            granted: 1,
+            removed: 1,
+            createdUsers: 1,
+            unchanged: 1,
+            deferred: 0,
+            errors: 0,
+          },
+        ],
+      };
+    };
+  }
+
+  test("405 on anything but POST", async () => {
+    const bearer = await bearerWith([HOST_ADMIN_SCOPE]);
+    const res = await handleSyncChannelVaults(req("/api/channel-vaults/sync", bearer), deps());
+    expect(res.status).toBe(405);
+  });
+
+  test("401 unauthenticated, 403 without host:admin — this route WRITES grants", async () => {
+    const calls: number[] = [];
+    const d = { ...deps(), runReconcile: fakeRun(calls) };
+    const anon = await handleSyncChannelVaults(
+      req("/api/channel-vaults/sync", undefined, { method: "POST" }),
+      d,
+    );
+    expect(anon.status).toBe(401);
+
+    const bearer = await bearerWith(["vault:existing:admin"]);
+    const res = await handleSyncChannelVaults(
+      req("/api/channel-vaults/sync", bearer, { method: "POST" }),
+      d,
+    );
+    expect(res.status).toBe(403);
+    // The gate is checked BEFORE any reconcile runs.
+    expect(calls).toHaveLength(0);
+  });
+
+  test("host:admin gets per-binding counts", async () => {
+    const calls: number[] = [];
+    const bearer = await bearerWith([HOST_ADMIN_SCOPE]);
+    const res = await handleSyncChannelVaults(
+      req("/api/channel-vaults/sync", bearer, { method: "POST" }),
+      { ...deps(), runReconcile: fakeRun(calls) },
+    );
+    expect(res.status).toBe(200);
+    expect(res.headers.get("cache-control")).toBe("no-store");
+    expect(await res.json()).toEqual({
+      ran: true,
+      results: [
+        {
+          relay_host: RELAY,
+          channel_id: CHANNEL,
+          vault: "existing",
+          status: "ok",
+          members: 2,
+          granted: 1,
+          removed: 1,
+          created_users: 1,
+          unchanged: 1,
+          deferred: 0,
+          errors: 0,
+        },
+      ],
+    });
+    expect(calls).toHaveLength(1);
+  });
+
+  test("a hub with no reader key answers ran:false with a reason, not an error", async () => {
+    const bearer = await bearerWith([HOST_ADMIN_SCOPE]);
+    // No `runReconcile` override: the REAL pass runs, and a test hub has no
+    // Buzz reader key, which is exactly the state being asserted.
+    const res = await handleSyncChannelVaults(
+      req("/api/channel-vaults/sync", bearer, { method: "POST" }),
+      deps(),
+    );
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ ran: false, reason: "not_configured", results: [] });
   });
 });

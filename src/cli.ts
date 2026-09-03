@@ -1072,7 +1072,12 @@ async function main(argv: string[]): Promise<number> {
       // passthrough for every OTHER vault verb doesn't pay for loading the
       // command module; `CHANNEL_SUBCOMMANDS` in that module is the canonical
       // set and a test pins the two together.
-      if (sub === "attach-channel" || sub === "detach-channel" || sub === "list-channels") {
+      if (
+        sub === "attach-channel" ||
+        sub === "detach-channel" ||
+        sub === "list-channels" ||
+        sub === "sync-channels"
+      ) {
         const ch = await loadCommand(
           "vault-channels",
           () => import("./commands/vault-channels.ts"),

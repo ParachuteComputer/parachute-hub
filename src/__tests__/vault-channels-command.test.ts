@@ -1,5 +1,6 @@
 /**
- * `parachute vault attach-channel | detach-channel | list-channels`.
+ * `parachute vault attach-channel | detach-channel | list-channels |
+ * sync-channels`.
  *
  * The command is a CLIENT of the running hub — every verb must go out as an
  * operator-token-bearing request to `/api/channel-vaults` and nothing may be
@@ -321,11 +322,88 @@ describe("list-channels", () => {
   });
 });
 
+describe("sync-channels", () => {
+  const okBody = {
+    ran: true,
+    results: [
+      {
+        relay_host: RELAY,
+        channel_id: CHANNEL,
+        vault: "parachute",
+        status: "ok",
+        members: 3,
+        granted: 1,
+        removed: 1,
+        created_users: 1,
+        unchanged: 2,
+        deferred: 0,
+        errors: 0,
+      },
+      {
+        relay_host: "other.example",
+        channel_id: "c2",
+        vault: "ch-c2",
+        status: "failed",
+        reason: "relay_unreachable",
+        members: 0,
+        granted: 0,
+        removed: 0,
+        created_users: 0,
+        unchanged: 0,
+        deferred: 0,
+        errors: 0,
+      },
+    ],
+  };
+
+  test("POSTs to the sync route and renders one row per binding", async () => {
+    const t = deps([{ status: 200, body: okBody }]);
+    expect(await vaultChannels("sync-channels", [], t.deps)).toBe(0);
+    expect(t.calls[0]?.method).toBe("POST");
+    expect(t.calls[0]?.url).toBe(`${BASE}/api/channel-vaults/sync`);
+    expect(t.calls[0]?.headers.authorization).toBe(`Bearer ${BEARER}`);
+
+    const text = t.sinks.text();
+    expect(text).toContain("STATUS");
+    expect(text).toContain(CHANNEL);
+    expect(text).toContain("failed:relay_unreachable");
+    // A failed binding must explain that its grants are still in place.
+    expect(text).toContain("freeze");
+  });
+
+  test("`ran:false` explains the reason instead of printing an empty table", async () => {
+    const t = deps([{ status: 200, body: { ran: false, reason: "not_configured", results: [] } }]);
+    expect(await vaultChannels("sync-channels", [], t.deps)).toBe(0);
+    expect(t.sinks.text()).toContain("No Buzz reader key");
+    expect(t.sinks.text()).toContain("buzz-reader.nsec");
+  });
+
+  test("no sync binding reads as nothing to do, not as a failure", async () => {
+    const t = deps([
+      { status: 200, body: { ran: false, reason: "no_sync_bindings", results: [] } },
+    ]);
+    expect(await vaultChannels("sync-channels", [], t.deps)).toBe(0);
+    expect(t.sinks.text()).toContain("Nothing to sync");
+  });
+
+  test("takes no filters — a partial pass would be a misleading answer", async () => {
+    const t = deps([{ status: 200, body: okBody }]);
+    expect(await vaultChannels("sync-channels", ["--vault", "parachute"], t.deps)).toBe(1);
+    expect(t.calls).toEqual([]);
+    expect(t.sinks.errText()).toContain("takes no filters");
+  });
+});
+
 describe("the subcommand set", () => {
   test("matches the literal list cli.ts dispatches on", () => {
     // cli.ts repeats these literals so the passthrough for every other vault
     // verb doesn't load this module. This is the pin that keeps them equal.
-    expect([...CHANNEL_SUBCOMMANDS]).toEqual(["attach-channel", "detach-channel", "list-channels"]);
+    expect([...CHANNEL_SUBCOMMANDS]).toEqual([
+      "attach-channel",
+      "detach-channel",
+      "list-channels",
+      "sync-channels",
+    ]);
     const cli = Bun.file(new URL("../cli.ts", import.meta.url)).text();
     return cli.then((src) => {
       for (const sub of CHANNEL_SUBCOMMANDS) {

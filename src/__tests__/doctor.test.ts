@@ -2,6 +2,8 @@ import { describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { channelGrantVia } from "../channel-reconciler.ts";
+import { upsertChannelVault } from "../channel-vaults.ts";
 import {
   type CheckResult,
   type DoctorDeps,
@@ -1164,6 +1166,120 @@ describe("doctor — Grants group (inventory + two advisories)", () => {
       expect(byName(checks, "grants-least-privilege")?.status).toBe("warn");
       expect(byName(checks, "grants-attributed")?.status).toBe("pass");
       expect(code).toBe(0);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("one line per sync channel binding, with the rows that binding owns", async () => {
+    const h = makeHarness();
+    try {
+      seedCurrentManifest(h.manifestPath);
+      seedOperatorToken(h.configDir);
+      const { checks } = await runDoctor(
+        h,
+        healthyDeps({
+          readGrants: () => ({
+            attributionSince: "2026-06-01T00:00:00.000Z",
+            rows: [],
+            channels: [
+              {
+                relayHost: "buzz.techne.coop",
+                channelId: "3ff68a58",
+                vault: "parachute",
+                members: 4,
+                syncedAt: "2026-09-03T12:00:00.000Z",
+                lastError: null,
+                lastAttemptAt: "2026-09-03T12:00:00.000Z",
+              },
+            ],
+          }),
+        }),
+      );
+      const line = byName(checks, "channel-sync:buzz.techne.coop:3ff68a58");
+      expect(line?.status).toBe("pass");
+      expect(line?.title).toBe("3ff68a58 @ buzz.techne.coop");
+      expect(line?.detail).toContain("vault=parachute");
+      expect(line?.detail).toContain("members=4");
+      expect(line?.detail).toContain("synced_at=2026-09-03T12:00:00.000Z");
+      // A hub with bindings but no grants still shows them.
+      expect(byName(checks, "grants")?.status).toBe("pass");
+      expectNoUnexpectedNonPass(checks, []);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("a frozen binding WARNs with its reason — the freeze is otherwise invisible", async () => {
+    const h = makeHarness();
+    try {
+      seedCurrentManifest(h.manifestPath);
+      seedOperatorToken(h.configDir);
+      const { code, checks } = await runDoctor(
+        h,
+        healthyDeps({
+          readGrants: () => ({
+            attributionSince: "2026-06-01T00:00:00.000Z",
+            rows: [],
+            channels: [
+              {
+                relayHost: "buzz.techne.coop",
+                channelId: "3ff68a58",
+                vault: "parachute",
+                members: 4,
+                syncedAt: "2026-09-01T00:00:00.000Z",
+                lastError: "relay_unreachable",
+                lastAttemptAt: "2026-09-03T12:00:00.000Z",
+              },
+            ],
+          }),
+        }),
+      );
+      const line = byName(checks, "channel-sync:buzz.techne.coop:3ff68a58");
+      expect(line?.status).toBe("warn");
+      expect(line?.detail).toContain("last_error=relay_unreachable");
+      expect(line?.detail).toContain("frozen at the last good roster");
+      // Still advisory — doctor never fails a run over a relay outage.
+      expect(code).toBe(0);
+      expectNoUnexpectedNonPass(checks, ["channel-sync:buzz.techne.coop:3ff68a58"]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("the REAL reader counts only the rows a binding owns", async () => {
+    const h = makeHarness();
+    try {
+      seedCurrentManifest(h.manifestPath);
+      seedOperatorToken(h.configDir);
+      const db = openHubDb(hubDbPath(h.configDir));
+      await createUser(db, "owner", "correct-horse-battery-staple", { passwordChanged: true });
+      const synced = await createUser(db, "synced", "correct-horse-battery-staple", {
+        allowMulti: true,
+        passwordChanged: true,
+      });
+      const byHand = await createUser(db, "byhand", "correct-horse-battery-staple", {
+        allowMulti: true,
+        passwordChanged: true,
+      });
+      upsertChannelVault(db, {
+        relayHost: "buzz.techne.coop",
+        channelId: "3ff68a58",
+        vault: "beta",
+      });
+      const via = channelGrantVia("buzz.techne.coop", "3ff68a58");
+      upsertUserVault(db, synced.id, "beta", "member", () => new Date(), { grantedVia: via });
+      // Same vault, granted by a human — counted in `grants`, NOT in the
+      // binding's member count.
+      upsertUserVault(db, byHand.id, "beta", "member", () => new Date(), { grantedVia: "cli" });
+      db.close();
+
+      const { checks } = await runDoctor(h, healthyDeps());
+      const line = byName(checks, "channel-sync:buzz.techne.coop:3ff68a58");
+      expect(line?.detail).toContain("members=1");
+      expect(line?.detail).toContain("synced_at=never");
+      expect(byName(checks, "grant:beta:synced")?.status).toBe("pass");
+      expect(byName(checks, "grant:beta:byhand")?.status).toBe("pass");
     } finally {
       h.cleanup();
     }
