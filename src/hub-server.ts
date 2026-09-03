@@ -155,9 +155,10 @@
  *                                                counts, `ran:false` when no reader key / no sync
  *                                                binding (host:admin)
  *   /login                        (GET + POST) → operator password login
- *   /login/2fa                    (POST)       → second-factor (TOTP/backup) step
+ *   /login/2fa                    (GET + POST) → second-factor (TOTP/backup) step
  *                                                 (hub#473; reached after a correct
- *                                                 password for a 2FA-enrolled user)
+ *                                                 password for a 2FA-enrolled user, or
+ *                                                 redirected here by the Nostr key door)
  *   /logout                       (POST)       → end admin session
  *   /account/session               (GET)        → same-origin boot oracle {signed_in,
  *                                                 csrf,...} (hub-parity P1); cookie-gated,
@@ -284,6 +285,7 @@ import { handleListGrants, handleRevokeGrant } from "./admin-grants.ts";
 import {
   handleAdminLoginGet,
   handleAdminLoginPost,
+  handleAdminLoginTotpGet,
   handleAdminLoginTotpPost,
   handleAdminLogoutPost,
 } from "./admin-handlers.ts";
@@ -3986,13 +3988,17 @@ export function hubFetch(
         return new Response("method not allowed", { status: 405 });
       }
 
-      // /login/2fa — second-factor step (hub#473). POST-only: reached only
-      // after a correct password POST for a 2FA-enrolled user handed back a
-      // pending-login cookie + rendered the challenge page. A bare GET (e.g.
-      // browser back button) has no form to render usefully, so 405 → the
-      // operator restarts at /login.
+      // /login/2fa — second-factor step (hub#473). POST verifies the factor.
+      // GET renders the form for a caller who was REDIRECTED here instead of
+      // being handed it inline (hub#B/4): the Nostr key door answers a
+      // 2FA-enrolled member with `redirect: "/login/2fa"` because its caller
+      // is a fetch(), not a form post, and before the GET that landed on a
+      // bare 405 with the member half-authenticated. The GET renders only
+      // when the pending-login cookie resolves and never consumes it;
+      // otherwise it 302s to /login.
       if (pathname === "/login/2fa") {
         if (!getDb) return dbNotConfigured();
+        if (req.method === "GET") return handleAdminLoginTotpGet(getDb(), req);
         if (req.method === "POST") return handleAdminLoginTotpPost(getDb(), req);
         return new Response("method not allowed", { status: 405 });
       }
