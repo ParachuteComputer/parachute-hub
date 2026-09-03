@@ -9,6 +9,7 @@ import {
   listVaultInstanceNames,
   provisionVault,
 } from "../admin-vaults.ts";
+import { getChannelVault, upsertChannelVault } from "../channel-vaults.ts";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
 import { ACCESS_TOKEN_TTL_SECONDS, signAccessToken, validateAccessToken } from "../jwt-sign.ts";
 import { upsertService, writeManifest } from "../services-manifest.ts";
@@ -1195,6 +1196,24 @@ describe("DELETE /vaults/<name> — the identity cascade", () => {
         //     must not inherit a stale cap).
         setVaultCap(db, "work", 1024 * 1024 * 1024);
         setVaultCap(db, "default", 2 * 1024 * 1024 * 1024);
+        // Two channels bound to the doomed vault (one relay each) plus one
+        // bound to `default`, so the cascade has to scope its delete by vault
+        // rather than truncate the table.
+        upsertChannelVault(db, {
+          relayHost: "buzz.techne.coop",
+          channelId: "chan-work-1",
+          vault: "work",
+        });
+        upsertChannelVault(db, {
+          relayHost: "relay.example",
+          channelId: "chan-work-2",
+          vault: "work",
+        });
+        upsertChannelVault(db, {
+          relayHost: "buzz.techne.coop",
+          channelId: "chan-default",
+          vault: "default",
+        });
 
         // 5. Connections: one sourced on work (torn down), one on default (kept).
         putConnection(store, {
@@ -1257,6 +1276,7 @@ describe("DELETE /vaults/<name> — the identity cascade", () => {
             user_vaults_removed: number;
             invites_invalidated: number;
             vault_cap_removed: boolean;
+            channel_vaults_removed: number;
             connections_torn_down: number;
             orphaned_channels: string[];
             vault_removed: boolean;
@@ -1303,6 +1323,14 @@ describe("DELETE /vaults/<name> — the identity cascade", () => {
         expect(out.cascade.vault_cap_removed).toBe(true);
         expect(getVaultCapBytes(db, "work")).toBeNull();
         expect(getVaultCapBytes(db, "default")).toBe(2 * 1024 * 1024 * 1024);
+
+        // 4c. channel_vaults: both work bindings dropped so a re-created
+        //     same-name vault cannot inherit a channel nobody attached to it;
+        //     the `default` binding is untouched.
+        expect(out.cascade.channel_vaults_removed).toBe(2);
+        expect(getChannelVault(db, "buzz.techne.coop", "chan-work-1")).toBeNull();
+        expect(getChannelVault(db, "relay.example", "chan-work-2")).toBeNull();
+        expect(getChannelVault(db, "buzz.techne.coop", "chan-default")?.vault).toBe("default");
 
         // 5. Connections: work connection torn down (trigger deregistered +
         //    channel entry deleted + record removed); default connection kept.
