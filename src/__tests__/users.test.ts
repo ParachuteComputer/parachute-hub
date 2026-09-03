@@ -858,7 +858,7 @@ describe("setUserVaults (multi-user Phase 2 PR 2)", () => {
   });
 });
 
-/** The v21 attribution columns on one `user_vaults` row. */
+/** The v22 attribution columns on one `user_vaults` row. */
 function readGrantRow(
   db: Database,
   userId: string,

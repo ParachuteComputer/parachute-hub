@@ -22,7 +22,7 @@
  *     never wired into the server)
  */
 import type { Database } from "bun:sqlite";
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -31,12 +31,14 @@ import { hubDbPath, openHubDb } from "../hub-db.ts";
 import { hubFetch } from "../hub-server.ts";
 import { NOSTR_AUTH_KIND, type NostrEvent, nostrEventId } from "../nostr-event.ts";
 import {
+  MAX_LIVE_CHALLENGES,
   NOSTR_LOGIN_2FA_ENV,
   NOSTR_LOGIN_CHALLENGE_TTL_MS,
   NOSTR_LOGIN_MAX_CREATED_AT_SKEW_SECONDS,
   NOSTR_LOGIN_VERIFY_PATH,
   _resetNostrLoginChallenges,
   handleNostrLogin,
+  issueLoginChallenge,
   signInStatement,
 } from "../nostr-login.ts";
 import { PENDING_LOGIN_COOKIE_NAME } from "../pending-login.ts";
@@ -256,6 +258,45 @@ describe("GET /api/auth/nostr/challenge", () => {
     expect((await call("POST", "/challenge")).status).toBe(405);
     expect((await call("GET", "/verify")).status).toBe(405);
     expect((await call("GET", "/nope")).status).toBe(404);
+  });
+});
+
+describe("issueLoginChallenge — MAX_LIVE_CHALLENGES eviction warning", () => {
+  test("normal use (never at the cap) never warns", () => {
+    const warn = spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const at = new Date("2026-09-03T12:00:00.000Z");
+      for (let i = 0; i < 50; i++) issueLoginChallenge(at);
+      expect(warn).not.toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  test("a nonce flood past the cap warns exactly once within the rate-limit window", () => {
+    const warn = spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const at = new Date("2026-09-03T12:00:00.000Z");
+      // Fill to the cap, then flood past it: every call past the cap evicts
+      // the oldest entry, which is the condition the warning fires on.
+      for (let i = 0; i < MAX_LIVE_CHALLENGES; i++) issueLoginChallenge(at);
+      expect(warn).not.toHaveBeenCalled();
+      for (let i = 0; i < 25; i++) issueLoginChallenge(at);
+      expect(warn).toHaveBeenCalledTimes(1);
+      const [message] = warn.mock.calls[0] ?? [];
+      expect(String(message)).toContain("MAX_LIVE_CHALLENGES");
+
+      // Still within the same minute: no second warning, however much more
+      // flooding happens — this is the rate limit, not a one-shot latch.
+      for (let i = 0; i < 25; i++) issueLoginChallenge(new Date(at.getTime() + 30_000));
+      expect(warn).toHaveBeenCalledTimes(1);
+
+      // Past the cooldown: the next eviction warns again.
+      issueLoginChallenge(new Date(at.getTime() + 61_000));
+      expect(warn).toHaveBeenCalledTimes(2);
+    } finally {
+      warn.mockRestore();
+    }
   });
 });
 
@@ -691,9 +732,13 @@ describe("POST /api/auth/nostr/verify — 2FA divert", () => {
     expect(setCookies(res).some((c) => c.startsWith(`${SESSION_COOKIE_NAME}=`))).toBe(true);
   });
 
-  test("the divert is ON by default and for any value that isn't an off-spelling", async () => {
+  test("the divert is ON by default and for any value that isn't exactly `off`", async () => {
+    // `off` is the ONLY spelling that turns off the divert — `0` / `false` /
+    // `no` used to be accepted too; tightened to match the design note's
+    // documented contract, so they now keep the divert ON like any other
+    // non-`off` value.
     const { id, secret } = await enrolledLinkedUser("twofa-default");
-    for (const value of [undefined, "", "on", "1", "require", "true"]) {
+    for (const value of [undefined, "", "on", "1", "require", "true", "0", "false", "no"]) {
       if (value === undefined) delete process.env[NOSTR_LOGIN_2FA_ENV];
       else process.env[NOSTR_LOGIN_2FA_ENV] = value;
       const res = await call("POST", "/verify", {

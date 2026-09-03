@@ -102,7 +102,7 @@ function memberCaller(userId: string, pubkey: string): GrantCaller {
   return { userId, isHubAdmin: false, authKind: "nostr", pubkey, via: "mcp", grant: null };
 }
 
-/** The v21 attribution columns on one `user_vaults` row. */
+/** The v22 attribution columns on one `user_vaults` row. */
 function readGrantAttribution(
   db: Database,
   userId: string,

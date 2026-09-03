@@ -157,7 +157,16 @@ const EXPIRED_NONCE_GRACE_MS = 10 * 60 * 1000;
  * also the closest to expiry). Losing a nonce under flood means one member
  * clicks sign-in twice; unbounded memory means the hub dies.
  */
-const MAX_LIVE_CHALLENGES = 10_000;
+export const MAX_LIVE_CHALLENGES = 10_000;
+
+/**
+ * Floor between `MAX_LIVE_CHALLENGES` eviction warnings. Hitting the cap at
+ * all means something anomalous is happening (a nonce flood, or a hub that
+ * needs a higher ceiling) and is worth ONE log line to make it visible — but
+ * a sustained flood evicts on every `issueLoginChallenge` call, and logging
+ * every one of those would be its own resource-exhaustion vector.
+ */
+const EVICTION_WARN_INTERVAL_MS = 60 * 1000;
 
 interface LoginChallenge {
   /** Absolute expiry (ms epoch). */
@@ -166,15 +175,19 @@ interface LoginChallenge {
 
 const challenges = new Map<string, LoginChallenge>();
 
+/** ms-epoch of the last eviction warning; 0 means "never warned". */
+let lastEvictionWarnAtMs = 0;
+
 function gc(nowMs: number): void {
   for (const [nonce, c] of challenges) {
     if (c.expiresAtMs + EXPIRED_NONCE_GRACE_MS <= nowMs) challenges.delete(nonce);
   }
 }
 
-/** Test-only: drop every issued nonce between cases. */
+/** Test-only: drop every issued nonce, and the eviction-warning cooldown, between cases. */
 export function _resetNostrLoginChallenges(): void {
   challenges.clear();
+  lastEvictionWarnAtMs = 0;
 }
 
 export interface IssuedLoginChallenge {
@@ -191,10 +204,18 @@ export interface IssuedLoginChallenge {
 export function issueLoginChallenge(now: Date = new Date()): IssuedLoginChallenge {
   const nowMs = now.getTime();
   gc(nowMs);
+  let evicted = false;
   while (challenges.size >= MAX_LIVE_CHALLENGES) {
     const oldest = challenges.keys().next();
     if (oldest.done) break;
     challenges.delete(oldest.value);
+    evicted = true;
+  }
+  if (evicted && nowMs - lastEvictionWarnAtMs >= EVICTION_WARN_INTERVAL_MS) {
+    lastEvictionWarnAtMs = nowMs;
+    console.warn(
+      `nostr-login: MAX_LIVE_CHALLENGES (${MAX_LIVE_CHALLENGES}) reached — evicting oldest sign-in nonces. Possible nonce flood.`,
+    );
   }
   const challenge = randomBytes(32).toString("hex");
   challenges.set(challenge, { expiresAtMs: nowMs + NOSTR_LOGIN_CHALLENGE_TTL_MS });
@@ -258,15 +279,16 @@ export function signInStatement(origin: string): string {
  * who has chosen 2FA has said they want the second factor; a new door must not
  * quietly be the one that skips it.
  *
- * `PARACHUTE_NOSTR_LOGIN_2FA=off` is the escape hatch (also `0` / `false` /
- * `no`, case-insensitive), for an operator who has decided their key custody is
- * the stronger factor. Anything else — including unset — keeps the divert.
+ * `PARACHUTE_NOSTR_LOGIN_2FA=off` (trimmed, case-insensitive) is the escape
+ * hatch, for an operator who has decided their key custody is the stronger
+ * factor. `off` is the ONLY spelling that turns it off — not `0` / `false` /
+ * `no`. Anything else, including unset, keeps the divert.
  */
 export const NOSTR_LOGIN_2FA_ENV = "PARACHUTE_NOSTR_LOGIN_2FA";
 
 export function nostrLoginRequires2fa(): boolean {
   const v = (process.env[NOSTR_LOGIN_2FA_ENV] ?? "").trim().toLowerCase();
-  return !(v === "off" || v === "0" || v === "false" || v === "no");
+  return v !== "off";
 }
 
 export interface NostrLoginDeps {

@@ -7,9 +7,9 @@
  * that loads but produces a header Buzz rejects is not a working config
  * surface.
  */
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { schnorr } from "@noble/curves/secp256k1.js";
@@ -126,6 +126,35 @@ describe("loadBuzzReaderKey", () => {
     }
   });
 
+  test("a key file behind a permissions wall is unreadable, not not_configured", () => {
+    // A `chmod 000` parent makes the `statSync` fail with EACCES rather than
+    // ENOENT. The key IS configured — the hub just cannot look at it — so
+    // reporting `not_configured` would send an operator off to create a file
+    // that is already sitting there.
+    const dir = tmp();
+    const walled = join(dir, "walled");
+    mkdirSync(walled);
+    try {
+      writeFileSync(join(walled, BUZZ_READER_KEY_FILENAME), `${SPEC_NSEC}\n`);
+      chmodSync(walled, 0o000);
+      // root ignores permission bits, so the wall only walls for an ordinary
+      // uid. Probe rather than assume: a suite run as root should skip the
+      // assertion, not fail it.
+      let walls = false;
+      try {
+        statSync(join(walled, BUZZ_READER_KEY_FILENAME));
+      } catch {
+        walls = true;
+      }
+      if (walls) {
+        expect(loadBuzzReaderKey({}, walled)).toMatchObject({ ok: false, reason: "unreadable" });
+      }
+    } finally {
+      chmodSync(walled, 0o700);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   test("a malformed key is refused and NEVER echoed back", () => {
     const dir = tmp();
     try {
@@ -145,6 +174,44 @@ describe("loadBuzzReaderKey", () => {
       writeFileSync(join(dir, BUZZ_READER_KEY_FILENAME), `${SPEC_HEX.toUpperCase()}\n`);
       expect(loadBuzzReaderKey({}, dir)).toMatchObject({ ok: false, reason: "malformed" });
     } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("group/other-readable key file warns once, names the path, never the contents — and still loads", () => {
+    const dir = tmp();
+    const path = join(dir, BUZZ_READER_KEY_FILENAME);
+    const warn = spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      writeFileSync(path, `${SPEC_NSEC}\n`);
+      chmodSync(path, 0o644);
+      const res = loadBuzzReaderKey({}, dir);
+      // Do not refuse to load — the warning is a nudge, not a gate.
+      expect(res.ok).toBe(true);
+      expect(warn).toHaveBeenCalledTimes(1);
+      const [message] = warn.mock.calls[0] ?? [];
+      expect(String(message)).toContain(path);
+      expect(String(message)).toContain("chmod 600");
+      expect(String(message)).not.toContain(SPEC_NSEC);
+      expect(String(message)).not.toContain(SPEC_HEX);
+    } finally {
+      warn.mockRestore();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("owner-only (0600) key file does not warn", () => {
+    const dir = tmp();
+    const path = join(dir, BUZZ_READER_KEY_FILENAME);
+    const warn = spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      writeFileSync(path, `${SPEC_NSEC}\n`);
+      chmodSync(path, 0o600);
+      const res = loadBuzzReaderKey({}, dir);
+      expect(res.ok).toBe(true);
+      expect(warn).not.toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
       rmSync(dir, { recursive: true, force: true });
     }
   });

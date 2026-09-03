@@ -2630,6 +2630,87 @@ describe("handleToken — full OAuth dance", () => {
     }
   });
 
+  test("token and refresh responses omit `vault` when scopes name two vaults", async () => {
+    // hub#946 projects `vault` only when the granted scopes name EXACTLY ONE
+    // vault (`singleVaultName`) — the single-vault case is covered above
+    // ("authorize → token → validate JWT" asserts `vault: "default"`) and
+    // the no-vault case is covered by "auth code is single-use" (`surface:read`
+    // asserts no `vault` key). This is the third leg: two NAMED vaults is
+    // ambiguous, not absent, so the field must still be omitted rather than
+    // picking one arbitrarily.
+    const { db, cleanup } = await makeDb();
+    try {
+      const user = await createUser(db, "owner", "pw");
+      const session = createSession(db, { userId: user.id });
+      const reg = registerClient(db, { redirectUris: ["https://app.example/cb"] });
+      const { verifier, challenge } = makePkce();
+      const consentForm = new URLSearchParams({
+        __action: "consent",
+        __csrf: TEST_CSRF,
+        approve: "yes",
+        client_id: reg.client.clientId,
+        redirect_uri: "https://app.example/cb",
+        response_type: "code",
+        // Two NAMED vault scopes — no picker involved (unnamed `vault:<verb>`
+        // is the only form that needs one), so this passes straight through
+        // like the single-vault test above.
+        scope: "vault:default:read vault:other:write",
+        code_challenge: challenge,
+        code_challenge_method: "S256",
+      });
+      const consentReq = new Request(`${ISSUER}/oauth/authorize`, {
+        method: "POST",
+        body: consentForm,
+        headers: {
+          "content-type": "application/x-www-form-urlencoded",
+          cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, 86400)}`,
+        },
+      });
+      const consentRes = await handleAuthorizePost(db, consentReq, { issuer: ISSUER });
+      const code = new URL(consentRes.headers.get("location") ?? "").searchParams.get("code");
+      const tokenForm = new URLSearchParams({
+        grant_type: "authorization_code",
+        code: code ?? "",
+        client_id: reg.client.clientId,
+        redirect_uri: "https://app.example/cb",
+        code_verifier: verifier,
+      });
+      const tokenRes = await handleToken(
+        db,
+        new Request(`${ISSUER}/oauth/token`, {
+          method: "POST",
+          body: tokenForm,
+          headers: { "content-type": "application/x-www-form-urlencoded" },
+        }),
+        { issuer: ISSUER },
+      );
+      expect(tokenRes.status).toBe(200);
+      const initial = (await tokenRes.json()) as TokenResponse & { refresh_token: string };
+      expect(initial.scope).toBe("vault:default:read vault:other:write");
+      expect(initial).not.toHaveProperty("vault");
+
+      const refreshForm = new URLSearchParams({
+        grant_type: "refresh_token",
+        refresh_token: initial.refresh_token,
+        client_id: reg.client.clientId,
+      });
+      const refreshRes = await handleToken(
+        db,
+        new Request(`${ISSUER}/oauth/token`, {
+          method: "POST",
+          body: refreshForm,
+          headers: { "content-type": "application/x-www-form-urlencoded" },
+        }),
+        { issuer: ISSUER },
+      );
+      expect(refreshRes.status).toBe(200);
+      const rotated = (await refreshRes.json()) as TokenResponse & { refresh_token: string };
+      expect(rotated).not.toHaveProperty("vault");
+    } finally {
+      cleanup();
+    }
+  });
+
   test("client_credentials returns unsupported_grant_type", async () => {
     const { db, cleanup } = await makeDb();
     try {

@@ -31,6 +31,7 @@ import {
   runReconcileOnce,
   startChannelReconciler,
 } from "../channel-reconciler.ts";
+import type { FetchChannelRosterResult } from "../channel-roster.ts";
 import { getChannelVault, upsertChannelVault } from "../channel-vaults.ts";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
 import {
@@ -41,7 +42,12 @@ import {
 } from "../nostr-event.ts";
 import { pubkeyForSecret, signNostrEvent } from "../nostr-http-sign.ts";
 import { findPubkeyLink } from "../pubkey-links.ts";
-import { createUser, upsertUserVault, vaultVerbsForRole } from "../users.ts";
+import {
+  createUser,
+  removeUserVault as removeUserVaultReal,
+  upsertUserVault,
+  vaultVerbsForRole,
+} from "../users.ts";
 
 const RELAY_HOST = "buzz.techne.coop";
 const CHANNEL = "3ff68a58-3f97-409a-b531-45d388b3c827";
@@ -294,6 +300,44 @@ describe("reconcileBinding", () => {
     ).toBe(true);
   });
 
+  test("removal sweep is all-or-nothing: a throw on the second row leaves every grant untouched", async () => {
+    const relay = fake([
+      rosterEvent(relaySecret, [
+        [alice, "member"],
+        [bob, "member"],
+      ]),
+    ]);
+    await reconcileBinding(binding(), depsFor(relay));
+    expect(rows()).toHaveLength(2);
+
+    // Both drop out of the roster in the same tick — two candidates for the
+    // removal sweep, so a throw on the second exercises the transaction
+    // rolling back the first row's already-applied delete too.
+    relay.setEvents([rosterEvent(relaySecret, [], 1_800_000_100)]);
+    clock += CHANNEL_RECONCILE_INTERVAL_MS;
+
+    let calls = 0;
+    const flakyRemove: typeof removeUserVaultReal = (removeDb, userId, vaultName, removeNow) => {
+      calls++;
+      if (calls === 2) throw new Error("simulated failure mid-sweep");
+      return removeUserVaultReal(removeDb, userId, vaultName, removeNow);
+    };
+    const result = await reconcileBinding(binding(), {
+      ...depsFor(relay),
+      removeUserVault: flakyRemove,
+    });
+
+    expect(calls).toBe(2);
+    expect(result.removed).toBe(0);
+    expect(result.errors).toBe(1);
+    // Rolled back: both rows survive, including the one the fake had already
+    // (really) deleted before it threw on the second.
+    expect(rows()).toHaveLength(2);
+    expect(logs.some((l) => l.includes("removal sweep failed") && l.includes("rolled back"))).toBe(
+      true,
+    );
+  });
+
   test("a role change is applied, never observed as a removal", async () => {
     const relay = fake([rosterEvent(relaySecret, [[alice, "member"]])]);
     await reconcileBinding(binding(), depsFor(relay));
@@ -439,6 +483,43 @@ describe("reconcileBinding", () => {
     expect(findPubkeyLink(db, alice)?.label).toBe("operator");
   });
 
+  test("a row survives while EITHER of a user's two linked keys is in the roster, and is removed once neither is", async () => {
+    // One hub account, two linked keys (the "an agent's and a human's" case
+    // the removal-sweep comment describes) — both seated in the channel.
+    const person = await createUser(db, "dual-key-user", "another-good-password", {
+      allowMulti: true,
+      passwordChanged: true,
+    });
+    const { bindPubkeyOperatorAttested } = await import("../pubkey-links.ts");
+    bindPubkeyOperatorAttested(db, { userId: person.id, pubkey: alice, label: "operator" });
+    bindPubkeyOperatorAttested(db, { userId: person.id, pubkey: bob, label: "operator" });
+
+    const relay = fake([
+      rosterEvent(relaySecret, [
+        [alice, "member"],
+        [bob, "member"],
+      ]),
+    ]);
+    await reconcileBinding(binding(), depsFor(relay));
+    expect(rows().filter((r) => r.user_id === person.id)).toHaveLength(1);
+
+    // The roster drops bob but keeps alice — one of the two keys is still
+    // seated, so the row must survive untouched.
+    relay.setEvents([rosterEvent(relaySecret, [[alice, "member"]], 1_800_000_100)]);
+    clock += CHANNEL_RECONCILE_INTERVAL_MS;
+    const second = await reconcileBinding(binding(), depsFor(relay));
+    expect(second.removed).toBe(0);
+    expect(rows().find((r) => r.user_id === person.id)?.role).toBe("member");
+
+    // Now the roster drops alice too — neither linked key is seated, so the
+    // row goes.
+    relay.setEvents([rosterEvent(relaySecret, [], 1_800_000_200)]);
+    clock += CHANNEL_RECONCILE_INTERVAL_MS;
+    const third = await reconcileBinding(binding(), depsFor(relay));
+    expect(third.removed).toBe(1);
+    expect(rows().find((r) => r.user_id === person.id)).toBeUndefined();
+  });
+
   test("a hub admin in the roster gets no row (unrestricted by construction)", async () => {
     const admin = db
       .query<{ id: string }, []>("SELECT id FROM users WHERE hub_role = 'admin'")
@@ -579,6 +660,64 @@ describe("startChannelReconciler", () => {
     // key-only account runs argon2 and is not microtask-fast.
     for (let i = 0; i < 100 && roleFor(alice) === undefined; i++) await Bun.sleep(20);
     expect(roleFor(alice)).toBe("member");
+    reconciler?.stop();
+  });
+
+  test("two overlapping ticks do not run concurrently — the second is a no-op while the first is in flight", async () => {
+    let fetchCalls = 0;
+    let resolveFetch: ((r: FetchChannelRosterResult) => void) | undefined;
+    // A roster fetch that never settles until the test says so — this holds
+    // the pass "in flight" for as long as the test needs, so a second tick
+    // fired while it is running can be observed hitting the `running` guard
+    // rather than racing a fast fetch.
+    const blockingFetchRoster = (): Promise<FetchChannelRosterResult> => {
+      fetchCalls++;
+      return new Promise((resolve) => {
+        resolveFetch = resolve;
+      });
+    };
+
+    let tick: (() => void) | undefined;
+    const reconciler = startChannelReconciler({
+      db,
+      now,
+      log: (l) => logs.push(l),
+      rosterOptions: { env },
+      fetchRoster: blockingFetchRoster,
+      setIntervalFn: (cb) => {
+        tick = cb;
+        return 1;
+      },
+      clearIntervalFn: () => {},
+    });
+    expect(reconciler).not.toBeNull();
+
+    tick?.();
+    // Give the first pass's fetch call a chance to run (it's synchronous up
+    // to the `await fetchRoster(...)`, so this should already be true, but a
+    // microtask tick keeps this robust either way).
+    await Bun.sleep(0);
+    expect(fetchCalls).toBe(1);
+
+    // A second tick while the first is still blocked on its fetch — the
+    // `running` guard in `startChannelReconciler` must make this a no-op:
+    // no second `fetchRoster` call, no second pass.
+    tick?.();
+    await Bun.sleep(20);
+    expect(fetchCalls).toBe(1);
+
+    // Let the first pass finish.
+    resolveFetch?.({ ok: false, reason: "relay_unreachable" });
+    for (let i = 0; i < 100 && binding().lastError === null; i++) await Bun.sleep(20);
+    expect(binding().lastError).toBe("relay_unreachable");
+
+    // The guard is an in-flight lock, not a permanent one: now that the first
+    // pass has finished, a fresh tick runs a fresh pass.
+    tick?.();
+    await Bun.sleep(20);
+    expect(fetchCalls).toBe(2);
+    resolveFetch?.({ ok: false, reason: "relay_unreachable" });
+
     reconciler?.stop();
   });
 });

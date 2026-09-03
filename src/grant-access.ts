@@ -18,7 +18,7 @@
  * can use the vault fully and still not hand it to anyone else.
  *
  * Every write here records its grantor on the row (`granted_by_user_id` /
- * `granted_by_pubkey` / `granted_via`, migration v21) and every revoke emits
+ * `granted_by_pubkey` / `granted_via`, migration v22) and every revoke emits
  * a `vault access revoked: …` line to the hub log, so "who did this" is
  * answerable after the fact rather than reconstructed.
  *
@@ -112,7 +112,7 @@ export interface AccessRow {
   role: string;
   user_id: string;
   username: string;
-  /** Grantor's signing key, or `null` for a pre-v21 / keyless grant. */
+  /** Grantor's signing key, or `null` for a pre-v22 / keyless grant. */
   granted_by_pubkey: string | null;
   /** Door the grant came through, or `null` when unrecorded. */
   granted_via: string | null;

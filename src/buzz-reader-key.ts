@@ -79,10 +79,11 @@ export function buzzReaderKeyPath(
 /**
  * Why a key could not be loaded. Coarse on purpose — see the module header.
  *
- *   - `not_configured` — no file at the resolved path. The ordinary state of
- *     a hub that has not opted into channel-attached vaults.
- *   - `unreadable` — the path exists but could not be read (permissions, a
- *     directory, an I/O error).
+ *   - `not_configured` — nothing at the resolved path (`ENOENT` / `ENOTDIR`).
+ *     The ordinary state of a hub that has not opted into channel-attached
+ *     vaults.
+ *   - `unreadable` — something is there but could not be read: a directory, a
+ *     permissions wall (`EACCES` on the file or a parent), an I/O error.
  *   - `empty` — the file exists and holds no non-comment content. Distinct
  *     from `not_configured` because a truncated file is an operator mistake
  *     worth naming, not an opt-out.
@@ -133,12 +134,33 @@ export function loadBuzzReaderKey(
   configDir: string = CONFIG_DIR,
 ): LoadBuzzReaderKeyResult {
   const path = buzzReaderKeyPath(env, configDir);
+  let stat: ReturnType<typeof statSync>;
   try {
     // `statSync` first so a missing file is `not_configured` rather than
     // `unreadable`: the two mean very different things to an operator.
-    if (!statSync(path).isFile()) return { ok: false, reason: "unreadable", path };
-  } catch {
-    return { ok: false, reason: "not_configured", path };
+    stat = statSync(path);
+    if (!stat.isFile()) return { ok: false, reason: "unreadable", path };
+  } catch (err) {
+    // Only "nothing is there" is the opt-out. `ENOENT` / `ENOTDIR` mean the
+    // path cannot name a file; anything else — `EACCES` from a chmod-000
+    // parent directory, an I/O error — means a key file may well exist and
+    // we simply could not look at it. Reporting that as `not_configured`
+    // would tell an operator "no reader key at <path>" (`channel-roster.ts`
+    // renders exactly that) for what is really a permissions problem, and
+    // send them off to create a file that is already sitting there.
+    const code = (err as NodeJS.ErrnoException | null)?.code;
+    if (code === "ENOENT" || code === "ENOTDIR") {
+      return { ok: false, reason: "not_configured", path };
+    }
+    return { ok: false, reason: "unreadable", path };
+  }
+
+  // Group/other permission bits on a secret-bearing file are an operator
+  // mistake worth surfacing — never the contents, never a refusal to load,
+  // just a nudge toward the fix. `& 0o077` catches any group or other read
+  // /write/execute bit; `0o600` (owner rw only) leaves it zero.
+  if (stat.mode & 0o077) {
+    console.warn(`Buzz reader key at ${path} is readable by group or other — chmod 600 it.`);
   }
 
   let contents: string;

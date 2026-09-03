@@ -225,7 +225,7 @@ function readVaultsForUser(db: Database, userId: string): string[] {
 export type VaultVerb = "read" | "write" | "admin";
 
 /**
- * How a `user_vaults` row was written (migration v21). Attribution, not
+ * How a `user_vaults` row was written (migration v22). Attribution, not
  * authority — nothing reads this to decide what a row may do.
  *
  *   - `mcp` — the `/account/mcp` `grant-access` tool.
@@ -253,7 +253,7 @@ export const GRANT_VIA_VALUES = ["mcp", "cli", "api"] as const;
 export type GrantVia = (typeof GRANT_VIA_VALUES)[number] | `channel:${string}`;
 
 /**
- * Who made a `user_vaults` grant, recorded alongside it (migration v21).
+ * Who made a `user_vaults` grant, recorded alongside it (migration v22).
  *
  * Both identifiers are carried because neither alone is enough: several
  * agents with their own Nostr keys routinely link to ONE hub user, so
@@ -693,7 +693,7 @@ export function setUserVaults(
  * ON CONFLICT updates `role` and preserves the original `created_at`.
  * Returns `false` when the user id does not exist.
  *
- * `attribution` (migration v21) records WHO granted, and over which door.
+ * `attribution` (migration v22) records WHO granted, and over which door.
  * A re-grant overwrites it — the row names the most recent grantor, which is
  * the one whose decision the current role reflects. Omitted attribution
  * writes NULLs rather than inventing a grantor.
