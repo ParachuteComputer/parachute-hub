@@ -142,6 +142,13 @@
  *   /api/users/<id>/promote-hub-admin (POST)   → promote a user to hub admin (host:admin)
  *   /api/vault-caps               (GET)        → list vaults + persisted storage caps (host:admin)
  *   /api/vault-caps/<name>        (PUT)        → set/update a vault's storage cap (host:admin)
+ *   /api/channel-vault            (GET)        → which vault backs ?relay=&channel= → {vault, mode, synced_at};
+ *                                                ANY authenticated principal (NIP-98 or Bearer), no membership
+ *                                                check — a vault name is not a secret; 404 when unbound
+ *   /api/channel-vaults           (GET)        → list channel→vault bindings, ?vault= filters (host:admin)
+ *   /api/channel-vaults           (POST)       → attach a channel to an already-installed vault; 400 if the
+ *                                                vault is not installed, 409 on a rebind (host:admin)
+ *   /api/channel-vaults           (DELETE)     → detach ?relay=&channel= (host:admin)
  *   /login                        (GET + POST) → operator password login
  *   /login/2fa                    (POST)       → second-factor (TOTP/backup) step
  *                                                 (hub#473; reached after a correct
@@ -288,6 +295,12 @@ import {
 } from "./api-account.ts";
 import { handleAdminLock } from "./api-admin-lock.ts";
 import { handleApiAttribution } from "./api-attribution.ts";
+import {
+  handleAttachChannelVault,
+  handleDetachChannelVault,
+  handleGetChannelVault,
+  handleListChannelVaults,
+} from "./api-channel-vaults.ts";
 import { handleHubUpgrade, handleHubUpgradeStatus } from "./api-hub-upgrade.ts";
 import { handleApiHub } from "./api-hub.ts";
 import { handleCreateInvite, handleListInvites, handleRevokeInvite } from "./api-invites.ts";
@@ -3880,6 +3893,35 @@ export function hubFetch(
           knownIssuers: oauthDeps(req).hubBoundOrigins(),
           manifestPath,
         });
+      }
+
+      // Channel → vault bindings (v23, channel-attached vaults PR 1). The
+      // READ side is authenticated-only: it answers with a vault NAME, which
+      // is not a secret, and the hub cannot verify channel membership anyway
+      // (a NIP-98 request carries no proof of it). The plural operator
+      // surface keeps the host:admin gate POST /vaults has — v1 is
+      // operator-only so a channel cannot annex a hub's storage.
+      if (pathname === "/api/channel-vault") {
+        if (!getDb) return dbNotConfigured();
+        return handleGetChannelVault(req, {
+          db: getDb(),
+          issuer: oauthDeps(req).issuer,
+          knownIssuers: oauthDeps(req).hubBoundOrigins(),
+          manifestPath,
+        });
+      }
+      if (pathname === "/api/channel-vaults") {
+        if (!getDb) return dbNotConfigured();
+        const channelVaultDeps = {
+          db: getDb(),
+          issuer: oauthDeps(req).issuer,
+          knownIssuers: oauthDeps(req).hubBoundOrigins(),
+          manifestPath,
+        };
+        if (req.method === "GET") return handleListChannelVaults(req, channelVaultDeps);
+        if (req.method === "POST") return handleAttachChannelVault(req, channelVaultDeps);
+        if (req.method === "DELETE") return handleDetachChannelVault(req, channelVaultDeps);
+        return new Response("method not allowed", { status: 405 });
       }
 
       // Canonical login/logout. The handlers themselves are unchanged from

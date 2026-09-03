@@ -13,8 +13,10 @@
  * live `tokens.user_id` backfill where `subject` already equals a
  * `users.id` (v19, hub#833 per-account mint), stored hub roles on the users
  * row (v20, hub#881), the additive `tokens.revoked_by` /
- * `tokens.revoked_via` revocation-actor columns (v21, hub#931), and grant
- * attribution on `user_vaults` (v22).
+ * `tokens.revoked_via` revocation-actor columns (v21, hub#931), grant
+ * attribution on `user_vaults` (v22), and the `channel_vaults` binding
+ * table that attaches a Buzz channel to a vault (v23, design
+ * "Channel-attached vaults — membership becomes access").
  *
  * Each open() runs `migrate()` to bring the schema up to date. A
  * `schema_version` table records every applied migration so re-opens are
@@ -799,6 +801,58 @@ const MIGRATIONS: readonly Migration[] = [
       ALTER TABLE user_vaults ADD COLUMN granted_by_user_id TEXT;
       ALTER TABLE user_vaults ADD COLUMN granted_by_pubkey TEXT;
       ALTER TABLE user_vaults ADD COLUMN granted_via TEXT;
+    `,
+  },
+  {
+    version: 23,
+    sql: `
+      -- Channel-attached vaults, PR 1 (design "Channel-attached vaults —
+      -- membership becomes access", §1). Binds ONE Buzz channel to ONE
+      -- Parachute vault so a later reconciler can turn channel membership
+      -- into \`user_vaults\` rows. This PR ships the binding only: no
+      -- roster fetch, no grants, no reconciler.
+      --
+      -- Schema:
+      --   * (relay_host, channel_id) composite PK — one binding per channel.
+      --     A vault MAY back several channels, so there is no UNIQUE on
+      --     \`vault\`; the index below serves the inverse lookup ("which
+      --     channels point at vault X?"), the same shape
+      --     \`user_vaults_vault\` (v10) serves.
+      --   * relay_host — stored LOWER-CASED and scheme-less, matching
+      --     \`relayHostOf\` in parachute-surface's parachute-mcp
+      --     (packages/parachute-mcp/src/channel.ts). Hostnames are
+      --     case-insensitive but the vault PATHS derived from them are not,
+      --     so a case difference would fork one channel into two bindings.
+      --   * vault — a vault INSTANCE NAME, same name space as
+      --     \`user_vaults.vault_name\` / services.json / \`invites.vault_name\`.
+      --     No FK: there is no vaults table on the hub (names resolve
+      --     through services.json), the established hub pattern.
+      --   * mode — 'sync' | 'frozen'. TEXT with a 'sync' default rather than
+      --     a flag so a third mode can land without a migration, and NO
+      --     CHECK constraint: the same fail-closed-at-the-reader posture
+      --     \`vaultVerbsForRole\` takes on \`user_vaults.role\` (v10) and
+      --     \`isHubAdmin\` takes on \`users.hub_role\` (v20). 'frozen' means
+      --     "keep the grants you have, stop syncing" — the answer to the
+      --     relay-unreachable question in the design.
+      --   * relay_self_pubkey — the relay's NIP-11 \`self\` key, pinned
+      --     trust-on-first-use so PR 4 can verify the signature on the kind
+      --     39002 roster it fetches. NULL until a roster fetch exists.
+      --   * synced_at — last successful roster sync (PR 5). NULL means
+      --     "never synced", which is every row this PR writes; \`doctor\`
+      --     renders it so a stale binding is visible rather than silent.
+      --
+      -- No backfill: the table is new and nothing else writes a binding.
+      CREATE TABLE channel_vaults (
+        relay_host TEXT NOT NULL,
+        channel_id TEXT NOT NULL,
+        vault TEXT NOT NULL,
+        mode TEXT NOT NULL DEFAULT 'sync',
+        relay_self_pubkey TEXT,
+        synced_at TEXT,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (relay_host, channel_id)
+      );
+      CREATE INDEX channel_vaults_vault ON channel_vaults (vault);
     `,
   },
 ];

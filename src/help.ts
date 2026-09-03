@@ -44,6 +44,8 @@ Usage:
                                     \`vault remove <name>\` is routed through the hub's
                                     identity cascade (revokes the vault's tokens/grants),
                                     not the raw mechanics-only delete.
+                                    \`vault attach-channel|detach-channel|list-channels\`
+                                    are hub-side: they bind a Buzz channel to a vault.
 
 Flags:
   --help, -h                        show this help (also per-subcommand: \`parachute <cmd> --help\`)
