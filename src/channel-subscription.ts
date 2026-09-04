@@ -485,8 +485,19 @@ export function startChannelSubscriptions(
               `reason=${typeof frame[2] === "string" ? frame[2] : "?"} (poll unaffected)`,
           );
           return;
+        case "NOTICE":
+          // Same rate limiter as CLOSED: a relay repeating one complaint must
+          // not bury hub.log. First ~200 chars only — a NOTICE is
+          // human-readable text from the relay operator, not something we
+          // parse, and it is not ours to let grow unbounded into the log.
+          rateLimited(
+            `sub ${this.host} notice`,
+            `channel subscription: relay sent a NOTICE relay=${this.host} ` +
+              `notice=${(typeof frame[1] === "string" ? frame[1] : "?").slice(0, 200)}`,
+          );
+          return;
         default:
-          // NOTICE, EOSE, COUNT, and anything a future relay adds.
+          // EOSE, COUNT, and anything a future relay adds.
           return;
       }
     }

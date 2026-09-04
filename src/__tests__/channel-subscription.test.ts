@@ -61,19 +61,30 @@ interface FakeWsRelay {
   closes: string[];
   /** How many websocket connections have been opened, ever. */
   connections: number;
+  /** `Date.now()` at each `open`, in order — for measuring reconnect delay. */
+  connectionTimes: number[];
   challenge: string;
   /** Push an EVENT to every open socket on the given subscription. */
   broadcast(subId: string, event: unknown): void;
+  /** Push a NOTICE to every open socket. */
+  notice(message: string): void;
   /** Drop every open socket without shutting the server down. */
   dropAll(): void;
+  /** Flip whether a subsequent AUTH is accepted. */
+  setAuthOk(ok: boolean): void;
 }
 
 /** Loopback stand-in for a Buzz relay websocket. */
 function startFakeWsRelay(opts: { authOk?: boolean } = {}): FakeWsRelay {
-  const authOk = opts.authOk ?? true;
+  let authOk = opts.authOk ?? true;
   const challenge = "challenge-abc123";
   const sockets = new Set<ServerWebSocket<unknown>>();
-  const state = { auths: [] as NostrEvent[], reqs: [] as ReqFrame[], closes: [] as string[] };
+  const state = {
+    auths: [] as NostrEvent[],
+    reqs: [] as ReqFrame[],
+    closes: [] as string[],
+    connectionTimes: [] as number[],
+  };
   let connections = 0;
 
   const server = Bun.serve({
@@ -86,6 +97,7 @@ function startFakeWsRelay(opts: { authOk?: boolean } = {}): FakeWsRelay {
     websocket: {
       open(ws) {
         connections++;
+        state.connectionTimes.push(Date.now());
         sockets.add(ws);
         // Buzz challenges proactively (NOSTR.md, "NIP-42 authentication").
         ws.send(JSON.stringify(["AUTH", challenge]));
@@ -132,12 +144,21 @@ function startFakeWsRelay(opts: { authOk?: boolean } = {}): FakeWsRelay {
     get connections() {
       return connections;
     },
+    get connectionTimes() {
+      return state.connectionTimes;
+    },
     challenge,
     broadcast(subId, event) {
       for (const ws of sockets) ws.send(JSON.stringify(["EVENT", subId, event]));
     },
+    notice(message) {
+      for (const ws of sockets) ws.send(JSON.stringify(["NOTICE", message]));
+    },
     dropAll() {
       for (const ws of sockets) ws.close();
+    },
+    setAuthOk(ok) {
+      authOk = ok;
     },
   };
 }
@@ -412,6 +433,72 @@ describe("startChannelSubscriptions", () => {
     subs?.stop();
   });
 
+  test("a NOTICE is logged (host + truncated to ~200 chars), not silently dropped", async () => {
+    const subs = startChannelSubscriptions(subDeps());
+    await until(() => relay.reqs.length >= 2);
+    const long = "x".repeat(300);
+    relay.notice(long);
+
+    await until(() => logs.some((l) => l.includes("NOTICE")));
+    const line = logs.find((l) => l.includes("NOTICE"));
+    expect(line).toBeDefined();
+    if (!line) throw new Error("no NOTICE line");
+    expect(line).toContain(RELAY_HOST);
+    // Truncated to the first ~200 chars — the whole 300-char notice must not
+    // ride into hub.log.
+    expect(line).toContain("x".repeat(200));
+    expect(line).not.toContain("x".repeat(201));
+    subs?.stop();
+  });
+
+  test("reconnect backoff grows (capped) across consecutive failed connects, and resets only after a successful subscription — not merely on socket open", async () => {
+    relay.stop();
+    relay = startFakeWsRelay({ authOk: false });
+    const minBackoffMs = 40;
+    const maxBackoffMs = 160;
+    const subs = startChannelSubscriptions(
+      subDeps({ minBackoffMs, maxBackoffMs, debounceMs: 10 }),
+    );
+    expect(subs).not.toBeNull();
+
+    // Every connect gets rejected at AUTH, so `sendSubscriptions` — the only
+    // place `attempt` resets — never runs. If backoff reset on socket `open`
+    // instead, every delta below would sit near `minBackoffMs`; it must
+    // instead grow and then plateau at the cap.
+    await until(() => relay.connectionTimes.length >= 4, 8_000);
+    const [t0, t1, t2, t3] = relay.connectionTimes.slice(0, 4);
+    if (t0 === undefined || t1 === undefined || t2 === undefined || t3 === undefined) {
+      throw new Error("expected 4 recorded connection timestamps");
+    }
+    const delta0 = t1 - t0;
+    const delta1 = t2 - t1;
+    const delta2 = t3 - t2;
+    expect(delta1).toBeGreaterThan(delta0);
+    for (const d of [delta0, delta1, delta2]) expect(d).toBeLessThanOrEqual(maxBackoffMs + 300);
+
+    // Let the next AUTH succeed — this drives a real subscription (OK true →
+    // `sendSubscriptions`), the ONLY path that resets `attempt` to 0.
+    relay.setAuthOk(true);
+    await until(() => relay.reqs.length > 0, 8_000);
+
+    // Drop the now-subscribed connection: the NEXT reconnect must use
+    // `minBackoffMs` again, proving the reset came from the subscription
+    // succeeding rather than from any of the sockets that merely opened
+    // above (all of which also got an `open` event, and none of which reset
+    // the counter).
+    const beforeDrop = relay.connectionTimes.length;
+    const dropAt = Date.now();
+    relay.dropAll();
+    await until(() => relay.connectionTimes.length > beforeDrop, 8_000);
+    const droppedAt = relay.connectionTimes[beforeDrop];
+    if (droppedAt === undefined) throw new Error("expected a recorded reconnect timestamp");
+    const reconnectDelay = droppedAt - dropAt;
+    expect(reconnectDelay).toBeLessThan(delta2);
+    expect(reconnectDelay).toBeLessThanOrEqual(minBackoffMs + 300);
+
+    subs?.stop();
+  });
+
   test("a relay that rejects AUTH is logged once and never subscribes", async () => {
     relay.stop();
     relay = startFakeWsRelay({ authOk: false });
@@ -550,6 +637,44 @@ describe("startChannelReconciler + live subscription", () => {
     tick?.();
     await until(() => fetchCalls > 0);
     expect(fetchCalls).toBe(1);
+    reconciler?.stop();
+  });
+
+  test("live subscriptions start lazily once a key appears — no restart required", async () => {
+    const missingKeyDir = join(dir, "missing-at-boot-live");
+    let tick: (() => void) | undefined;
+    const reconciler = startChannelReconciler({
+      db,
+      now,
+      log: (l) => logs.push(l),
+      rosterOptions: { env: {}, configDir: missingKeyDir },
+      liveSubscriptions: {
+        wsUrlFor: () => relay.url,
+        debounceMs: 60,
+        minBackoffMs: 10,
+        maxBackoffMs: 40,
+      },
+      setIntervalFn: (cb) => {
+        tick = cb;
+        return 1;
+      },
+      clearIntervalFn: () => {},
+    });
+    expect(reconciler).not.toBeNull();
+    // No key at boot: no sockets, same as the poll's own no-op state.
+    expect(reconciler?.subscriptionStates().size).toBe(0);
+    expect(relay.connections).toBe(0);
+
+    // The operator drops the key in — no hub restart.
+    const { mkdirSync } = await import("node:fs");
+    mkdirSync(missingKeyDir, { recursive: true });
+    writeFileSync(join(missingKeyDir, "buzz-reader.nsec"), `${randomSecret()}\n`, {
+      mode: 0o600,
+    });
+
+    tick?.();
+    await until(() => relay.connections > 0);
+    await until(() => reconciler?.subscriptionStates().get(RELAY_HOST) === "connected");
     reconciler?.stop();
   });
 

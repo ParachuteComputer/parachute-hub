@@ -14,6 +14,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { schnorr } from "@noble/curves/secp256k1.js";
 import {
+  _resetBuzzReaderKeyWarnings,
   BUZZ_NSEC_FILE_ENV,
   BUZZ_READER_KEY_FILENAME,
   buzzReaderKeyPath,
@@ -210,6 +211,31 @@ describe("loadBuzzReaderKey", () => {
       const res = loadBuzzReaderKey({}, dir);
       expect(res.ok).toBe(true);
       expect(warn).not.toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("a group/other-readable file is warned about once per path, not once per call — the 60s poll calls this N times per tick with N bindings", () => {
+    const dir = tmp();
+    const path = join(dir, BUZZ_READER_KEY_FILENAME);
+    const warn = spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      writeFileSync(path, `${SPEC_NSEC}\n`);
+      chmodSync(path, 0o644);
+      // Same call shape a 60s poll with several `sync` bindings makes: many
+      // calls, same path, all within the same tick.
+      for (let i = 0; i < 5; i++) expect(loadBuzzReaderKey({}, dir).ok).toBe(true);
+      expect(warn).toHaveBeenCalledTimes(1);
+
+      // The test-only reset is the seam a suite uses to get a fresh cooldown
+      // without waiting out `KEY_PERM_WARN_INTERVAL_MS` in real time — it
+      // must not be needed for path-per-test isolation (each test above uses
+      // its own tmpdir), only for a suite that reuses one path.
+      _resetBuzzReaderKeyWarnings();
+      expect(loadBuzzReaderKey({}, dir).ok).toBe(true);
+      expect(warn).toHaveBeenCalledTimes(2);
     } finally {
       warn.mockRestore();
       rmSync(dir, { recursive: true, force: true });

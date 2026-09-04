@@ -605,37 +605,88 @@ describe("runReconcileOnce", () => {
 });
 
 describe("startChannelReconciler", () => {
-  test("never starts without a configured reader key", () => {
+  test("arms the poll even without a configured reader key — a tick is a no-op: no network, no grants", async () => {
+    const relay = fake([rosterEvent(relaySecret, [[alice, "member"]])]);
+    let started = 0;
+    let tick: (() => void) | undefined;
+    const reconciler = startChannelReconciler({
+      db,
+      log: (l) => logs.push(l),
+      rosterOptions: { env: {}, configDir: join(dir, "empty"), originFor: () => relay.origin },
+      liveSubscriptions: false,
+      setIntervalFn: (cb) => {
+        started++;
+        tick = cb;
+        return 1;
+      },
+      clearIntervalFn: () => {},
+    });
+    expect(reconciler).not.toBeNull();
+    expect(started).toBe(1);
+    // `not_configured` is the ordinary state of a hub that hasn't opted in —
+    // it must not nag on every boot.
+    expect(logs).toEqual([]);
+
+    tick?.();
+    await Bun.sleep(20);
+    expect(rows()).toHaveLength(0);
+    expect(relay.queries).toBe(0);
+    reconciler.stop();
+  });
+
+  test("says so once when the key file exists but is unusable, but still arms the poll for when it's fixed", () => {
+    const bad = join(dir, "bad.nsec");
+    writeFileSync(bad, "not-a-key\n");
     let started = 0;
     const reconciler = startChannelReconciler({
       db,
       log: (l) => logs.push(l),
-      rosterOptions: { env: {}, configDir: join(dir, "empty") },
+      rosterOptions: { env: { [BUZZ_NSEC_FILE_ENV]: bad } },
       setIntervalFn: () => {
         started++;
         return 1;
       },
       clearIntervalFn: () => {},
     });
-    expect(reconciler).toBeNull();
-    expect(started).toBe(0);
-    // `not_configured` is the ordinary state of a hub that hasn't opted in —
-    // it must not nag on every boot.
-    expect(logs).toEqual([]);
+    expect(reconciler).not.toBeNull();
+    expect(started).toBe(1);
+    expect(logs.filter((l) => l.includes("malformed")).length).toBe(1);
+    reconciler.stop();
   });
 
-  test("says so once when the key file exists but is unusable", () => {
-    const bad = join(dir, "bad.nsec");
-    writeFileSync(bad, "not-a-key\n");
+  test("a key added after boot is picked up on the next tick — no restart required", async () => {
+    const missingKeyDir = join(dir, "missing-at-boot");
+    const relay = fake([rosterEvent(relaySecret, [[alice, "member"]])]);
+    let tick: (() => void) | undefined;
     const reconciler = startChannelReconciler({
       db,
       log: (l) => logs.push(l),
-      rosterOptions: { env: { [BUZZ_NSEC_FILE_ENV]: bad } },
-      setIntervalFn: () => 1,
+      rosterOptions: { env: {}, configDir: missingKeyDir, originFor: () => relay.origin },
+      liveSubscriptions: false,
+      setIntervalFn: (cb) => {
+        tick = cb;
+        return 1;
+      },
       clearIntervalFn: () => {},
     });
-    expect(reconciler).toBeNull();
-    expect(logs.some((l) => l.includes("malformed"))).toBe(true);
+    expect(reconciler).not.toBeNull();
+
+    // First tick: still no key on disk — a no-op, same property as the test
+    // above.
+    tick?.();
+    await Bun.sleep(20);
+    expect(rows()).toHaveLength(0);
+
+    // The operator drops the key in. No hub restart — the fix is `mkdirSync`
+    // + `writeFileSync`, nothing that touches the running process.
+    const { mkdirSync } = await import("node:fs");
+    mkdirSync(missingKeyDir, { recursive: true });
+    writeFileSync(join(missingKeyDir, "buzz-reader.nsec"), `${randomSecret()}\n`, { mode: 0o600 });
+
+    tick?.();
+    for (let i = 0; i < 100 && roleFor(alice) === undefined; i++) await Bun.sleep(20);
+    expect(roleFor(alice)).toBe("member");
+    reconciler.stop();
   });
 
   test("arms a 60-second poll when a key is configured, and a tick reconciles", async () => {

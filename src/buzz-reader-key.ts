@@ -109,6 +109,25 @@ export type LoadBuzzReaderKeyResult =
   | { ok: false; reason: BuzzReaderKeyFailure; path: string };
 
 /**
+ * Floor between repeated "readable by group or other" warnings for the SAME
+ * path. `loadBuzzReaderKey` is called once per `sync` binding on the
+ * 60-second poll (`channel-reconciler.ts`) plus once per relay AUTH from
+ * `channel-subscription.ts` — N bindings means N (or more) calls a tick, all
+ * resolving to the SAME key file, so without this a hub with N
+ * channel-attached vaults would log the same nudge N times a minute. Same
+ * posture and interval as `EVICTION_WARN_INTERVAL_MS` in `nostr-login.ts`.
+ */
+const KEY_PERM_WARN_INTERVAL_MS = 60 * 1000;
+
+/** ms-epoch of the last permission warning, per resolved path. */
+const lastKeyPermWarnAtMs = new Map<string, number>();
+
+/** Test-only: forget every path's warning cooldown, between cases. */
+export function _resetBuzzReaderKeyWarnings(): void {
+  lastKeyPermWarnAtMs.clear();
+}
+
+/**
  * First non-empty, non-comment line of the file. Everything after it is
  * ignored, so an operator can leave notes below the key.
  */
@@ -158,9 +177,16 @@ export function loadBuzzReaderKey(
   // Group/other permission bits on a secret-bearing file are an operator
   // mistake worth surfacing — never the contents, never a refusal to load,
   // just a nudge toward the fix. `& 0o077` catches any group or other read
-  // /write/execute bit; `0o600` (owner rw only) leaves it zero.
+  // /write/execute bit; `0o600` (owner rw only) leaves it zero. Rate-limited
+  // per path: this function is called far more often than an operator needs
+  // to hear about it (see `KEY_PERM_WARN_INTERVAL_MS`).
   if (stat.mode & 0o077) {
-    console.warn(`Buzz reader key at ${path} is readable by group or other — chmod 600 it.`);
+    const nowMs = Date.now();
+    const lastWarnAtMs = lastKeyPermWarnAtMs.get(path);
+    if (lastWarnAtMs === undefined || nowMs - lastWarnAtMs >= KEY_PERM_WARN_INTERVAL_MS) {
+      lastKeyPermWarnAtMs.set(path, nowMs);
+      console.warn(`Buzz reader key at ${path} is readable by group or other — chmod 600 it.`);
+    }
   }
 
   let contents: string;
