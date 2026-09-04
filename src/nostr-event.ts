@@ -16,6 +16,12 @@
  *     whitespace-free; `JSON.stringify` produces precisely the escaping
  *     NIP-01 mandates (`\"`, `\\`, `\n`, `\r`, `\t`, `\b`, `\f`, and `\uXXXX`
  *     for other control characters; non-ASCII passes through literally).
+ *     Serialization is defined over UTF-8, so `content` and every tag
+ *     element must be well-formed Unicode (no lone UTF-16 surrogates).
+ *     JS `JSON.stringify("\uD800")` emits the ASCII escape `\\ud800` while
+ *     UTF-8 implementations typically substitute U+FFFD or refuse — the
+ *     two hashes diverge (hub#863). `parseNostrEvent` rejects those
+ *     strings rather than hashing them.
  *   - `sig` is a **BIP-340 Schnorr** signature over the 32 raw bytes of `id`
  *     (not over the hex string), 64 bytes / 128 hex chars.
  *
@@ -118,6 +124,30 @@ function isHex64(v: unknown): v is string {
 }
 
 /**
+ * True when `s` is well-formed UTF-16 (no unpaired surrogates). NIP-01 ids
+ * hash UTF-8; a lone surrogate cannot be a valid signed event on an
+ * implementation that works on well-formed UTF-8. Manual scan rather than
+ * `String.prototype.isWellFormed` so the check is obvious and does not
+ * depend on lib target.
+ */
+function isWellFormedUtf16(s: string): boolean {
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c >= 0xd800 && c <= 0xdbff) {
+      // charCodeAt past end is NaN; NaN comparisons are always false, so
+      // a trailing high surrogate must be length-checked, not compared.
+      if (i + 1 >= s.length) return false;
+      const n = s.charCodeAt(i + 1);
+      if (n < 0xdc00 || n > 0xdfff) return false;
+      i++;
+    } else if (c >= 0xdc00 && c <= 0xdfff) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
  * Per-call overrides for the size bounds. Every field defaults to the
  * `MAX_*` constant above; a caller raises a bound only when it knows the
  * event it is parsing is legitimately bigger than a linkage event.
@@ -165,7 +195,11 @@ export function parseNostrEvent(
   if (typeof o.created_at !== "number" || !Number.isSafeInteger(o.created_at) || o.created_at < 0) {
     return { ok: false, reason: "created_at" };
   }
-  if (typeof o.content !== "string" || o.content.length > maxContentLen) {
+  if (
+    typeof o.content !== "string" ||
+    o.content.length > maxContentLen ||
+    !isWellFormedUtf16(o.content)
+  ) {
     return { ok: false, reason: "content" };
   }
   if (!Array.isArray(o.tags) || o.tags.length > maxTags) {
@@ -175,7 +209,7 @@ export function parseNostrEvent(
   for (const tag of o.tags) {
     if (!Array.isArray(tag) || tag.length > maxTagElements) return { ok: false, reason: "tags" };
     for (const el of tag) {
-      if (typeof el !== "string" || el.length > maxTagElementLen) {
+      if (typeof el !== "string" || el.length > maxTagElementLen || !isWellFormedUtf16(el)) {
         return { ok: false, reason: "tags" };
       }
     }
