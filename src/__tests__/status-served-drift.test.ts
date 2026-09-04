@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { status } from "../commands/status.ts";
 import type { DetectServedResolutionDeps } from "../install-source.ts";
+import type { ModuleStatesResult } from "../module-ops-client.ts";
 
 /**
  * Wiring test for the hub#780 served-bundle guardrail — the EXECUTING proof
@@ -143,6 +144,123 @@ describe("status() served-drift wiring (hub#780)", () => {
     // … but with consistent resolution the guardrail must NOT fire. This makes
     // the positive test above discriminating: the pipeline emits the note only
     // on genuine divergence, not unconditionally.
+    expect(lines.some((l) => l.includes("SERVED-DRIFT"))).toBe(false);
+  });
+});
+
+/**
+ * hub#783: the #780 guardrail hardcoded supervisor cwd as `/`. A hub launched
+ * from another bare directory inherits that directory; resolution from there
+ * can still hit the install cache, but status computed from `/` stayed silent.
+ *
+ * Discriminating fixture: `resolveSync` returns the cache ONLY when the
+ * candidate base is `/tmp/bare`. From `/` (the #780 carve-out) it returns the
+ * global link, so the old hardcoded cwd is silent and the recovered cwd fires.
+ */
+const BARE_CWD = "/tmp/bare";
+const BARE_PID = 4242;
+
+function bareDirDivergentDeps(
+  overrides: DetectServedResolutionDeps = {},
+): DetectServedResolutionDeps {
+  return {
+    home: HOME,
+    resolveSync: (_specifier: string, base: string) => {
+      if (base === BARE_CWD) return join(CACHE_ROOT, "package.json");
+      return join(LINK_ROOT, "package.json");
+    },
+    existsSync: () => true,
+    readJson: (path: string) =>
+      path.startsWith(CACHE_ROOT) ? { version: "0.22.5" } : { version: "0.22.9" },
+    resolveBunGlobal: () => LINK_ROOT,
+    ...overrides,
+  };
+}
+
+function fakeOpenDb(): { close: () => void } {
+  return { close: () => {} };
+}
+
+const runningAppStates: ModuleStatesResult = {
+  supervisorAvailable: true,
+  modules: [
+    {
+      short: "app",
+      installed: true,
+      installed_version: "0.22.9",
+      supervisor_status: "running",
+      pid: BARE_PID,
+      supervisor_start_error: null,
+    },
+  ],
+};
+
+describe("status() served-drift wiring (hub#783 non-/ bare cwd)", () => {
+  test("hub-up: pid whose /proc cwd is a non-/ bare dir reports SERVED-DRIFT", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "hub783-status-"));
+    const lines: string[] = [];
+    try {
+      await status({
+        manifestPath: writeAppManifest(dir),
+        configDir: dir,
+        print: (line) => lines.push(line),
+        // cwd omitted — recovered from snap.pid via readProcCwd.
+        servedResolutionDeps: bareDirDivergentDeps({
+          readProcCwd: (pid) => (pid === BARE_PID ? BARE_CWD : undefined),
+        }),
+        supervisor: {
+          probeHubHealth: async () => true,
+          queryHubUnitState: () => ({ state: "active" as const }),
+          fetchModuleStates: async () => runningAppStates,
+          openDb: fakeOpenDb as unknown as (configDir: string) => import("bun:sqlite").Database,
+          readInstanceState: () => undefined,
+        },
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+
+    const drift = lines.find((l) => l.includes("SERVED-DRIFT"));
+    expect(drift).toBeDefined();
+    expect(drift).toContain(`${APP_PKG}@0.22.5`);
+    expect(drift).toContain(CACHE_ROOT);
+    expect(drift).toContain(LINK_ROOT);
+  });
+
+  test("hub-down: no pid, same resolver, cwd falls back to / → silent (the old hardcoded model)", async () => {
+    // Same resolveSync that diverges from `/tmp/bare`. Hub down → no snapshot
+    // pid → cascade ends at `/` → `/` is not a candidate → lands on the link.
+    const lines = await runStatus(bareDirDivergentDeps());
+
+    expect(lines.some((l) => l.includes("parachute-app"))).toBe(true);
+    expect(lines.some((l) => l.includes("SERVED-DRIFT"))).toBe(false);
+  });
+
+  test("explicit cwd / still wins over a pid whose proc cwd is the bare dir (production fallback unchanged)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "hub783-status-cwd-"));
+    const lines: string[] = [];
+    try {
+      await status({
+        manifestPath: writeAppManifest(dir),
+        configDir: dir,
+        print: (line) => lines.push(line),
+        servedResolutionDeps: bareDirDivergentDeps({
+          cwd: "/",
+          readProcCwd: () => BARE_CWD,
+        }),
+        supervisor: {
+          probeHubHealth: async () => true,
+          queryHubUnitState: () => ({ state: "active" as const }),
+          fetchModuleStates: async () => runningAppStates,
+          openDb: fakeOpenDb as unknown as (configDir: string) => import("bun:sqlite").Database,
+          readInstanceState: () => undefined,
+        },
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+
+    expect(lines.some((l) => l.includes("parachute-app"))).toBe(true);
     expect(lines.some((l) => l.includes("SERVED-DRIFT"))).toBe(false);
   });
 });
