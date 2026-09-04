@@ -5,6 +5,10 @@
  *   - an INTEROP VECTOR: a real, third-party-signed event pulled off a public
  *     relay, whose id we recompute and whose signature we verify (see below —
  *     this is the only test here that could catch a wrong serialization)
+ *   - a known-answer id matching nostr-tools@2 `getEventHash` (and an
+ *     independent Python 3 `json.dumps` + sha256) on a well-formed event
+ *   - lone UTF-16 surrogates in `content` or a tag value are rejected
+ *     (hub#863) — NIP-01 serialization is UTF-8
  *   - `nostrEventId` reproduces the canonical NIP-01 serialization/hash
  *   - a genuinely signed event verifies; a tampered field does not
  *   - every field-shape rejection: pubkey / id / sig hex + length, kind,
@@ -125,6 +129,26 @@ describe("interop with the real nostr network", () => {
 });
 
 describe("nostrEventId", () => {
+  test("known-answer: well-formed event id matches nostr-tools@2 getEventHash", () => {
+    // Computed independently, 2026-09-04, against current `next` (`32d9e77`):
+    //   nostr-tools@2 getEventHash → 5ab4a55d193743b8146e901fb026f531877318d7d9717eec645f3222a856e4df
+    //   Python 3 json.dumps(separators=(',', ':'), ensure_ascii=False) + sha256
+    //     → the same hex
+    // This is the UTF-8-well-formed half of hub#863. The relay vector above
+    // is a third-party signed event; this one is a frozen hash from two
+    // reference implementations so a serialization drift cannot hide behind
+    // "we signed what we hashed".
+    expect(
+      nostrEventId({
+        pubkey: "0".repeat(64),
+        created_at: 1700000000,
+        kind: 1,
+        tags: [],
+        content: "hello",
+      }),
+    ).toBe("5ab4a55d193743b8146e901fb026f531877318d7d9717eec645f3222a856e4df");
+  });
+
   test("matches the canonical NIP-01 serialization", () => {
     // Self-consistency only — the interop vector above is what pins the
     // serialization to the spec.
@@ -286,6 +310,52 @@ describe("parseNostrEvent", () => {
     expect(
       parseNostrEvent({ ...good(), tags: [["a", "x".repeat(MAX_TAG_ELEMENT_LEN + 1)]] }),
     ).toEqual({ ok: false, reason: "tags" });
+  });
+
+  test("rejects a lone UTF-16 surrogate in content (hub#863)", () => {
+    // Confirmed still open on origin/next 32d9e77: parseNostrEvent accepted
+    // these, and nostrEventId hashed JSON.stringify's `\ud800` escape to
+    // 2144f4e9… while a UTF-8 replacement (U+FFFD) hashed to 0984f0d2….
+    // NIP-01 is UTF-8; such content cannot be a valid signed event elsewhere.
+    // Constructed at runtime: a `\uD800` source literal is well-formed to
+    // U+FFFD by bun's test transpiler before the assertion runs.
+    const loneHigh = String.fromCharCode(0xd800);
+    const loneLow = String.fromCharCode(0xdc00);
+    expect(loneHigh.isWellFormed()).toBe(false);
+    expect(parseNostrEvent({ ...good(), content: loneHigh })).toEqual({
+      ok: false,
+      reason: "content",
+    });
+    expect(parseNostrEvent({ ...good(), content: loneLow })).toEqual({
+      ok: false,
+      reason: "content",
+    });
+    expect(parseNostrEvent({ ...good(), content: `ok${loneHigh}` })).toEqual({
+      ok: false,
+      reason: "content",
+    });
+  });
+
+  test("rejects a lone UTF-16 surrogate in a tag value (hub#863)", () => {
+    const loneHigh = String.fromCharCode(0xd800);
+    const loneLow = String.fromCharCode(0xdc00);
+    expect(parseNostrEvent({ ...good(), tags: [["u", loneHigh]] })).toEqual({
+      ok: false,
+      reason: "tags",
+    });
+    expect(parseNostrEvent({ ...good(), tags: [["challenge", `x${loneLow}`]] })).toEqual({
+      ok: false,
+      reason: "tags",
+    });
+  });
+
+  test("still accepts a well-formed supplementary character (paired surrogates)", () => {
+    // U+10000 is one supplementary scalar, encoded as a surrogate pair.
+    // Rejecting every surrogate would break emoji / non-BMP content.
+    const pair = String.fromCharCode(0xd800, 0xdc00);
+    expect(pair.isWellFormed()).toBe(true);
+    expect(parseNostrEvent({ ...good(), content: pair }).ok).toBe(true);
+    expect(parseNostrEvent({ ...good(), tags: [["t", "😀"]] }).ok).toBe(true);
   });
 });
 
