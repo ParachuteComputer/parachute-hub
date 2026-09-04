@@ -64,13 +64,17 @@ interface FakeWsRelay {
   challenge: string;
   /** Push an EVENT to every open socket on the given subscription. */
   broadcast(subId: string, event: unknown): void;
+  /** Push a NOTICE to every open socket. */
+  notice(message: string): void;
   /** Drop every open socket without shutting the server down. */
   dropAll(): void;
+  /** Flip whether a subsequent AUTH is accepted. */
+  setAuthOk(ok: boolean): void;
 }
 
 /** Loopback stand-in for a Buzz relay websocket. */
 function startFakeWsRelay(opts: { authOk?: boolean } = {}): FakeWsRelay {
-  const authOk = opts.authOk ?? true;
+  let authOk = opts.authOk ?? true;
   const challenge = "challenge-abc123";
   const sockets = new Set<ServerWebSocket<unknown>>();
   const state = { auths: [] as NostrEvent[], reqs: [] as ReqFrame[], closes: [] as string[] };
@@ -136,8 +140,14 @@ function startFakeWsRelay(opts: { authOk?: boolean } = {}): FakeWsRelay {
     broadcast(subId, event) {
       for (const ws of sockets) ws.send(JSON.stringify(["EVENT", subId, event]));
     },
+    notice(message) {
+      for (const ws of sockets) ws.send(JSON.stringify(["NOTICE", message]));
+    },
     dropAll() {
       for (const ws of sockets) ws.close();
+    },
+    setAuthOk(ok) {
+      authOk = ok;
     },
   };
 }
@@ -412,6 +422,99 @@ describe("startChannelSubscriptions", () => {
     subs?.stop();
   });
 
+  test("a NOTICE is logged (host + truncated to ~200 chars), not silently dropped", async () => {
+    const subs = startChannelSubscriptions(subDeps());
+    try {
+      await until(() => relay.reqs.length >= 2);
+      const long = "x".repeat(300);
+      relay.notice(long);
+
+      await until(() => logs.some((l) => l.includes("NOTICE")));
+      const line = logs.find((l) => l.includes("NOTICE"));
+      expect(line).toBeDefined();
+      if (!line) throw new Error("no NOTICE line");
+      expect(line).toContain(RELAY_HOST);
+      // Truncated to the first ~200 chars — the whole 300-char notice must
+      // not ride into hub.log.
+      expect(line).toContain("x".repeat(200));
+      expect(line).not.toContain("x".repeat(201));
+    } finally {
+      // MUST run even when an assertion above throws: a live `subs` holds a
+      // reconnect timer whose `wsUrlFor` closure reads the shared `relay`
+      // variable at CALL time, not creation time — an un-stopped timer from
+      // this test fires after the next test's `beforeEach` has already
+      // reassigned `relay`, and dials that fresh fake relay instead.
+      subs?.stop();
+    }
+  });
+
+  test(
+    "reconnect backoff grows (capped) across consecutive failed connects, and resets only after a successful subscription — not merely on socket open",
+    async () => {
+      relay.stop();
+      relay = startFakeWsRelay({ authOk: false });
+      const minBackoffMs = 40;
+      const maxBackoffMs = 160;
+      // Deterministic instead of wall-clock: `reconnectSetTimeoutFn` is a
+      // test seam that touches ONLY the reconnect timer (never the AUTH
+      // grace timer or the reconcile debounce timer, both of which stay on
+      // real time so the wire protocol's AUTH-then-subscribe order can't
+      // race). It records every delay {@link scheduleReconnect} actually
+      // REQUESTS and fires fast (a real 5ms timer, not synchronous, so the
+      // call stack doesn't recurse straight through connect() → onclose() →
+      // scheduleReconnect()). Asserting the recorded sequence is a direct
+      // check of the backoff FORMULA — no inference from wall-clock deltas
+      // between real socket connects, which on a shared/loaded box can
+      // stall by seconds for reasons (OS socket teardown, GC pauses) that
+      // have nothing to do with this module's correctness.
+      const scheduled: number[] = [];
+      const reconnectSetTimeoutFn = (cb: () => void, delayMs: number) => {
+        scheduled.push(delayMs);
+        return setTimeout(cb, 5);
+      };
+      const subs = startChannelSubscriptions(
+        subDeps({ minBackoffMs, maxBackoffMs, debounceMs: 10, reconnectSetTimeoutFn }),
+      );
+      try {
+        expect(subs).not.toBeNull();
+
+        // Every connect gets rejected at AUTH, so `sendSubscriptions` — the
+        // only place `attempt` resets — never runs. If backoff reset on
+        // socket `open` instead, every requested delay would be
+        // `minBackoffMs` rather than doubling (capped at `maxBackoffMs`).
+        await until(() => scheduled.length >= 4);
+        expect(scheduled.slice(0, 4)).toEqual([40, 80, 160, 160]);
+
+        // Let the next AUTH succeed — this drives a real subscription (OK
+        // true → `sendSubscriptions`), the ONLY path that resets `attempt`
+        // to 0. However many extra fast-fired attempts happened while we
+        // were asserting above is irrelevant; we only need the NEXT one to
+        // land after the flip.
+        relay.setAuthOk(true);
+        await until(() => relay.reqs.length > 0);
+
+        // Drop the now-subscribed connection: the NEXT scheduled delay must
+        // be exactly `minBackoffMs` again, proving the reset came from the
+        // subscription succeeding rather than from any of the sockets that
+        // merely opened above (all of which also fired `onopen`, and none
+        // of which reset the counter).
+        const beforeReset = scheduled.length;
+        relay.dropAll();
+        await until(() => scheduled.length > beforeReset);
+        expect(scheduled[beforeReset]).toBe(minBackoffMs);
+      } finally {
+        // MUST run even when an assertion above throws: a live `subs` holds
+        // a reconnect timer whose `wsUrlFor` closure reads the shared
+        // `relay` variable at CALL time, not creation time — an un-stopped
+        // timer from this test fires after the next test's `beforeEach` has
+        // already reassigned `relay`, and dials that fresh fake relay
+        // instead.
+        subs?.stop();
+      }
+    },
+    30_000,
+  );
+
   test("a relay that rejects AUTH is logged once and never subscribes", async () => {
     relay.stop();
     relay = startFakeWsRelay({ authOk: false });
@@ -551,6 +654,50 @@ describe("startChannelReconciler + live subscription", () => {
     await until(() => fetchCalls > 0);
     expect(fetchCalls).toBe(1);
     reconciler?.stop();
+  });
+
+  test("live subscriptions start lazily once a key appears — no restart required", async () => {
+    const missingKeyDir = join(dir, "missing-at-boot-live");
+    let tick: (() => void) | undefined;
+    const reconciler = startChannelReconciler({
+      db,
+      now,
+      log: (l) => logs.push(l),
+      rosterOptions: { env: {}, configDir: missingKeyDir },
+      liveSubscriptions: {
+        wsUrlFor: () => relay.url,
+        debounceMs: 60,
+        minBackoffMs: 10,
+        maxBackoffMs: 40,
+      },
+      setIntervalFn: (cb) => {
+        tick = cb;
+        return 1;
+      },
+      clearIntervalFn: () => {},
+    });
+    try {
+      expect(reconciler).not.toBeNull();
+      // No key at boot: no sockets, same as the poll's own no-op state.
+      expect(reconciler?.subscriptionStates().size).toBe(0);
+      expect(relay.connections).toBe(0);
+
+      // The operator drops the key in — no hub restart.
+      const { mkdirSync } = await import("node:fs");
+      mkdirSync(missingKeyDir, { recursive: true });
+      writeFileSync(join(missingKeyDir, "buzz-reader.nsec"), `${randomSecret()}\n`, {
+        mode: 0o600,
+      });
+
+      tick?.();
+      await until(() => relay.connections > 0);
+      await until(() => reconciler?.subscriptionStates().get(RELAY_HOST) === "connected");
+    } finally {
+      // Same reasoning as the tests above: a live socket left running past
+      // this test would dial the next test's `relay` once it reassigns the
+      // shared variable.
+      reconciler?.stop();
+    }
   });
 
   test("stop() takes the sockets down with the timer", async () => {

@@ -581,19 +581,28 @@ export interface ChannelReconcilerDeps<H = unknown> extends ReconcilerDeps {
 }
 
 /**
- * Start the 60-second poll — or don't.
+ * Start the 60-second poll. Always — the timer is armed whether or not a
+ * usable Buzz reader key exists yet.
  *
- * Returns `null`, and starts NO timer, when the hub has no usable Buzz reader
- * key. That is the ordinary state of a hub that has not opted into
- * channel-attached vaults, and an opt-in feature should cost such a hub
- * exactly nothing: no timer, no wakeups, no log line every minute about a file
- * that was never meant to exist. An operator who adds the key restarts the
- * hub, which is the same ceremony every other credential file already asks
- * for.
+ * It used to gate on the key at boot and return `null` (no timer at all) when
+ * one was missing or unusable. That made "opt-in costs nothing" true at the
+ * price of a worse bug: `runReconcileOnce` already re-checks the key on EVERY
+ * tick (an attached-at-runtime `sync` binding gets the same treatment), but a
+ * boot-time `null` here meant a hub started before the key existed — or
+ * before a typo in it was fixed — never got a timer to re-check FROM. The
+ * operator's fix sat on disk, inert, until the next restart. Arming
+ * unconditionally costs a hub that never configures a key one `statSync` a
+ * minute — the same cost `loadBuzzReaderKey` already documents as free.
  *
- * The presence of a `sync` binding is deliberately NOT a start condition — it
- * is re-checked on every tick — because bindings are attached at runtime while
- * the key is not.
+ * The presence of a `sync` binding is, likewise, deliberately NOT a start
+ * condition — re-checked every tick because bindings are attached at runtime.
+ *
+ * The boot log line stays informative rather than becoming noise: a key file
+ * that exists but cannot be used (a typo, bad permissions past `unreadable`)
+ * is still worth one line at boot, because it is an operator mistake, not an
+ * opt-out. `not_configured` — the ordinary state of a hub that hasn't opted
+ * in — stays silent, at boot AND on every tick (`runReconcileOnce`'s own
+ * `not_configured` result is not logged either).
  *
  * Ticks never overlap: a poll that is still running (a slow relay against a
  * 10s timeout) makes the next tick a no-op rather than stacking a second pass
@@ -602,18 +611,17 @@ export interface ChannelReconcilerDeps<H = unknown> extends ReconcilerDeps {
  */
 export function startChannelReconciler<H = ReturnType<typeof setInterval>>(
   deps: ChannelReconcilerDeps<H>,
-): ChannelReconciler | null {
+): ChannelReconciler {
   const log = deps.log ?? ((line: string) => console.log(line));
-  const key = loadBuzzReaderKey(deps.rosterOptions?.env, deps.rosterOptions?.configDir);
-  if (!key.ok) {
-    if (key.reason !== "not_configured") {
-      // A key file that exists but cannot be used is an operator typo, not an
-      // opt-out — say so once, at boot, and stay off.
-      log(
-        `parachute hub: Buzz reader key at ${key.path} is ${key.reason}; channel membership sync is OFF until it is fixed.`,
-      );
-    }
-    return null;
+  const bootKey = loadBuzzReaderKey(deps.rosterOptions?.env, deps.rosterOptions?.configDir);
+  if (!bootKey.ok && bootKey.reason !== "not_configured") {
+    // A key file that exists but cannot be used is an operator typo, not an
+    // opt-out — say so once, at boot. The poll still arms below and keeps
+    // re-checking, so fixing the file takes effect on the next tick rather
+    // than needing a restart.
+    log(
+      `parachute hub: Buzz reader key at ${bootKey.path} is ${bootKey.reason}; channel membership sync is OFF until it is fixed.`,
+    );
   }
 
   const intervalMs = deps.intervalMs ?? CHANNEL_RECONCILE_INTERVAL_MS;
@@ -645,30 +653,40 @@ export function startChannelReconciler<H = ReturnType<typeof setInterval>>(
     return true;
   }
 
+  // Live subscriptions start the same way the poll used to gate: `null` until
+  // a usable key exists. Unlike the poll, there is no cheap always-on version
+  // of a websocket, so `ensureSubscriptions` (called every tick) is what
+  // makes this lazy — a key added after boot gets sockets on the next tick
+  // rather than needing a restart, the same fix as the poll's own.
+  let subscriptions: ChannelSubscriptions | null = null;
+  function tryStartSubscriptions(): ChannelSubscriptions | null {
+    if (deps.liveSubscriptions === false) return null;
+    return startChannelSubscriptions({
+      db: deps.db,
+      log,
+      limiter,
+      requestReconcile: tryRun,
+      ...(deps.rosterOptions?.env !== undefined ? { env: deps.rosterOptions.env } : {}),
+      ...(deps.rosterOptions?.configDir !== undefined
+        ? { configDir: deps.rosterOptions.configDir }
+        : {}),
+      ...(deps.now !== undefined ? { now: deps.now } : {}),
+      ...deps.liveSubscriptions,
+    });
+  }
   // Started before the timer so the sockets are up for the first minute
-  // rather than after it. `null` here (no key — already checked above, or a
-  // deliberate `false`) simply means poll-only; nothing downstream cares.
-  const subscriptions: ChannelSubscriptions | null =
-    deps.liveSubscriptions === false
-      ? null
-      : startChannelSubscriptions({
-          db: deps.db,
-          log,
-          limiter,
-          requestReconcile: tryRun,
-          ...(deps.rosterOptions?.env !== undefined ? { env: deps.rosterOptions.env } : {}),
-          ...(deps.rosterOptions?.configDir !== undefined
-            ? { configDir: deps.rosterOptions.configDir }
-            : {}),
-          ...(deps.now !== undefined ? { now: deps.now } : {}),
-          ...deps.liveSubscriptions,
-        });
+  // rather than after it, when a key is already there at boot.
+  subscriptions = tryStartSubscriptions();
 
   const handle = setIntervalFn(() => {
     // Bindings attached or detached at runtime by the CLI go live on the next
     // tick rather than instantly — the hub has no change feed on its own
     // tables, and a poll interval of staleness on a socket set is invisible
-    // next to the poll the socket is accelerating.
+    // next to the poll the socket is accelerating. Same reasoning is why a
+    // still-null `subscriptions` is retried here: a key dropped in after boot
+    // (or after this tick's own reconcile attempt) opens sockets on the very
+    // next tick instead of waiting for a restart.
+    if (subscriptions === null) subscriptions = tryStartSubscriptions();
     subscriptions?.refresh();
     tryRun();
   }, intervalMs);

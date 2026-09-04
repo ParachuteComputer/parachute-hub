@@ -800,19 +800,19 @@ export async function serve(opts: ServeOpts = {}): Promise<{
 
   // Channel membership sync (channel-attached vaults PR 5). Started here, on
   // the real `parachute serve` path, for the same reason the DB watchdog is:
-  // this is the process a launchd / systemd unit actually runs. It returns
-  // `null` — and starts NO timer — unless a Buzz reader key is configured, so
-  // a hub that has not opted in pays nothing. Skipped under `skipModuleBoot`
-  // alongside every other real timer, so tests never spawn a 60-second poll.
+  // this is the process a launchd / systemd unit actually runs. The poll
+  // arms unconditionally — a hub with no Buzz reader key configured pays one
+  // `statSync` a minute and does nothing else, per-tick, until an operator
+  // opts in by dropping a key file in (no restart needed either way).
+  // Skipped under `skipModuleBoot` alongside every other real timer, so tests
+  // never spawn a 60-second poll.
   let reconciler: ChannelReconciler | null = null;
   if (!opts.skipModuleBoot) {
     reconciler = startChannelReconciler({ db: dbHolder.get(), log });
-    if (reconciler) {
-      log(
-        "parachute serve: channel membership sync armed (60s poll over `sync` channel bindings, " +
-          "plus a live relay subscription that reconciles on membership change).",
-      );
-    }
+    log(
+      "parachute serve: channel membership sync armed (60s poll over `sync` channel bindings, " +
+        "plus a live relay subscription that reconciles on membership change).",
+    );
   }
 
   // Boot already-installed modules from services.json — now that we own the
