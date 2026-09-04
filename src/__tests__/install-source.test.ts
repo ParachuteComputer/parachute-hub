@@ -2,11 +2,13 @@ import { describe, expect, test } from "bun:test";
 import { join } from "node:path";
 import {
   type DetectInstallSourceDeps,
+  SUPERVISOR_CWD,
   detectHubInstallSource,
   detectInstallSource,
   detectServedResolution,
   formatInstallSourceLabel,
   isStale,
+  resolveShimLaunchCwd,
   servedDivergenceNote,
 } from "../install-source.ts";
 import { SEED_VERSION } from "../service-spec.ts";
@@ -411,5 +413,114 @@ describe("detectServedResolution + servedDivergenceNote (hub#780 guardrail)", ()
     expect(served.divergent).toBe(true);
     expect(served.servedVersion).toBeUndefined();
     expect(servedDivergenceNote(PKG, served)).toContain(`${PKG}@unknown`);
+  });
+
+  // hub#783: a non-`/` bare cwd IS a resolution candidate (unlike `/`, which
+  // #780 drops). Bun.resolveSync from there can still land on the install cache
+  // and the guardrail must report it — the hardcoded-`/` model stayed silent.
+  test("hub#783: non-/ bare cwd resolves the cache while the link points elsewhere → SERVED-DRIFT", () => {
+    const bareCwd = "/tmp/bare";
+    const served = detectServedResolution(PKG, {
+      home,
+      cwd: bareCwd,
+      resolveSync: (_specifier, base) => {
+        if (base === bareCwd) return join(cacheRoot, "package.json");
+        return join(linkedRoot, "package.json");
+      },
+      existsSync: () => true,
+      readJson: (p) => {
+        if (p === join(cacheRoot, "package.json")) return { name: PKG, version: "0.22.5" };
+        return { name: PKG, version: "0.30.0" };
+      },
+      resolveBunGlobal: () => linkedRoot,
+    });
+
+    expect(served.divergent).toBe(true);
+    expect(served.servedPath).toBe(cacheRoot);
+    expect(served.servedVersion).toBe("0.22.5");
+    expect(servedDivergenceNote(PKG, served)).toContain("SERVED-DRIFT");
+  });
+
+  test("hub#783: same resolver stays silent when cwd falls back to / (the #780 carve-out)", () => {
+    const bareCwd = "/tmp/bare";
+    const served = detectServedResolution(PKG, {
+      home,
+      // cwd omitted → SUPERVISOR_CWD `/` → `/` is dropped as a candidate, so
+      // resolution never probes `bareCwd` and lands on the global link.
+      resolveSync: (_specifier, base) => {
+        if (base === bareCwd) return join(cacheRoot, "package.json");
+        return join(linkedRoot, "package.json");
+      },
+      existsSync: () => true,
+      readJson: () => ({ name: PKG, version: "0.30.0" }),
+      resolveBunGlobal: () => linkedRoot,
+    });
+
+    expect(served.divergent).toBe(false);
+    expect(served.servedPath).toBe(linkedRoot);
+    expect(servedDivergenceNote(PKG, served)).toBeUndefined();
+  });
+});
+
+describe("resolveShimLaunchCwd (hub#783 cascade)", () => {
+  const BARE = "/tmp/bare";
+  const INSTALL = "/opt/parachute/app";
+
+  test("recorded cwd wins over pid and installDir", () => {
+    expect(
+      resolveShimLaunchCwd(
+        { recordedCwd: BARE, pid: 4242, installDir: INSTALL },
+        { readProcCwd: () => "/proc-should-not-run" },
+      ),
+    ).toBe(BARE);
+  });
+
+  test("empty recorded cwd falls through to /proc/<pid>/cwd", () => {
+    expect(
+      resolveShimLaunchCwd(
+        { recordedCwd: "", pid: 4242, installDir: INSTALL },
+        { readProcCwd: (pid) => (pid === 4242 ? BARE : undefined) },
+      ),
+    ).toBe(BARE);
+  });
+
+  test("pid cwd wins over installDir when recorded cwd is absent", () => {
+    expect(
+      resolveShimLaunchCwd({ pid: 4242, installDir: INSTALL }, { readProcCwd: () => BARE }),
+    ).toBe(BARE);
+  });
+
+  test("installDir is used when recorded cwd and proc cwd are absent", () => {
+    expect(
+      resolveShimLaunchCwd({ pid: 4242, installDir: INSTALL }, { readProcCwd: () => undefined }),
+    ).toBe(INSTALL);
+  });
+
+  test("falls back to SUPERVISOR_CWD / when nothing else is available", () => {
+    expect(resolveShimLaunchCwd()).toBe(SUPERVISOR_CWD);
+    expect(resolveShimLaunchCwd({ pid: 4242 }, { readProcCwd: () => undefined })).toBe("/");
+  });
+
+  test("non-positive pid does not call readProcCwd", () => {
+    let called = false;
+    expect(
+      resolveShimLaunchCwd(
+        { pid: 0, installDir: INSTALL },
+        {
+          readProcCwd: () => {
+            called = true;
+            return BARE;
+          },
+        },
+      ),
+    ).toBe(INSTALL);
+    expect(called).toBe(false);
+  });
+
+  test("default /proc reader no-ops on a pid that has no procfs entry (Darwin / missing pid)", () => {
+    // This box is Darwin — `/proc/<pid>/cwd` does not exist, so the default
+    // reader must return undefined rather than throw, and the cascade falls
+    // through to `/`.
+    expect(resolveShimLaunchCwd({ pid: 1 })).toBe(SUPERVISOR_CWD);
   });
 });
