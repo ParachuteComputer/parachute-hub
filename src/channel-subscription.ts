@@ -179,6 +179,19 @@ export interface ChannelSubscriptionDeps {
   nowSeconds?: () => number;
   /** Injectable clock for the log rate limiter. */
   now?: () => Date;
+  /**
+   * Test seam for the reconnect backoff timer ONLY — the AUTH grace timer and
+   * the reconcile debounce timer are untouched, so accelerating this in a
+   * test cannot race the wire protocol (a test that sped up the grace timer
+   * too could fire `sendSubscriptions` before the real AUTH round trip
+   * finishes). Defaults to the real `setTimeout`; a test can record the
+   * requested delay and fire fast, asserting the backoff FORMULA (min,
+   * 2×min, 4×min … capped, reset only after a real subscription) instead of
+   * wall-clock deltas between real socket connects.
+   */
+  reconnectSetTimeoutFn?: (cb: () => void, delayMs: number) => ReturnType<typeof setTimeout>;
+  /** Paired clear for {@link reconnectSetTimeoutFn}. Defaults to `clearTimeout`. */
+  reconnectClearTimeoutFn?: (handle: ReturnType<typeof setTimeout>) => void;
 }
 
 /** Handle returned by {@link startChannelSubscriptions}. */
@@ -243,6 +256,10 @@ export function startChannelSubscriptions(
   const maxBackoffMs = deps.maxBackoffMs ?? SUBSCRIPTION_MAX_BACKOFF_MS;
   const authGraceMs = deps.authGraceMs ?? SUBSCRIPTION_AUTH_GRACE_MS;
   const logIntervalMs = deps.logIntervalMs ?? SUBSCRIPTION_LOG_INTERVAL_MS;
+  const reconnectSetTimeoutFn =
+    deps.reconnectSetTimeoutFn ?? ((cb: () => void, delayMs: number) => setTimeout(cb, delayMs));
+  const reconnectClearTimeoutFn =
+    deps.reconnectClearTimeoutFn ?? ((handle: ReturnType<typeof setTimeout>) => clearTimeout(handle));
 
   let stopped = false;
 
@@ -316,7 +333,7 @@ export function startChannelSubscriptions(
     }
 
     private clearTimers(): void {
-      if (this.reconnectTimer !== null) clearTimeout(this.reconnectTimer);
+      if (this.reconnectTimer !== null) reconnectClearTimeoutFn(this.reconnectTimer);
       if (this.graceTimer !== null) clearTimeout(this.graceTimer);
       this.reconnectTimer = null;
       this.graceTimer = null;
@@ -378,7 +395,7 @@ export function startChannelSubscriptions(
       const delay = Math.min(maxBackoffMs, minBackoffMs * 2 ** this.attempt);
       this.attempt++;
       this.state = "reconnecting";
-      this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = reconnectSetTimeoutFn(() => {
         this.reconnectTimer = null;
         // Bindings may have changed while we were down; take the current set.
         // A throw here means the DB went away underneath us (shutdown race) —
