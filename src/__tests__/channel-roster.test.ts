@@ -356,7 +356,38 @@ describe("fetchChannelRoster", () => {
   test("an empty result set is no_roster, not an empty roster", async () => {
     const relay = fake({ nip11Self: pubkeyForSecret(randomSecret()), events: [] });
     const res = await fetchChannelRoster(db, RELAY_HOST, CHANNEL, optsFor(relay));
-    expect(res).toMatchObject({ ok: false, reason: "no_roster" });
+    expect(res).toMatchObject({
+      ok: false,
+      reason: "no_roster",
+      detail: "no kind 39002 for channel",
+    });
+  });
+
+  test("a 39002-shaped event that fails NIP-01 parse is unparseable_roster, not no_roster", async () => {
+    // Same query path as the empty-set case, but the relay DID return an
+    // object claiming kind 39002. parseNostrEvent rejects it (pubkey is not
+    // 64 hex). Pre-split, selectRosterEvent skipped that and collapsed to
+    // no_roster — last_error could not tell a missing roster from junk.
+    const relay = fake({
+      nip11Self: pubkeyForSecret(randomSecret()),
+      events: [
+        {
+          kind: 39002,
+          created_at: 1_800_000_000,
+          pubkey: "not-a-pubkey",
+          id: "not-an-id",
+          sig: "not-a-sig",
+          tags: [["d", CHANNEL]],
+          content: "",
+        },
+      ],
+    });
+    const res = await fetchChannelRoster(db, RELAY_HOST, CHANNEL, optsFor(relay));
+    expect(res).toMatchObject({
+      ok: false,
+      reason: "unparseable_roster",
+      detail: "kind 39002 event failed to parse",
+    });
   });
 
   test("a 39002 for a different channel does not satisfy this channel", async () => {

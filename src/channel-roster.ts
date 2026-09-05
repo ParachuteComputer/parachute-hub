@@ -101,7 +101,14 @@ export const MAX_ROSTER_TAGS = 2048;
  *   - `relay_key_changed` — NIP-11 `self` differs from the pinned value.
  *     Refused; see the module header.
  *   - `no_roster` — the relay answered but returned no 39002 for this
- *     channel.
+ *     channel (empty result, or every event was a well-formed event for a
+ *     different kind/channel). Distinct from `unparseable_roster`.
+ *   - `unparseable_roster` — at least one returned object failed NIP-01
+ *     parse, and none of the well-formed events was a 39002 for this
+ *     channel (hub#956 review: `no_roster` used to cover this too, so
+ *     `parachute doctor`/`status` could not tell a missing roster from a
+ *     malformed one). `last_error` stores the reason word, so this has to
+ *     be a distinct code, not just a different detail.
  *   - `bad_signature` — a 39002 was returned but is not validly signed by
  *     the relay's `self` key (wrong signer, forged id, or bad sig).
  */
@@ -114,6 +121,7 @@ export type RosterFailure =
   | "relay_self_unknown"
   | "relay_key_changed"
   | "no_roster"
+  | "unparseable_roster"
   | "bad_signature";
 
 export interface RosterSuccess {
@@ -327,18 +335,26 @@ async function fetchRosterEvents(
  * plus a current one. The `d` tag is re-checked here rather than trusted from
  * the filter — the filter is a request, the tag is signed.
  */
-function selectRosterEvent(events: readonly unknown[], channelId: string): NostrEvent | null {
+function selectRosterEvent(
+  events: readonly unknown[],
+  channelId: string,
+): { event: NostrEvent } | { event: null; parseFailed: number } {
   let best: NostrEvent | null = null;
+  let parseFailed = 0;
   for (const raw of events) {
     const parsed = parseNostrEvent(raw, { maxTags: MAX_ROSTER_TAGS });
-    if (!parsed.ok) continue;
+    if (!parsed.ok) {
+      parseFailed++;
+      continue;
+    }
     const event = parsed.event;
     if (event.kind !== KIND_GROUP_MEMBERS) continue;
     const d = event.tags.find((t) => t[0] === "d")?.[1];
     if (d !== channelId) continue;
     if (best === null || event.created_at > best.created_at) best = event;
   }
-  return best;
+  if (best !== null) return { event: best };
+  return { event: null, parseFailed };
 }
 
 /**
@@ -391,10 +407,22 @@ export async function fetchChannelRoster(
   const fetched = await fetchRosterEvents(relayHost, channelId, loaded.key.secretKeyHex, opts);
   if (!fetched.ok) return fetched;
 
-  const event = selectRosterEvent(fetched.events, channelId);
-  if (event === null) {
+  const selected = selectRosterEvent(fetched.events, channelId);
+  if (selected.event === null) {
+    // A well-formed 39002 for this channel was not in the result. If ANY
+    // returned object failed NIP-01 parse, that is a different operator
+    // problem than "the relay has no roster" — last_error stores the reason
+    // word, so the codes must differ.
+    if (selected.parseFailed > 0) {
+      return {
+        ok: false,
+        reason: "unparseable_roster",
+        detail: `kind ${KIND_GROUP_MEMBERS} event failed to parse`,
+      };
+    }
     return { ok: false, reason: "no_roster", detail: `no kind ${KIND_GROUP_MEMBERS} for channel` };
   }
+  const event = selected.event;
 
   // Two independent checks. The author check is the one that matters here:
   // a validly-signed event from SOME key proves only that somebody signed it,
