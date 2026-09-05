@@ -127,6 +127,8 @@
  *   /api/modules/operations/:id   (GET)        → poll async op status
  *   /api/settings/hub-origin      (GET + PUT)  → canonical hub URL (host:admin)
  *   /api/settings/root-redirect   (GET + PUT)  → bare-`/` redirect target (host:admin)
+ *   /api/auth/nostr/challenge     (GET)        → sign-in nonce + event template (ANONYMOUS)
+ *   /api/auth/nostr/verify        (POST)       → signed kind-27235 → session cookie (ANONYMOUS)
  *   /api/auth/mint-token          (POST)       → CLI/automation token mint (bearer)
  *   /api/auth/revoke-token        (POST)       → revoke registry-row token by jti
  *   /api/auth/tokens              (GET)        → paginated registry list (carries the additive subject_pubkey snapshot)
@@ -142,10 +144,21 @@
  *   /api/users/<id>/promote-hub-admin (POST)   → promote a user to hub admin (host:admin)
  *   /api/vault-caps               (GET)        → list vaults + persisted storage caps (host:admin)
  *   /api/vault-caps/<name>        (PUT)        → set/update a vault's storage cap (host:admin)
+ *   /api/channel-vault            (GET)        → which vault backs ?relay=&channel= → {vault, mode, synced_at};
+ *                                                ANY authenticated principal (NIP-98 or Bearer), no membership
+ *                                                check — a vault name is not a secret; 404 when unbound
+ *   /api/channel-vaults           (GET)        → list channel→vault bindings, ?vault= filters (host:admin)
+ *   /api/channel-vaults           (POST)       → attach a channel to an already-installed vault; 400 if the
+ *                                                vault is not installed, 409 on a rebind (host:admin)
+ *   /api/channel-vaults           (DELETE)     → detach ?relay=&channel= (host:admin)
+ *   /api/channel-vaults/sync      (POST)       → run one membership reconcile pass now; per-binding
+ *                                                counts, `ran:false` when no reader key / no sync
+ *                                                binding (host:admin)
  *   /login                        (GET + POST) → operator password login
- *   /login/2fa                    (POST)       → second-factor (TOTP/backup) step
+ *   /login/2fa                    (GET + POST) → second-factor (TOTP/backup) step
  *                                                 (hub#473; reached after a correct
- *                                                 password for a 2FA-enrolled user)
+ *                                                 password for a 2FA-enrolled user, or
+ *                                                 redirected here by the Nostr key door)
  *   /logout                       (POST)       → end admin session
  *   /account/session               (GET)        → same-origin boot oracle {signed_in,
  *                                                 csrf,...} (hub-parity P1); cookie-gated,
@@ -272,6 +285,7 @@ import { handleListGrants, handleRevokeGrant } from "./admin-grants.ts";
 import {
   handleAdminLoginGet,
   handleAdminLoginPost,
+  handleAdminLoginTotpGet,
   handleAdminLoginTotpPost,
   handleAdminLogoutPost,
 } from "./admin-handlers.ts";
@@ -288,6 +302,13 @@ import {
 } from "./api-account.ts";
 import { handleAdminLock } from "./api-admin-lock.ts";
 import { handleApiAttribution } from "./api-attribution.ts";
+import {
+  handleAttachChannelVault,
+  handleDetachChannelVault,
+  handleGetChannelVault,
+  handleListChannelVaults,
+  handleSyncChannelVaults,
+} from "./api-channel-vaults.ts";
 import { handleHubUpgrade, handleHubUpgradeStatus } from "./api-hub-upgrade.ts";
 import { handleApiHub } from "./api-hub.ts";
 import { handleCreateInvite, handleListInvites, handleRevokeInvite } from "./api-invites.ts";
@@ -352,6 +373,7 @@ import {
   readModuleManifest as defaultReadModuleManifest,
 } from "./module-manifest.ts";
 import { isNostrAuthorization } from "./nostr-http-auth.ts";
+import { handleNostrLogin } from "./nostr-login.ts";
 import { isLegacyNotesPath, logNotesRedirect, maybeRedirectNotes } from "./notes-redirect.ts";
 import {
   authorizationServerMetadata,
@@ -3617,6 +3639,37 @@ export function hubFetch(
         }
       }
 
+      // The human key door (design note "Human key door — sign in with a Nostr
+      // key"). The ONLY anonymous routes under /api/auth/* — everything else in
+      // this family is bearer-gated, and these two cannot be: their entire
+      // purpose is to establish a session for a member who has no password and
+      // no token, only a linked Nostr key.
+      //
+      // `hubBoundOrigins` comes from `linkageBoundOrigins`, NOT the general
+      // `oauthDeps(req).hubBoundOrigins()`. The general set includes the
+      // per-request (Host-derived) issuer, which an attacker can choose; if it
+      // were accepted as a `u` origin here, a signature over a statement naming
+      // the ATTACKER's host would be spendable at this hub, minting a session
+      // as the victim. hub#833 MEDIUM-1 drew that line for a durable proof; a
+      // session mint earns it at least as much. The cost is the same as for
+      // linkage: an unconfigured-but-Host-exposed hub must pin an origin (set
+      // hub_origin, or `parachute expose`) before the key door works from
+      // anywhere but loopback.
+      if (pathname === "/api/auth/nostr" || pathname.startsWith("/api/auth/nostr/")) {
+        if (!getDb) return dbNotConfigured();
+        const subpath = pathname.slice("/api/auth/nostr".length);
+        return handleNostrLogin(req, subpath, {
+          db: getDb(),
+          hubBoundOrigins: linkageBoundOrigins({
+            issuerSource: resolveIssuerSource(getDb(), configuredIssuer, loadExposeHubOrigin),
+            issuer: resolveIssuer(req, getDb(), configuredIssuer, loadExposeHubOrigin),
+            loopbackPort,
+            exposeHubOrigin: loadExposeHubOrigin(),
+            platformOrigin: process.env.RENDER_EXTERNAL_URL ?? flyDefaultOrigin(process.env),
+          }),
+        });
+      }
+
       if (pathname === "/api/auth/mint-token") {
         if (!getDb) return dbNotConfigured();
         // Derive the set of registered vault names so the handler can reject a
@@ -3882,6 +3935,46 @@ export function hubFetch(
         });
       }
 
+      // Channel → vault bindings (v23, channel-attached vaults PR 1). The
+      // READ side is authenticated-only: it answers with a vault NAME, which
+      // is not a secret, and the hub cannot verify channel membership anyway
+      // (a NIP-98 request carries no proof of it). The plural operator
+      // surface keeps the host:admin gate POST /vaults has — v1 is
+      // operator-only so a channel cannot annex a hub's storage.
+      if (pathname === "/api/channel-vault") {
+        if (!getDb) return dbNotConfigured();
+        return handleGetChannelVault(req, {
+          db: getDb(),
+          issuer: oauthDeps(req).issuer,
+          knownIssuers: oauthDeps(req).hubBoundOrigins(),
+          manifestPath,
+        });
+      }
+      // One reconcile pass on demand (PR 5). Mounted ABOVE the plural route so
+      // the more specific path wins; both carry the same host:admin gate.
+      if (pathname === "/api/channel-vaults/sync") {
+        if (!getDb) return dbNotConfigured();
+        return handleSyncChannelVaults(req, {
+          db: getDb(),
+          issuer: oauthDeps(req).issuer,
+          knownIssuers: oauthDeps(req).hubBoundOrigins(),
+          manifestPath,
+        });
+      }
+      if (pathname === "/api/channel-vaults") {
+        if (!getDb) return dbNotConfigured();
+        const channelVaultDeps = {
+          db: getDb(),
+          issuer: oauthDeps(req).issuer,
+          knownIssuers: oauthDeps(req).hubBoundOrigins(),
+          manifestPath,
+        };
+        if (req.method === "GET") return handleListChannelVaults(req, channelVaultDeps);
+        if (req.method === "POST") return handleAttachChannelVault(req, channelVaultDeps);
+        if (req.method === "DELETE") return handleDetachChannelVault(req, channelVaultDeps);
+        return new Response("method not allowed", { status: 405 });
+      }
+
       // Canonical login/logout. The handlers themselves are unchanged from
       // when they lived at /admin/login + /admin/logout; the rename surfaced
       // via #231-followup so the URL reflects the surface's actual scope
@@ -3895,13 +3988,17 @@ export function hubFetch(
         return new Response("method not allowed", { status: 405 });
       }
 
-      // /login/2fa — second-factor step (hub#473). POST-only: reached only
-      // after a correct password POST for a 2FA-enrolled user handed back a
-      // pending-login cookie + rendered the challenge page. A bare GET (e.g.
-      // browser back button) has no form to render usefully, so 405 → the
-      // operator restarts at /login.
+      // /login/2fa — second-factor step (hub#473). POST verifies the factor.
+      // GET renders the form for a caller who was REDIRECTED here instead of
+      // being handed it inline (hub#B/4): the Nostr key door answers a
+      // 2FA-enrolled member with `redirect: "/login/2fa"` because its caller
+      // is a fetch(), not a form post, and before the GET that landed on a
+      // bare 405 with the member half-authenticated. The GET renders only
+      // when the pending-login cookie resolves and never consumes it;
+      // otherwise it 302s to /login.
       if (pathname === "/login/2fa") {
         if (!getDb) return dbNotConfigured();
+        if (req.method === "GET") return handleAdminLoginTotpGet(getDb(), req);
         if (req.method === "POST") return handleAdminLoginTotpPost(getDb(), req);
         return new Response("method not allowed", { status: 405 });
       }

@@ -12,8 +12,15 @@
  * grant outside it, and a named composed verb must satisfy `admin`. Legacy
  * `account:vaults` / `account:self:vaults` are coverage wildcards (verb
  * `read`) — they do not cap the verb; first-admin or a write assignee does.
- * Anyone else needs `vaultVerbsForUserVault` to include `admin` (today:
- * `user_vaults.role = 'write'`). A read-only assignee cannot grant.
+ * Anyone else needs `vaultVerbsForUserVault` to include `admin` (only
+ * `user_vaults.role = 'write'` grants it). A `read`- or `member`-role assignee
+ * cannot grant: `member` is read+write WITHOUT admin, so a member principal
+ * can use the vault fully and still not hand it to anyone else.
+ *
+ * Every write here records its grantor on the row (`granted_by_user_id` /
+ * `granted_by_pubkey` / `granted_via`, migration v22) and every revoke emits
+ * a `vault access revoked: …` line to the hub log, so "who did this" is
+ * answerable after the fact rather than reconstructed.
  *
  * First-admin is unrestricted by empty `user_vaults`, not by rows. Granting
  * to the owner's pubkey is a no-op success (`unrestricted: true`); we never
@@ -29,6 +36,7 @@ import { composedVerbSatisfies, isComposedVaultVerb } from "@openparachute/door-
 import { decodeNpub } from "./nip19.ts";
 import { bindPubkeyOperatorAttested, findPubkeyLink, isPubkeyHex } from "./pubkey-links.ts";
 import {
+  type GrantVia,
   UsernameTakenError,
   createUser,
   deleteUser,
@@ -39,7 +47,17 @@ import {
   vaultVerbsForUserVault,
 } from "./users.ts";
 
-export const GRANTABLE_ROLES = ["read", "write"] as const;
+/**
+ * Roles this door may write. Ordered least → most authority.
+ *
+ * `member` sits between `read` and `write`: full data authority on the vault
+ * (read + write) with NO `admin` verb, so a `member` principal cannot re-grant.
+ * `write` still means read+write+admin — unchanged, deliberately, because
+ * that is the shape every existing assignment and every issued token was made
+ * under. `member` is the narrower thing to reach for, not a redefinition of
+ * the broader one.
+ */
+export const GRANTABLE_ROLES = ["read", "member", "write"] as const;
 export type GrantableRole = (typeof GRANTABLE_ROLES)[number];
 
 export class GrantError extends Error {
@@ -56,6 +74,16 @@ export interface GrantCaller {
   userId: string;
   isHubAdmin: boolean;
   authKind: "bearer" | "nostr";
+  /**
+   * The Nostr key that signed this request, when there was one (NIP-98 only;
+   * `AccountMcpPrincipal.pubkey`, hub#937). Recorded as the grantor because
+   * several agent keys routinely share one hub user, so `userId` alone cannot
+   * name the actor. Bearer / CLI / API callers leave it undefined and the row
+   * keeps a NULL pubkey rather than a fabricated one.
+   */
+  pubkey?: string;
+  /** Which door this call came through. Attribution only — never authority. */
+  via?: GrantVia;
   grant: {
     wildcard: string | null;
     vaults: { has(name: string): boolean; get(name: string): string | undefined };
@@ -84,6 +112,10 @@ export interface AccessRow {
   role: string;
   user_id: string;
   username: string;
+  /** Grantor's signing key, or `null` for a pre-v22 / keyless grant. */
+  granted_by_pubkey: string | null;
+  /** Door the grant came through, or `null` when unrecorded. */
+  granted_via: string | null;
 }
 
 function usernameForPubkey(pubkey: string): string {
@@ -127,10 +159,10 @@ export function parseGrantPubkey(raw: unknown): string {
 
 export function parseGrantRole(raw: unknown): GrantableRole {
   if (typeof raw !== "string" || raw.length === 0) {
-    throw new GrantError("invalid_role", "role is required (read or write).");
+    throw new GrantError("invalid_role", "role is required (read, member, or write).");
   }
   if ((GRANTABLE_ROLES as readonly string[]).includes(raw)) return raw as GrantableRole;
-  throw new GrantError("invalid_role", 'role must be "read" or "write".');
+  throw new GrantError("invalid_role", 'role must be "read", "member", or "write".');
 }
 
 export function parseGrantVault(raw: unknown): string {
@@ -163,8 +195,8 @@ function bearerCoversVaultForGrant(
  * NIP-98 hub admins are unrestricted across installed vaults. Bearer
  * `parachute:host:admin` (wildcard `admin`) is too. A Bearer that names a
  * vault subset cannot grant outside it; a named composed verb must satisfy
- * `admin`. Everyone else needs the `admin` verb on the vault
- * (`role = 'write'` today).
+ * `admin`. Everyone else needs the `admin` verb on the vault — only
+ * `role = 'write'` carries it; `member` and `read` do not.
  */
 export function callerCanAdminVault(db: Database, caller: GrantCaller, vaultName: string): boolean {
   if (caller.authKind === "bearer") {
@@ -181,10 +213,29 @@ export function callerCanAdminVault(db: Database, caller: GrantCaller, vaultName
   return verbs?.includes("admin") === true;
 }
 
-async function ensureUserForPubkey(
+/**
+ * Resolve a pubkey to a hub user, creating a key-only account when the key is
+ * unknown ("grant-first"). Idempotent: an already-linked key returns its user
+ * and `created: false` WITHOUT touching the existing `user_pubkeys` row — the
+ * label a key was first bound under is history and must not be rewritten by
+ * whoever happens to grant next.
+ *
+ * Exported for the channel membership reconciler (PR 5), which needs exactly
+ * this — including the username-collision and lost-race handling, which is the
+ * fiddly part and must not be reimplemented — but binds new keys under a
+ * `channel:<relay-host>:<channel-id>` label instead of the default `grant`, so
+ * `user_pubkeys` records WHERE an account came from. The reconciler is the
+ * caller most likely to create accounts in bulk, and "this account exists
+ * because it was in that channel" is the fact an operator will want later.
+ *
+ * Throws {@link GrantError} — `no_hub_owner` on an empty hub, `username_taken`
+ * / `pubkey_taken` when the key cannot be given an account.
+ */
+export async function ensureUserForPubkey(
   db: Database,
   pubkey: string,
   now: () => Date,
+  opts: { label?: string } = {},
 ): Promise<{ userId: string; username: string; created: boolean }> {
   const existing = findPubkeyLink(db, pubkey);
   if (existing) {
@@ -259,7 +310,7 @@ async function ensureUserForPubkey(
   const bound = bindPubkeyOperatorAttested(db, {
     userId: user.id,
     pubkey,
-    label: "grant",
+    label: opts.label ?? "grant",
     now: now(),
   });
   if (!bound.ok) {
@@ -310,7 +361,11 @@ export async function grantAccess(
     };
   }
 
-  const ok = upsertUserVault(db, target.userId, vault, role, now);
+  const ok = upsertUserVault(db, target.userId, vault, role, now, {
+    grantedByUserId: caller.userId,
+    grantedByPubkey: caller.pubkey ?? null,
+    grantedVia: caller.via ?? null,
+  });
   if (!ok) {
     throw new GrantError("server_error", "Failed to write the vault grant.");
   }
@@ -350,6 +405,16 @@ export function revokeAccess(
     );
   }
   const revoked = removeUserVault(db, link.userId, vault);
+  if (revoked) {
+    // Audit line in the same `key=value` shape as admin-clients.ts's
+    // approve/delete lines, so "who took this access away" is greppable in
+    // hub.log. The row itself is gone by design (revoke is a delete, not a
+    // tombstone), so the log is the only place this survives.
+    console.log(
+      `vault access revoked: vault=${vault} subject_pubkey=${pubkey} subject_user_id=${link.userId} ` +
+        `actor_user_id=${caller.userId} actor_pubkey=${caller.pubkey ?? ""} via=${caller.via ?? ""}`,
+    );
+  }
   return { pubkey, vault, revoked };
 }
 
@@ -378,10 +443,19 @@ export function listAccess(
 
   const rows = db
     .query<
-      { pubkey: string; vault_name: string; role: string; user_id: string; username: string },
+      {
+        pubkey: string;
+        vault_name: string;
+        role: string;
+        user_id: string;
+        username: string;
+        granted_by_pubkey: string | null;
+        granted_via: string | null;
+      },
       []
     >(
-      `SELECT up.pubkey, uv.vault_name, uv.role, u.id AS user_id, u.username
+      `SELECT up.pubkey, uv.vault_name, uv.role, u.id AS user_id, u.username,
+              uv.granted_by_pubkey, uv.granted_via
        FROM user_vaults uv
        JOIN users u ON u.id = uv.user_id
        JOIN user_pubkeys up ON up.user_id = uv.user_id
@@ -400,6 +474,8 @@ export function listAccess(
       role: r.role,
       user_id: r.user_id,
       username: r.username,
+      granted_by_pubkey: r.granted_by_pubkey ?? null,
+      granted_via: r.granted_via ?? null,
     });
   }
   return { access };

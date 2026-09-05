@@ -6,6 +6,189 @@ All notable changes to `@openparachute/hub` are documented here. The format foll
 >
 > This backfill covers the 0.6.x line only. Two pre-existing gaps remain undocumented and are **not** addressed here: the `0.5.13` stable itself (the file's newest entry is `0.5.13-rc.48`, never the stable) and the entire `0.5.14-rc` chain (rc.1–rc.21 on npm), which never promoted to a `0.5.14` stable — its work folded forward into 0.6.0.
 
+## [0.7.19-rc.4] - 2026-09-05
+
+**Channel-attached vaults, the human key door, and grant attribution.**
+Seventeen PRs on `next` after 0.7.19-rc.3, cut as a `next` → `main` batch.
+Version bump only; no new code in this commit. Merging this to `main`
+publishes `@rc` (this rc is ahead of `@latest` 0.7.18, so `@rc` stays a safe
+channel to point a box at). Four schema migrations run on upgrade — v21, v22,
+v23, v24 — all additive.
+
+### Channel-attached vaults — membership becomes access
+
+- **Buzz channels bind to vaults (#947).** Migration **v23** adds
+  `channel_vaults(relay_host, channel_id, vault, mode, relay_self_pubkey,
+  synced_at, created_at)` keyed on `(relay_host, channel_id)`, plus an inverse
+  index on `vault`. `relay_host` is stored lower-cased and scheme-less to match
+  parachute-mcp's `relayHostOf`, so a case difference cannot fork one channel
+  into two bindings. `GET /api/channel-vault` is an authenticated-only lookup;
+  `GET/POST/DELETE /api/channel-vaults` is the operator surface on
+  `parachute:host:admin`; `parachute vault attach-channel|detach-channel|
+  list-channels` is the thin loopback client. Deleting a vault cascades to its
+  bindings. Binding only — no roster fetch, no grants, no reconciler.
+
+- **Channel roster fetcher (#948).** The hub can now ask a Buzz relay who is in
+  a channel and prove the answer came from the relay: NIP-11 `self` fetch, a
+  NIP-98-signed `POST /query` for `{kinds:[39002], "#d":[channel]}`, signature
+  verified against `self`, and `["p", pubkey, "", role]` parsed into typed
+  entries. The relay key is pinned trust-on-first-use; a later `self` that
+  differs is `relay_key_changed` — refused, never re-pinned. Introduces the
+  hub's Buzz reader key (`PARACHUTE_BUZZ_NSEC_FILE`, default
+  `<PARACHUTE_HOME>/buzz-reader.nsec`): a **path**, never an inline env secret,
+  because the environment is readable by same-uid processes, inherited by every
+  module the supervisor spawns, and printed by crash reporters. No key
+  configured is `not_configured`, not a boot failure. Every remote failure is a
+  value, never a throw, and the binding row is untouched on every failure path.
+
+- **Channel membership reconciler (#950).** Every `sync` binding is polled once
+  a minute and the relay-signed roster becomes ordinary `user_vaults` rows, so
+  every existing chokepoint (`vaultVerbsForUserVault`, `callerCanAdminVault`,
+  the OAuth mint cap) works unchanged and nothing downstream knows a Buzz
+  channel exists. Role map: owner/admin/member/bot land as `member` (read+write,
+  **not** granting), guest as `read`; `write` and `admin` are unreachable from
+  this module by construction, because a channel owner is not a hub granter.
+  Provenance reuses v22's `granted_via` — rows the reconciler writes carry
+  `granted_via = 'channel:<relay-host>:<channel-id>'` and the removal sweep
+  matches that string exactly, scoped to the bound vault, so an operator grant
+  (NULL / `mcp` / `cli` / `api`) is invisible to the sweep. Freeze on outage: on
+  any failure the binding is untouched. Migration **v24** adds
+  `channel_vaults.last_error` + `last_attempt_at` so a frozen binding is legible
+  instead of merely stale; both are diagnostics, never authority.
+
+- **Live membership subscription (#953).** One authenticated outbound websocket
+  per bound relay turns a membership change into a reconcile in one round trip
+  instead of one poll interval. It changes only **when** a reconcile runs, never
+  what it does — no grant is written or removed from a live event; the signed
+  39002 roster stays the single source of truth. A channel-scoped REQ per bound
+  channel for kind 39002 is the real edge (44100/44101 are in Buzz's
+  `P_GATED_KINDS`, so the filter the design named is refused outright and the
+  accepted `#p` form fires only when the hub's own reader key is seated or
+  unseated; that narrow sub is opened too). Events are acted on only when they
+  verify and their signer equals the binding's pinned `relay_self_pubkey`.
+  Every failure is inert: the 60-second poll is the backstop.
+
+- **`no_roster` and `unparseable_roster` are separate failures (#958).**
+  `selectRosterEvent` skipped parse failures, so an empty `/query` result and a
+  39002-shaped object that failed NIP-01 both landed as `no_roster` — and since
+  `channel_vaults.last_error` stores the reason word rather than the detail,
+  `doctor` and `vault channels` could not tell "the relay has no roster for this
+  channel" from "the relay answered with something malformed". The new
+  `unparseable_roster` code separates them. An empty result, or well-formed
+  events for another kind or channel, stay `no_roster`; a valid 39002 for this
+  channel still wins when one is present.
+
+### The human key door
+
+- **Nostr key door — challenge, verify, session mint, 2FA divert (#949).** A
+  key-only user has an unusable random password, so both password doors are shut
+  and NIP-98 mints no session — they can drive MCP and the CLI but never reach
+  `/account` or the OAuth consent screen. `GET /api/auth/nostr/challenge` issues
+  a single-use nonce plus the exact kind-27235 template to sign;
+  `POST /api/auth/nostr/verify` checks ±5 min skew, the `u` tag against
+  `linkageBoundOrigins` (request-derived issuer dropped, hub#833 MEDIUM-1),
+  consumes the nonce before anything is minted, and mints through the password
+  door's own `mintSessionAndRedirect`. Unlinked keys are refused and
+  auto-provision is not consulted. A TOTP-enrolled user is diverted to the
+  second factor by default; `PARACHUTE_NOSTR_LOGIN_2FA=off` is the only spelling
+  that skips it. The door never writes grants.
+
+- **Nostr key door UI (#951).** A "Sign in with Nostr key" section on both login
+  pages — `renderAdminLogin` (`/login`) and the `/oauth/authorize` login view —
+  from one module so the two cannot drift. Emitted `hidden` + `disabled`, so a
+  no-JS page is byte-for-byte today's page and the password form is untouched.
+  NIP-07 only: no NIP-46, no nsec paste. Adds `GET /login/2fa`, closing #949's
+  documented gap where a key-door caller handed `redirect: "/login/2fa"` landed
+  on a 405 half-authenticated.
+
+### Grants, tokens, roles
+
+- **The live operator token is protected from revoke, and the revoking actor is
+  recorded (#944, hub#931).** `parachute auth revoke-token <jti>` and
+  `POST /api/auth/revoke-token` could revoke the jti in
+  `~/.parachute/operator.token` — which 401s every start/stop/restart/upgrade
+  while the token file still parses and `doctor` still says issuer-matches (it
+  happened on a 0.7.18-rc.11 upgrade). Both surfaces now refuse it unless
+  break-glass is explicit (`--break-glass` / `break_glass: true`); HTTP answers
+  409 `live_operator_token`. Migration **v21** adds `tokens.revoked_by` +
+  `tokens.revoked_via` (HTTP records the bearer `sub` + `http`, the CLI records
+  `cli:<unix user>` + `cli`), both surfaced additively on
+  `GET /api/auth/tokens`; actor-less internal sweeps keep NULL — unrecorded, not
+  fabricated.
+
+- **`member` role, grant attribution, and a `doctor` Grants group (#945).**
+  `write` implied `admin`, so every write-granted principal could re-grant its
+  vault to anyone. The new `member` role is `["read","write"]` — the same data
+  authority with no re-grant; `grant-access` / `revoke-access` / `list-access`
+  are hidden from a member principal's `tools/list` and refused if called.
+  `write` is unchanged. Migration **v22** adds nullable `granted_by_user_id`,
+  `granted_by_pubkey`, and `granted_via` to `user_vaults`, recorded on every new
+  grant and surfaced on `list-access`; no backfill, because a value invented for
+  a pre-migration row would be a fabricated audit trail. `parachute doctor`
+  gains a Grants group with one row per assignment plus a least-privilege WARN.
+
+- **OAuth token response carries `vault` again (#946).** `singleVaultName`
+  projects `vault` onto the token and refresh responses when the granted scopes
+  name exactly one vault, and omits it when they name none or several rather
+  than picking one arbitrarily.
+
+### Fixes
+
+- **Lone UTF-16 surrogates are refused at NIP-01 parse (#956, hub#863).** NIP-01
+  id hashing is defined over UTF-8; JS `JSON.stringify("\uD800")` emits the
+  ASCII escape `\ud800` while UTF-8 implementations substitute U+FFFD or refuse,
+  so the two serializations hash differently. `parseNostrEvent` now rejects
+  `content` or any tag element that is not well-formed UTF-16, with the same
+  coarse field reason as other shape failures (HTTP maps those to
+  `invalid_event`). Paired surrogates — every real non-BMP character — still
+  pass. Also pins a known-answer id against `nostr-tools@2` `getEventHash`.
+
+- **`status` recovers the shim launch cwd for served-drift (#957, hub#783).**
+  `detectServedResolution` hardcoded the supervisor cwd as `/`, which is right
+  for launchd/systemd but silent for a hub launched from another bare directory:
+  the shim inherits that cwd, `Bun.resolveSync` from there can still land on the
+  install cache, and the comparison against `/` stayed quiet.
+  `resolveShimLaunchCwd` now walks a cascade — supervisor-recorded child cwd,
+  else `/proc/<pid>/cwd` on Linux, else the module's `installDir`, else `/` — so
+  the supervised production path is unchanged and the bare-directory launch now
+  reports SERVED-DRIFT.
+
+### Follow-ups, CI, and tests
+
+- **Review nits from the 2026-09-03 merges (#952).** Six parked comments from
+  #945–#950 swept together: the grant-attribution columns are v22 not v21 after
+  the renumber (comments and test labels corrected; the remaining v21 references
+  are correct), a two-named-vault token response is covered end to end, and the
+  `channel_vaults` migration test pins its predecessor exactly instead of
+  asserting `>= 21`.
+
+- **Reader-key warn rate limit, NOTICE logging, backoff test, and the reconciler
+  gate re-arms (#954).** The group/other-readable key warning was firing on
+  every `loadBuzzReaderKey` call — N+1 times per 60s poll — and is now once per
+  path per minute. Subscription NOTICE frames log through the same rate-limited
+  logger CLOSED uses instead of being dropped. `startChannelReconciler` arms the
+  poll unconditionally rather than gating on the reader key at boot, so a hub
+  started before the key existed (or before a typo in it was fixed) still gets a
+  timer to re-check from — no restart needed to opt in.
+
+- **Container smoke also gates PRs into `next` (#955, closes #845).**
+  `container-smoke.yml` triggered on PRs into `main` only, so every merge-train
+  feature PR skipped the Docker build + HTTP smoke and the container-deploy
+  class of bug was caught first on the release PR. Cost: one ~15-minute-bounded
+  smoke job per PR into `next`.
+
+- **Bounded hub CI and isolated git credentials (#942).** Timeouts on the
+  workflow jobs, and `surface-command.test.ts` no longer inherits ambient git
+  credentials.
+
+- **`/v/<vault>/n/<note>` pinned as an app route the SPA tail must shell
+  (#943).** The app's vault-scoped note address reaches the app only because
+  nothing on the hub claims `/v` — a fact by absence, and the kind that
+  regresses silently with the symptom landing in a different repo. Two guards,
+  no behaviour change.
+
+Do not suffix-drop 0.7.19 until this rc has lived.
+
 ## [0.7.19-rc.3] - 2026-09-02
 
 **npub-shaped operator input, and per-agent attribution on the account-MCP

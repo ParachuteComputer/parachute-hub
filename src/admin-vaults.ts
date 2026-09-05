@@ -73,6 +73,7 @@ import {
   requireScope,
 } from "./admin-auth.ts";
 import { type ConnectionsDeps, teardownConnection } from "./admin-connections.ts";
+import { removeChannelVaultsForVault } from "./channel-vaults.ts";
 import { SERVICES_MANIFEST_PATH } from "./config.ts";
 import { readConnections } from "./connections-store.ts";
 import { rewriteGrantsRemovingVault } from "./grants.ts";
@@ -713,6 +714,13 @@ interface CascadeSummary {
   user_vaults_removed: number;
   invites_invalidated: number;
   vault_cap_removed: boolean;
+  /**
+   * `channel_vaults` bindings dropped (v23). A binding that outlived its
+   * vault would point a later reconciler at a name that no longer resolves —
+   * or, worse, at a re-created same-name vault whose operator never attached
+   * that channel.
+   */
+  channel_vaults_removed: number;
   connections_torn_down: number;
   /**
    * Vault-backed channel-daemon entries still referencing the deleted vault
@@ -733,6 +741,7 @@ function emptyCascadeSummary(): CascadeSummary {
     user_vaults_removed: 0,
     invites_invalidated: 0,
     vault_cap_removed: false,
+    channel_vaults_removed: 0,
     connections_torn_down: 0,
     orphaned_channels: [],
     vault_removed: false,
@@ -918,6 +927,11 @@ export async function handleDeleteVault(
   // --- 4b. Per-vault storage cap row (v15). ----------------------------------
   // A re-created same-name vault must not inherit a stale cap; drop it.
   summary.vault_cap_removed = removeVaultCap(deps.db, name) > 0;
+
+  // --- 4c. Channel → vault bindings (v23). ----------------------------------
+  // Same reason as the cap row: a re-created same-name vault must not inherit
+  // a channel attachment nobody made for it.
+  summary.channel_vaults_removed = removeChannelVaultsForVault(deps.db, name);
 
   // --- 5. Connections teardown (+ legacy channel scan, report-only). --------
   // Runs BEFORE the CLI remove so the vault daemon is still alive to accept

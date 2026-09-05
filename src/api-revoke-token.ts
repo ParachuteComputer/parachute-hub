@@ -33,26 +33,48 @@
  * but not yours" leaks nothing beyond what it already holds — and returning
  * idempotent-ok there would be a lie (it revoked nothing).
  *
- * Body: `{ jti: string }`.
+ * LIVE-OPERATOR-TOKEN GUARD (hub#931). Independent of, and applied AFTER,
+ * the authority checks above: the jti sitting in `~/.parachute/operator.token`
+ * is refused with 409 even for a `parachute:host:auth` bearer. That
+ * credential is what on-box module-ops (`start`/`stop`/`restart`/`upgrade`)
+ * authenticates with, so revoking it 401s the box's lifecycle verbs while the
+ * token file — and `doctor`'s issuer check — still look fine. `break_glass:
+ * true` in the body waives the guard and nothing else. 409 rather than 403
+ * because this is a REFUSAL ON STATE, not a scope failure: the same bearer
+ * revoking any other jti succeeds, and the same jti becomes revocable the
+ * moment `rotate-operator` replaces the file.
+ *
+ * Body: `{ jti: string, break_glass?: boolean }`.
  *
  * Responses (OAuth 2.0 error-shape vocabulary, matching mint-token):
  *
  *   - 200 `{ jti, revoked_at }` — success. Idempotent: re-revoking an
  *     already-revoked jti returns the existing `revoked_at` and 200.
- *   - 400 `invalid_request` — missing/malformed body, missing jti.
+ *   - 400 `invalid_request` — missing/malformed body, missing jti,
+ *     non-boolean `break_glass`.
  *   - 401 `unauthenticated` — missing or invalid bearer.
  *   - 403 `insufficient_scope` — bearer holds no minting authority (entry
  *     gate), or the target jti carries a scope the bearer couldn't have
  *     minted (per-jti authority check).
  *   - 404 `not_found` — no `tokens` row matches the jti.
  *   - 405 `method_not_allowed` — non-POST.
+ *   - 409 `live_operator_token` — the jti is the live operator token and
+ *     `break_glass` was not set.
  *
  * Identity field in audit-friendly success: not echoed in the response
  * body (the JSON shape is intentionally minimal — `jti` + `revoked_at`
- * is all a UI consumer needs); operator-side audit lives in hub logs.
+ * is all a UI consumer needs); operator-side audit lives in hub logs (a
+ * `token revoked: ...` key=value line) and, durably, in the row's
+ * `revoked_by` / `revoked_via` columns.
  */
 import type { Database } from "bun:sqlite";
-import { findTokenRowByJti, revokeTokenByJti, validateAccessToken } from "./jwt-sign.ts";
+import {
+  type RevokeActor,
+  findTokenRowByJti,
+  revokeTokenByJti,
+  validateAccessToken,
+} from "./jwt-sign.ts";
+import { liveOperatorTokenRevokeRefusal, readOperatorTokenJti } from "./operator-token.ts";
 import { MINT_HOST_AUTH_SCOPE, canGrant, hasMintingAuthority } from "./scope-attenuation.ts";
 
 /**
@@ -84,10 +106,19 @@ export interface ApiRevokeTokenDeps {
   knownIssuers?: readonly string[];
   /** Test seam for time. */
   now?: () => Date;
+  /**
+   * The jti of the operator token currently on disk, or null when there
+   * isn't one — the live-operator-token guard's input (hub#931). Defaults to
+   * reading `~/.parachute/operator.token`, which is the same file the hub
+   * process's own `PARACHUTE_HOME` resolves to. A seam, so tests don't need
+   * to plant a real token file.
+   */
+  liveOperatorJti?: () => string | null;
 }
 
 interface RevokeTokenRequest {
   jti?: unknown;
+  break_glass?: unknown;
 }
 
 export async function handleApiRevokeToken(
@@ -111,6 +142,7 @@ export async function handleApiRevokeToken(
 
   // 2. Bearer validation (signature, issuer, expiry, hub-side revocation).
   let bearerScopes: string[];
+  let bearerSub: string;
   try {
     const validated = await validateAccessToken(
       deps.db,
@@ -120,6 +152,7 @@ export async function handleApiRevokeToken(
     if (typeof validated.payload.sub !== "string" || validated.payload.sub.length === 0) {
       return jsonError(401, "unauthenticated", "bearer token has no sub claim");
     }
+    bearerSub = validated.payload.sub;
     bearerScopes =
       typeof validated.payload.scope === "string"
         ? validated.payload.scope.split(/\s+/).filter((s) => s.length > 0)
@@ -167,6 +200,12 @@ export async function handleApiRevokeToken(
   if (body.jti.length > MAX_JTI_LENGTH) {
     return jsonError(400, "invalid_request", `jti exceeds ${MAX_JTI_LENGTH}-character maximum`);
   }
+  // Strict boolean. A truthy string ("false", "0") must NOT waive a safety
+  // guard by accident — absent means false, anything non-boolean is a 400.
+  if (body.break_glass !== undefined && typeof body.break_glass !== "boolean") {
+    return jsonError(400, "invalid_request", "break_glass must be a boolean when present");
+  }
+  const breakGlass = body.break_glass === true;
   const jti = body.jti;
 
   // 5. Lookup + per-jti authority + revoke. Order: row-existence first
@@ -216,8 +255,16 @@ export async function handleApiRevokeToken(
     return ok({ jti, revoked_at: existing.revokedAt });
   }
 
+  // Live-operator-token guard (hub#931). Applied after the authority checks
+  // and after the idempotent already-revoked short-circuit — a jti that is
+  // already revoked has nothing left to protect.
+  if (!breakGlass && jti === (deps.liveOperatorJti ?? readOperatorTokenJti)()) {
+    return jsonError(409, "live_operator_token", liveOperatorTokenRevokeRefusal(jti));
+  }
+
   const now = deps.now?.() ?? new Date();
-  const flipped = revokeTokenByJti(deps.db, jti, now);
+  const actor: RevokeActor = { by: bearerSub, via: "http" };
+  const flipped = revokeTokenByJti(deps.db, jti, now, actor);
   if (!flipped) {
     // Race: row vanished or was concurrently revoked between our lookup
     // and the UPDATE. Re-read to surface the now-current revoked_at if
@@ -229,6 +276,12 @@ export async function handleApiRevokeToken(
     }
     return jsonError(404, "not_found", `no token with jti ${jti} found in registry`);
   }
+  // Audit line in the hub log, same `key=value` shape the CLI path appends,
+  // so "who revoked this" is greppable across both surfaces. The durable
+  // record is the row's revoked_by / revoked_via.
+  console.log(
+    `token revoked: jti=${jti} revoked_by=${actor.by} revoked_via=${actor.via}${breakGlass ? " break_glass=1" : ""}`,
+  );
   return ok({ jti, revoked_at: now.toISOString() });
 }
 

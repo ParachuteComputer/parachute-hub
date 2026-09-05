@@ -4,6 +4,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  type TokenResponse,
   checkAuthorizationServerMetadata,
   checkProtectedResourceMetadata,
   checkTokenResponseInvariants,
@@ -2409,21 +2410,23 @@ describe("handleToken — full OAuth dance", () => {
         loadServicesManifest: fixtureLoadServicesManifest,
       });
       expect(tokenRes.status).toBe(200);
-      const tokenBody = (await tokenRes.json()) as {
-        access_token: string;
+      const tokenBody = (await tokenRes.json()) as TokenResponse & {
         refresh_token: string;
-        token_type: string;
-        expires_in: number;
-        scope: string;
         services: Record<string, { url: string; version: string }>;
       };
       expect(tokenBody.token_type).toBe("Bearer");
       expect(tokenBody.scope).toBe("vault:default:read");
+      expect(tokenBody.vault).toBe("default");
       expect(tokenBody.refresh_token.length).toBeGreaterThan(20);
       // H1.2 — door-contract conformance: token_type/expires_in/scope/access_token
       // invariants against a REAL `POST /oauth/token` success body (V1.4/C1.4 twin
       // coverage, hub half).
-      expect(checkTokenResponseInvariants(tokenBody, "vault:default:read")).toEqual([]);
+      expect(
+        checkTokenResponseInvariants(
+          tokenBody as unknown as Record<string, unknown>,
+          "vault:default:read",
+        ),
+      ).toEqual([]);
 
       // JWT must verify against the hub's signing keys, with the right sub +
       // aud (named `vault:default:read` → "vault.default" — RFC 8707-style
@@ -2527,6 +2530,9 @@ describe("handleToken — full OAuth dance", () => {
 
       const first = await exchange();
       expect(first.status).toBe(200);
+      const firstBody = (await first.json()) as TokenResponse;
+      expect(firstBody.scope).toBe("surface:read");
+      expect(firstBody).not.toHaveProperty("vault");
       const second = await exchange();
       expect(second.status).toBe(400);
       const err = (await second.json()) as Record<string, unknown>;
@@ -2580,7 +2586,8 @@ describe("handleToken — full OAuth dance", () => {
         }),
         { issuer: ISSUER },
       );
-      const initial = (await tokenRes.json()) as { refresh_token: string };
+      const initial = (await tokenRes.json()) as TokenResponse & { refresh_token: string };
+      expect(initial.vault).toBe("default");
 
       const refreshForm = new URLSearchParams({
         grant_type: "refresh_token",
@@ -2598,8 +2605,9 @@ describe("handleToken — full OAuth dance", () => {
         { issuer: ISSUER, now: () => rotateAt },
       );
       expect(refreshRes.status).toBe(200);
-      const rotated = (await refreshRes.json()) as { refresh_token: string };
+      const rotated = (await refreshRes.json()) as TokenResponse & { refresh_token: string };
       expect(rotated.refresh_token).not.toBe(initial.refresh_token);
+      expect(rotated.vault).toBe("default");
 
       // Old refresh token replayed PAST the one-generation grace window
       // should fail (revoked) — the immediate-predecessor grace (hub#685)
@@ -2617,6 +2625,87 @@ describe("handleToken — full OAuth dance", () => {
       expect(replayRes.status).toBe(400);
       const err = (await replayRes.json()) as Record<string, unknown>;
       expect(err.error).toBe("invalid_grant");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("token and refresh responses omit `vault` when scopes name two vaults", async () => {
+    // hub#946 projects `vault` only when the granted scopes name EXACTLY ONE
+    // vault (`singleVaultName`) — the single-vault case is covered above
+    // ("authorize → token → validate JWT" asserts `vault: "default"`) and
+    // the no-vault case is covered by "auth code is single-use" (`surface:read`
+    // asserts no `vault` key). This is the third leg: two NAMED vaults is
+    // ambiguous, not absent, so the field must still be omitted rather than
+    // picking one arbitrarily.
+    const { db, cleanup } = await makeDb();
+    try {
+      const user = await createUser(db, "owner", "pw");
+      const session = createSession(db, { userId: user.id });
+      const reg = registerClient(db, { redirectUris: ["https://app.example/cb"] });
+      const { verifier, challenge } = makePkce();
+      const consentForm = new URLSearchParams({
+        __action: "consent",
+        __csrf: TEST_CSRF,
+        approve: "yes",
+        client_id: reg.client.clientId,
+        redirect_uri: "https://app.example/cb",
+        response_type: "code",
+        // Two NAMED vault scopes — no picker involved (unnamed `vault:<verb>`
+        // is the only form that needs one), so this passes straight through
+        // like the single-vault test above.
+        scope: "vault:default:read vault:other:write",
+        code_challenge: challenge,
+        code_challenge_method: "S256",
+      });
+      const consentReq = new Request(`${ISSUER}/oauth/authorize`, {
+        method: "POST",
+        body: consentForm,
+        headers: {
+          "content-type": "application/x-www-form-urlencoded",
+          cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, 86400)}`,
+        },
+      });
+      const consentRes = await handleAuthorizePost(db, consentReq, { issuer: ISSUER });
+      const code = new URL(consentRes.headers.get("location") ?? "").searchParams.get("code");
+      const tokenForm = new URLSearchParams({
+        grant_type: "authorization_code",
+        code: code ?? "",
+        client_id: reg.client.clientId,
+        redirect_uri: "https://app.example/cb",
+        code_verifier: verifier,
+      });
+      const tokenRes = await handleToken(
+        db,
+        new Request(`${ISSUER}/oauth/token`, {
+          method: "POST",
+          body: tokenForm,
+          headers: { "content-type": "application/x-www-form-urlencoded" },
+        }),
+        { issuer: ISSUER },
+      );
+      expect(tokenRes.status).toBe(200);
+      const initial = (await tokenRes.json()) as TokenResponse & { refresh_token: string };
+      expect(initial.scope).toBe("vault:default:read vault:other:write");
+      expect(initial).not.toHaveProperty("vault");
+
+      const refreshForm = new URLSearchParams({
+        grant_type: "refresh_token",
+        refresh_token: initial.refresh_token,
+        client_id: reg.client.clientId,
+      });
+      const refreshRes = await handleToken(
+        db,
+        new Request(`${ISSUER}/oauth/token`, {
+          method: "POST",
+          body: refreshForm,
+          headers: { "content-type": "application/x-www-form-urlencoded" },
+        }),
+        { issuer: ISSUER },
+      );
+      expect(refreshRes.status).toBe(200);
+      const rotated = (await refreshRes.json()) as TokenResponse & { refresh_token: string };
+      expect(rotated).not.toHaveProperty("vault");
     } finally {
       cleanup();
     }

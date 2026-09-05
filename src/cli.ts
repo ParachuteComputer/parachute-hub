@@ -1063,6 +1063,29 @@ async function main(argv: string[]): Promise<number> {
         return await rm.vaultRemove(rest.slice(1));
       }
 
+      // Channel → vault bindings (v23, channel-attached vaults PR 1). Hub-side
+      // verbs — `parachute-vault` knows nothing about Buzz channels — so they
+      // are intercepted here rather than forwarded. They drive the running hub
+      // over loopback for the same reason `remove` does: attaching may CREATE a
+      // vault, and the hub already owns that orchestration.
+      // The literal list is repeated here (rather than imported) so the
+      // passthrough for every OTHER vault verb doesn't pay for loading the
+      // command module; `CHANNEL_SUBCOMMANDS` in that module is the canonical
+      // set and a test pins the two together.
+      if (
+        sub === "attach-channel" ||
+        sub === "detach-channel" ||
+        sub === "list-channels" ||
+        sub === "sync-channels"
+      ) {
+        const ch = await loadCommand(
+          "vault-channels",
+          () => import("./commands/vault-channels.ts"),
+        );
+        if (!ch) return 1;
+        return await ch.vaultChannels(sub, rest.slice(1));
+      }
+
       // Everything else under `vault` forwards transparently to `parachute-vault`.
       // `vault tokens create` used to route through a guided interactive
       // wrapper, but the pvt_* DROP (vault#412 / hub#466) removed that vault

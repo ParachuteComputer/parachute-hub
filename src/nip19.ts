@@ -43,8 +43,12 @@ const GENERATOR = [0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3];
 /** bech32 (not bech32m) checksum constant. NIP-19 is plain bech32. */
 const BECH32_CONST = 1;
 
-/** An npub is `npub` + `1` + 52 data chars (32 bytes @ 5 bits) + 6 checksum. */
-const NPUB_LENGTH = 63;
+/**
+ * An `npub`/`nsec` is the 4-char hrp + `1` + 52 data chars (32 bytes @ 5 bits)
+ * + 6 checksum characters. Both NIP-19 forms carry exactly 32 bytes, so both
+ * are exactly this long.
+ */
+const KEY_BECH32_LENGTH = 63;
 
 /** x-only key size in bytes. */
 const PUBKEY_BYTES = 32;
@@ -99,10 +103,40 @@ function wordsToBytes(words: readonly number[]): Uint8Array | null {
  * this never throws.
  */
 export function decodeNpub(input: string): string | null {
-  if (input.length !== NPUB_LENGTH) return null;
-  if (!input.startsWith("npub1")) return null;
+  return decodeKeyBech32(input, "npub");
+}
 
-  const data = input.slice("npub1".length);
+/**
+ * Decode a lowercase NIP-19 `nsec1…` into 64-char lowercase hex.
+ *
+ * Same decoder, different human-readable part. It exists for exactly one
+ * caller — `buzz-reader-key.ts`, which loads the hub's Buzz reader key from a
+ * file an operator wrote in the form their Buzz client showed them. Everything
+ * the `npub` doc says about bech32 being a typo guard rather than a credential
+ * applies here in reverse: the checksum catches a truncated paste, it does not
+ * make the value less secret.
+ *
+ * **The return value is a private key.** Never log it, never put it in an
+ * error message, never let it reach `process.argv`. `decodeNsec` deliberately
+ * returns `null` rather than throwing, because a thrown bech32 error is the
+ * classic way a secret ends up in a stack trace (see also `new URL()` echoing
+ * its whole input).
+ */
+export function decodeNsec(input: string): string | null {
+  return decodeKeyBech32(input, "nsec");
+}
+
+/**
+ * Shared bech32 body for the two 32-byte NIP-19 forms. Returns lowercase hex,
+ * or `null` for a wrong hrp, a bad checksum, an illegal character, any
+ * uppercase, or non-canonical padding. Never throws — the caller owns the
+ * error message, and for `nsec` the input must never appear in one.
+ */
+function decodeKeyBech32(input: string, hrp: "npub" | "nsec"): string | null {
+  if (input.length !== KEY_BECH32_LENGTH) return null;
+  if (!input.startsWith(`${hrp}1`)) return null;
+
+  const data = input.slice(hrp.length + 1);
   const words: number[] = [];
   for (const char of data) {
     const value = CHARSET.indexOf(char);
@@ -110,12 +144,12 @@ export function decodeNpub(input: string): string | null {
     words.push(value);
   }
 
-  if (polymod([...hrpExpand("npub"), ...words]) !== BECH32_CONST) return null;
+  if (polymod([...hrpExpand(hrp), ...words]) !== BECH32_CONST) return null;
 
   const bytes = wordsToBytes(words.slice(0, -6));
   // `wordsToBytes` can still return null (non-canonical padding). The
   // `PUBKEY_BYTES` half is belt, not brace: 63 chars fixes the payload at 52
-  // words = 32 bytes exactly, so a wrong-length npub is already rejected by
+  // words = 32 bytes exactly, so a wrong-length key is already rejected by
   // the gate on the first line — this can never be the reason. Kept so the
   // 32-byte contract is stated where the bytes are produced rather than
   // inferred from an arithmetic identity three lines up.

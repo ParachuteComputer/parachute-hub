@@ -4,7 +4,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { handleApiRevokeToken } from "../api-revoke-token.ts";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
-import { findTokenRowByJti, recordTokenMint, signAccessToken } from "../jwt-sign.ts";
+import {
+  findTokenRowByJti,
+  recordTokenMint,
+  revokeTokenByJti,
+  signAccessToken,
+} from "../jwt-sign.ts";
 import { mintOperatorToken } from "../operator-token.ts";
 import { rotateSigningKey } from "../signing-keys.ts";
 import { createUser } from "../users.ts";
@@ -717,6 +722,152 @@ describe("POST /api/auth/revoke-token — capability attenuation (symmetric to h
         const body = (await resp.json()) as { error: string; error_description: string };
         expect(body.error).toBe("invalid_request");
         expect(body.error_description).toContain("256");
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+});
+
+/**
+ * Live-operator-token guard + revocation-actor recording (hub#931). The bug:
+ * a `parachute:host:auth` bearer could revoke the jti sitting in
+ * `~/.parachute/operator.token`, which 401s every module-ops call on the box,
+ * and the registry recorded nothing about who did it.
+ */
+describe("POST /api/auth/revoke-token — live operator token + actor (hub#931)", () => {
+  test("409 when the target jti is the live operator token and no break_glass", async () => {
+    const h = makeHarness();
+    try {
+      const { db, userId } = await bootstrap(h.dir);
+      try {
+        const op = await mintOperatorToken(db, userId, { issuer: ISSUER });
+        const victim = await seedToken(db, userId);
+        const resp = await handleApiRevokeToken(
+          jsonRequest({ jti: victim }, { authorization: `Bearer ${op.token}` }),
+          { db, issuer: ISSUER, liveOperatorJti: () => victim },
+        );
+        expect(resp.status).toBe(409);
+        const body = (await resp.json()) as { error: string; error_description: string };
+        expect(body.error).toBe("live_operator_token");
+        // The refusal NAMES the reason, not just "forbidden".
+        expect(body.error_description).toContain("live operator token");
+        expect(body.error_description).toContain("module-ops");
+        expect(body.error_description).toContain("rotate-operator");
+        // And the row is genuinely untouched.
+        expect(findTokenRowByJti(db, victim)?.revokedAt).toBeNull();
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("break_glass: true revokes the live operator token jti anyway", async () => {
+    const h = makeHarness();
+    try {
+      const { db, userId } = await bootstrap(h.dir);
+      try {
+        const op = await mintOperatorToken(db, userId, { issuer: ISSUER });
+        const victim = await seedToken(db, userId);
+        const resp = await handleApiRevokeToken(
+          jsonRequest({ jti: victim, break_glass: true }, { authorization: `Bearer ${op.token}` }),
+          { db, issuer: ISSUER, liveOperatorJti: () => victim },
+        );
+        expect(resp.status).toBe(200);
+        expect(findTokenRowByJti(db, victim)?.revokedAt).not.toBeNull();
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("400 when break_glass is present but not a boolean", async () => {
+    const h = makeHarness();
+    try {
+      const { db, userId } = await bootstrap(h.dir);
+      try {
+        const op = await mintOperatorToken(db, userId, { issuer: ISSUER });
+        const victim = await seedToken(db, userId);
+        // A truthy STRING must not waive a safety guard by accident.
+        const resp = await handleApiRevokeToken(
+          jsonRequest(
+            { jti: victim, break_glass: "true" },
+            { authorization: `Bearer ${op.token}` },
+          ),
+          { db, issuer: ISSUER, liveOperatorJti: () => victim },
+        );
+        expect(resp.status).toBe(400);
+        expect(((await resp.json()) as { error: string }).error).toBe("invalid_request");
+        expect(findTokenRowByJti(db, victim)?.revokedAt).toBeNull();
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("a non-operator jti is unaffected by the guard", async () => {
+    const h = makeHarness();
+    try {
+      const { db, userId } = await bootstrap(h.dir);
+      try {
+        const op = await mintOperatorToken(db, userId, { issuer: ISSUER });
+        const other = await seedToken(db, userId);
+        const resp = await handleApiRevokeToken(
+          jsonRequest({ jti: other }, { authorization: `Bearer ${op.token}` }),
+          { db, issuer: ISSUER, liveOperatorJti: () => "some-other-live-jti" },
+        );
+        expect(resp.status).toBe(200);
+        expect(findTokenRowByJti(db, other)?.revokedAt).not.toBeNull();
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("records revoked_by = bearer sub and revoked_via = http", async () => {
+    const h = makeHarness();
+    try {
+      const { db, userId } = await bootstrap(h.dir);
+      try {
+        const op = await mintOperatorToken(db, userId, { issuer: ISSUER });
+        const victim = await seedToken(db, userId);
+        const resp = await handleApiRevokeToken(
+          jsonRequest({ jti: victim }, { authorization: `Bearer ${op.token}` }),
+          { db, issuer: ISSUER, liveOperatorJti: () => null },
+        );
+        expect(resp.status).toBe(200);
+        const row = findTokenRowByJti(db, victim);
+        expect(row?.revokedBy).toBe(userId);
+        expect(row?.revokedVia).toBe("http");
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("an actor-less internal revoke leaves revoked_by NULL (no fabrication)", async () => {
+    const h = makeHarness();
+    try {
+      const { db, userId } = await bootstrap(h.dir);
+      try {
+        const jti = await seedToken(db, userId);
+        revokeTokenByJti(db, jti, new Date());
+        const row = findTokenRowByJti(db, jti);
+        expect(row?.revokedAt).not.toBeNull();
+        expect(row?.revokedBy).toBeNull();
+        expect(row?.revokedVia).toBeNull();
       } finally {
         db.close();
       }
