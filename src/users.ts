@@ -200,6 +200,15 @@ function readVaultsForUser(db: Database, userId: string): string[] {
  *
  * Mapping:
  *   - `write` (today's default)     → `["read", "write", "admin"]`
+ *   - `member`                      → `["read", "write"]` — full data
+ *     authority, NO admin. This is the role for a principal that should USE a
+ *     vault but must not be able to hand it to anyone else: `admin` is what
+ *     `callerCanAdminVault` reads, so a `member` row cannot grant, revoke, or
+ *     list access (the tools are hidden from it, not merely refused). Added
+ *     because `write` silently means "and may re-grant to anybody". Named for
+ *     membership, not for agent-ness: the channel-attached-vaults flow writes
+ *     this same role for every principal synced from a Buzz channel, human or
+ *     agent alike.
  *   - `read` (forward-compat)       → `["read"]` — a *deliberate* read-only
  *     assignment stays read-only even under the any-assigned-user-gets-admin
  *     policy. `grant-access` on `/account/mcp` can create these rows.
@@ -215,8 +224,52 @@ function readVaultsForUser(db: Database, userId: string): string[] {
  */
 export type VaultVerb = "read" | "write" | "admin";
 
+/**
+ * How a `user_vaults` row was written (migration v22). Attribution, not
+ * authority — nothing reads this to decide what a row may do.
+ *
+ *   - `mcp` — the `/account/mcp` `grant-access` tool.
+ *   - `cli` — a local `parachute` invocation against `hub.db`.
+ *   - `api` — a REST admin path (`/api/users`, invite redeem).
+ *   - `channel:<relay-host>:<channel-id>` — written by the channel membership
+ *     reconciler, one label per `channel_vaults` binding. This is the only
+ *     value with STRUCTURE, and it carries a second job: it is the reconciler's
+ *     PROVENANCE mark. A row it created can be identified — and therefore
+ *     removed when the member leaves — by exact match on this string, which is
+ *     precisely why a hand-made operator grant (`mcp` / `cli` / `api` / NULL)
+ *     can never be swept up by a roster it isn't in. Not a separate column
+ *     because "how did this row get here" is exactly the question v22 added
+ *     `granted_via` to answer, and a second column answering the same question
+ *     would eventually disagree with the first.
+ *
+ * NULL on every row that pre-dates the migration, and on any writer that
+ * hasn't been taught to record it. NULL means "unknown", never "none".
+ *
+ * Attribution, never authority: the value is read for display and for the
+ * reconciler's own bookkeeping, and never to decide what a row may do. That is
+ * why an unrecognised value is safe.
+ */
+export const GRANT_VIA_VALUES = ["mcp", "cli", "api"] as const;
+export type GrantVia = (typeof GRANT_VIA_VALUES)[number] | `channel:${string}`;
+
+/**
+ * Who made a `user_vaults` grant, recorded alongside it (migration v22).
+ *
+ * Both identifiers are carried because neither alone is enough: several
+ * agents with their own Nostr keys routinely link to ONE hub user, so
+ * `grantedByUserId` cannot tell them apart, while a Bearer/CLI/API caller has
+ * no key at all and leaves `grantedByPubkey` NULL. Recording the empty one as
+ * a placeholder would fabricate attribution, so it stays NULL.
+ */
+export interface VaultGrantAttribution {
+  grantedByUserId?: string | null;
+  grantedByPubkey?: string | null;
+  grantedVia?: GrantVia | null;
+}
+
 export function vaultVerbsForRole(role: string): VaultVerb[] {
   if (role === "write") return ["read", "write", "admin"];
+  if (role === "member") return ["read", "write"];
   if (role === "read") return ["read"];
   return [];
 }
@@ -639,6 +692,11 @@ export function setUserVaults(
  *
  * ON CONFLICT updates `role` and preserves the original `created_at`.
  * Returns `false` when the user id does not exist.
+ *
+ * `attribution` (migration v22) records WHO granted, and over which door.
+ * A re-grant overwrites it — the row names the most recent grantor, which is
+ * the one whose decision the current role reflects. Omitted attribution
+ * writes NULLs rather than inventing a grantor.
  */
 export function upsertUserVault(
   db: Database,
@@ -646,6 +704,7 @@ export function upsertUserVault(
   vaultName: string,
   role: string,
   now: () => Date = () => new Date(),
+  attribution: VaultGrantAttribution = {},
 ): boolean {
   const exists = db
     .query<{ id: string }, [string]>("SELECT id FROM users WHERE id = ?")
@@ -654,10 +713,24 @@ export function upsertUserVault(
   const stamp = now().toISOString();
   db.transaction(() => {
     db.prepare(
-      `INSERT INTO user_vaults (user_id, vault_name, role, created_at)
-       VALUES (?, ?, ?, ?)
-       ON CONFLICT(user_id, vault_name) DO UPDATE SET role = excluded.role`,
-    ).run(userId, vaultName, role, stamp);
+      `INSERT INTO user_vaults
+         (user_id, vault_name, role, created_at,
+          granted_by_user_id, granted_by_pubkey, granted_via)
+       VALUES (?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(user_id, vault_name) DO UPDATE SET
+         role = excluded.role,
+         granted_by_user_id = excluded.granted_by_user_id,
+         granted_by_pubkey = excluded.granted_by_pubkey,
+         granted_via = excluded.granted_via`,
+    ).run(
+      userId,
+      vaultName,
+      role,
+      stamp,
+      attribution.grantedByUserId ?? null,
+      attribution.grantedByPubkey ?? null,
+      attribution.grantedVia ?? null,
+    );
     db.prepare("UPDATE users SET updated_at = ? WHERE id = ?").run(stamp, userId);
   })();
   return true;

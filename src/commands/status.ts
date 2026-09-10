@@ -44,10 +44,11 @@ export interface StatusOpts {
    */
   installSourceDeps?: DetectInstallSourceDeps;
   /**
-   * Test seam for the served-bundle guardrail (hub#780). Production resolves the
-   * shim-served package (notes/app) from the real supervisor cwd + filesystem;
-   * tests inject stubs so the divergence case (served path ≠ bun-global link) is
-   * exercised deterministically. Empty in production.
+   * Test seam for the served-bundle guardrail (hub#780 / hub#783). Production
+   * leaves this empty so `detectServedResolution` recovers the shim's launch cwd
+   * (recorded cwd → `/proc/<pid>/cwd` → installDir → `/`). Tests inject stubs so
+   * the divergence case (served path ≠ bun-global link) is exercised
+   * deterministically; pin `cwd` to skip the cascade.
    */
   servedResolutionDeps?: DetectServedResolutionDeps;
   /**
@@ -255,6 +256,7 @@ function manifestRowBase(
   entry: ServiceEntry,
   installSourceDeps: DetectInstallSourceDeps,
   servedResolutionDeps: DetectServedResolutionDeps,
+  launch?: { pid?: number | null; recordedCwd?: string },
 ): ManifestRowBase {
   // Third-party rows (with `installDir`) live under `~/.parachute/<entry.name>/`,
   // matching what `parachute start` uses as the short. First-party rows still
@@ -282,20 +284,30 @@ function manifestRowBase(
     ? `STALE: services.json cached ${entry.version}; live package.json ${source.livePackageVersion}`
     : undefined;
 
-  // Served-bundle guardrail (hub#780). Only shim-served rows (notes/app —
-  // served via `bundle-serve.ts`) have a resolution distinct from their launch
-  // command; for those, resolve the bundle the way the shim does at serve time
-  // and warn if it diverges from the bun-global link the SOURCE column shows.
+  // Served-bundle guardrail (hub#780 / hub#783). Only shim-served rows
+  // (notes/app — served via `bundle-serve.ts`) have a resolution distinct from
+  // their launch command; for those, resolve the bundle the way the shim does
+  // at serve time and warn if it diverges from the bun-global link the SOURCE
+  // column shows. Per-row pid / installDir feed resolveShimLaunchCwd when
+  // `servedResolutionDeps.cwd` is omitted, so a hub launched from a non-`/`
+  // bare dir is visible instead of being compared against hardcoded `/`.
   // The `startCmd` referencing the shim is the shim-served signal (getSpec
   // returns undefined → no note for unknown/third-party rows). Never throws.
   let servedNote: string | undefined;
   const spec = short ? getSpec(short) : undefined;
   const shimServed = spec?.startCmd?.(entry)?.some((a) => a.endsWith("bundle-serve.ts")) ?? false;
   if (shimServed && spec?.package) {
-    servedNote = servedDivergenceNote(
-      spec.package,
-      detectServedResolution(spec.package, servedResolutionDeps),
-    );
+    const perRow: DetectServedResolutionDeps = {
+      ...servedResolutionDeps,
+      ...(entry.installDir !== undefined ? { installDir: entry.installDir } : {}),
+      ...(launch?.recordedCwd !== undefined && launch.recordedCwd.length > 0
+        ? { recordedCwd: launch.recordedCwd }
+        : {}),
+      // Only overlay a live pid. `null` (hub down / no snapshot) must not wipe
+      // a test-injected `servedResolutionDeps.pid`.
+      ...(typeof launch?.pid === "number" ? { pid: launch.pid } : {}),
+    };
+    servedNote = servedDivergenceNote(spec.package, detectServedResolution(spec.package, perRow));
   }
 
   // Persisted last-start failure (lifecycle preflight wrote a missing-dependency
@@ -631,8 +643,11 @@ async function buildSupervisorRows(args: BuildSupervisorRowsArgs): Promise<Statu
   }
 
   const rows: StatusRow[] = manifest.services.map((entry) => {
-    const base = manifestRowBase(entry, installSourceDeps, servedResolutionDeps);
-    const snap = base.short ? stateByShort.get(base.short) : undefined;
+    const short = shortNameForManifest(entry.name) ?? (entry.installDir ? entry.name : undefined);
+    const snap = short ? stateByShort.get(short) : undefined;
+    const base = manifestRowBase(entry, installSourceDeps, servedResolutionDeps, {
+      pid: snap?.pid ?? null,
+    });
 
     if (!hubHealthy) {
       // Hub is down → every supervised module is down with it. Show `inactive`

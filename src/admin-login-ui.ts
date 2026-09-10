@@ -2,8 +2,13 @@
  * Branded HTML for the hub's pre-auth surfaces: the `/login` form and the
  * generic admin error page surfaced when CSRF or rate-limit gates fire on
  * `/login` and `/logout`. Same privacy posture as `oauth-ui.ts` (no third-
- * party fonts, inline CSS, no JS) — these pages are pre-auth and have to
- * stand alone without the SPA shell.
+ * party fonts, inline CSS) — these pages are pre-auth and have to stand alone
+ * without the SPA shell.
+ *
+ * The password form itself carries no JS and never will: it has to work for a
+ * member with scripting off. The only script on `/login` is the Nostr key
+ * door's (`nostr-login-ui.ts`), which is strictly additive — it un-hides an
+ * extra button and does nothing to the form.
  *
  * History: this file was `admin-config-ui.ts` and held the server-rendered
  * `/admin/config` module-config portal (hub#46). #240 retired the portal
@@ -14,6 +19,7 @@
  */
 import { WORDMARK_TEXT, brandMarkSvg } from "./brand.ts";
 import { renderCsrfHiddenInput } from "./csrf.ts";
+import { NOSTR_LOGIN_STYLES, renderNostrKeyDoor } from "./nostr-login-ui.ts";
 import { escapeHtml } from "./oauth-ui.ts";
 
 // --- shared chrome ---------------------------------------------------------
@@ -104,6 +110,7 @@ export function renderAdminLogin(props: AdminLoginProps): string {
         </label>
         <button type="submit" class="btn btn-primary">Sign in</button>
       </form>
+      ${renderNostrKeyDoor({ next })}
     </div>`;
   return baseDocument("Sign in — Parachute", body);
 }
@@ -126,6 +133,11 @@ export interface TotpChallengeProps {
  *
  * No JS, stands alone like `/login`. `inputmode`/`autocomplete` hint mobile
  * keyboards toward a numeric pad + the platform's one-time-code autofill.
+ *
+ * Rendered from three places now: the two password doors render it inline
+ * after a correct password, and `handleAdminLoginTotpGet` renders it for a
+ * caller who was REDIRECTED to `/login/2fa` — which is what the Nostr key
+ * door does, since its caller is a `fetch()` that can only follow a URL.
  */
 export function renderTotpChallenge(props: TotpChallengeProps): string {
   const { next, csrfToken, errorMessage } = props;
@@ -495,4 +507,5 @@ const STYLES = `
     }
     .brand-tag { border-color: #3a362f; color: #a8a29a; }
   }
+${NOSTR_LOGIN_STYLES}
 `;

@@ -674,6 +674,12 @@ function namedVaultScopeNames(scopes: readonly string[]): Set<string> {
   return out;
 }
 
+/** The one vault named by the granted scopes, or nothing when absent/ambiguous. */
+function singleVaultName(scopes: readonly string[]): string | undefined {
+  const names = [...namedVaultScopeNames(scopes)];
+  return names.length === 1 ? names[0] : undefined;
+}
+
 function invalidTargetResponse(resource: string): Response {
   return jsonResponse(
     {
@@ -2811,12 +2817,14 @@ async function handleTokenAuthorizationCode(
     deps.issuer,
     redeemed.scopes,
   );
+  const vault = singleVaultName(redeemed.scopes);
   return jsonResponse({
     access_token: access.token,
     token_type: "Bearer",
     expires_in: ACCESS_TOKEN_TTL_SECONDS,
     refresh_token: refresh.token,
     scope: redeemed.scopes.join(" "),
+    ...(vault ? { vault } : {}),
     services,
   });
 }
@@ -3015,12 +3023,14 @@ async function rotateAndRespond(
     deps.issuer,
     row.scopes,
   );
+  const vault = singleVaultName(row.scopes);
   return jsonResponse({
     access_token: access.token,
     token_type: "Bearer",
     expires_in: ACCESS_TOKEN_TTL_SECONDS,
     refresh_token: refresh.token,
     scope: row.scopes.join(" "),
+    ...(vault ? { vault } : {}),
     services,
   });
 }

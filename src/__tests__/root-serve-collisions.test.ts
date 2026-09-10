@@ -48,6 +48,12 @@ const HUB_CLAIMED_SEGMENTS: readonly string[] = [
  */
 const APP_TOP_LEVEL_SEGMENTS: readonly string[] = [
   "n",
+  // The vault-scoped note address, `/v/<vault>/n/<note>` (parachute-app#186,
+  // #194) — a note link that names its own vault. Deliberately `/v` and not
+  // `/vault`: `/vault` IS a hub claim (the 301 back-compat namespace and the
+  // per-vault proxy), so an app route there would be unreachable. This entry is
+  // what makes that a checked fact rather than a comment in another repo.
+  "v",
   "notes",
   "tags",
   "settings",

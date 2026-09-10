@@ -1,3 +1,4 @@
+import type { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -857,6 +858,22 @@ describe("setUserVaults (multi-user Phase 2 PR 2)", () => {
   });
 });
 
+/** The v22 attribution columns on one `user_vaults` row. */
+function readGrantRow(
+  db: Database,
+  userId: string,
+  vaultName: string,
+): Record<string, unknown> | null {
+  return (
+    db
+      .query<Record<string, unknown>, [string, string]>(
+        `SELECT role, granted_by_user_id, granted_by_pubkey, granted_via
+           FROM user_vaults WHERE user_id = ? AND vault_name = ?`,
+      )
+      .get(userId, vaultName) ?? null
+  );
+}
+
 describe("upsertUserVault / removeUserVault", () => {
   test("returns false when user does not exist", () => {
     const { db, cleanup } = makeDb();
@@ -906,6 +923,64 @@ describe("upsertUserVault / removeUserVault", () => {
         .get(u.id, "beta");
       expect(after?.role).toBe("read");
       expect(after?.created_at).toBe(before?.created_at);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("records grantor attribution, and a re-grant names the new grantor", async () => {
+    const { db, cleanup } = makeDb();
+    try {
+      const u = await createUser(db, "alice", "alice-strong-passphrase", {
+        allowMulti: true,
+      });
+      expect(
+        upsertUserVault(db, u.id, "beta", "member", () => new Date(1000), {
+          grantedByUserId: "owner-1",
+          grantedByPubkey: "a".repeat(64),
+          grantedVia: "mcp",
+        }),
+      ).toBe(true);
+      const first = readGrantRow(db, u.id, "beta");
+      expect(first).toEqual({
+        role: "member",
+        granted_by_user_id: "owner-1",
+        granted_by_pubkey: "a".repeat(64),
+        granted_via: "mcp",
+      });
+
+      // A keyless door (CLI/API) records the door and the hub user but NOT a
+      // pubkey — inventing one would fabricate attribution.
+      expect(
+        upsertUserVault(db, u.id, "beta", "read", () => new Date(2000), {
+          grantedByUserId: "owner-2",
+          grantedVia: "cli",
+        }),
+      ).toBe(true);
+      expect(readGrantRow(db, u.id, "beta")).toEqual({
+        role: "read",
+        granted_by_user_id: "owner-2",
+        granted_by_pubkey: null,
+        granted_via: "cli",
+      });
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("omitted attribution writes NULLs rather than inventing a grantor", async () => {
+    const { db, cleanup } = makeDb();
+    try {
+      const u = await createUser(db, "alice", "alice-strong-passphrase", {
+        allowMulti: true,
+      });
+      expect(upsertUserVault(db, u.id, "beta", "read")).toBe(true);
+      expect(readGrantRow(db, u.id, "beta")).toEqual({
+        role: "read",
+        granted_by_user_id: null,
+        granted_by_pubkey: null,
+        granted_via: null,
+      });
     } finally {
       cleanup();
     }
@@ -1003,6 +1078,17 @@ describe("vaultVerbsForRole / vaultVerbsForUserVault (friend token-mint cap)", (
     expect(vaultVerbsForRole("admin")).toEqual([]);
     expect(vaultVerbsForRole("owner")).toEqual([]);
     expect(vaultVerbsForRole("")).toEqual([]);
+  });
+
+  test("member is read+write with NO admin — it cannot re-grant", () => {
+    // The whole point of the role: `admin` is what `callerCanAdminVault`
+    // reads, so its absence is what stops a member principal handing the
+    // vault to someone else. Full data authority, zero grant authority.
+    expect(vaultVerbsForRole("member")).toEqual(["read", "write"]);
+    expect(vaultVerbsForRole("member")).not.toContain("admin");
+    // `write` is deliberately UNCHANGED — every existing assignment and every
+    // issued token was made under the read/write/admin reading of it.
+    expect(vaultVerbsForRole("write")).toEqual(["read", "write", "admin"]);
   });
 
   test("vaultVerbsForUserVault returns the role's verbs for an assigned vault", async () => {

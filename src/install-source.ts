@@ -340,12 +340,78 @@ export function formatInstallSourceLabel(source: InstallSource): string {
 // ---------------------------------------------------------------------------
 
 /**
- * The cwd the supervisor launches shim-served (notes/app) processes with.
+ * Fallback cwd when the shim's actual launch cwd cannot be recovered.
  * launchd/systemd hand a supervised child `/` when no per-module cwd is set —
- * exactly the bundle-serve case (hub#780). Served resolution is computed from
- * here so `status` mirrors the running shim rather than the CLI's own cwd.
+ * the hub#780 production path. Do not assume this is always the launch cwd:
+ * a hub started from another bare directory (hub#783) inherits that directory
+ * instead. {@link resolveShimLaunchCwd} recovers the real one; this constant
+ * is the last-resort fallback so the supervised production path is unchanged.
  */
 export const SUPERVISOR_CWD = "/";
+
+export interface ResolveShimLaunchCwdArgs {
+  /**
+   * Supervisor-recorded child cwd (`SpawnRequest.cwd`), when the snapshot
+   * carries one. Today that is only set from `entry.installDir` (see
+   * `buildModuleSpawnRequest`); first-party notes/app typically leave it unset
+   * and inherit the hub process cwd.
+   */
+  readonly recordedCwd?: string;
+  /** Running child pid, used to read `/proc/<pid>/cwd` on Linux. */
+  readonly pid?: number | null;
+  /** Manifest `installDir`, used when no recorded cwd and no proc cwd. */
+  readonly installDir?: string;
+}
+
+export interface ResolveShimLaunchCwdDeps {
+  /**
+   * Read the process cwd for `pid`. Defaults to `realpathSync("/proc/<pid>/cwd")`,
+   * which is the Linux procfs symlink; Darwin has no `/proc`, so the default
+   * returns undefined and the cascade falls through. Tests inject a stub.
+   */
+  readonly readProcCwd?: (pid: number) => string | undefined;
+}
+
+function defaultReadProcCwd(pid: number): string | undefined {
+  try {
+    return realpathSync(`/proc/${pid}/cwd`);
+  } catch {
+    return undefined;
+  }
+}
+
+function nonEmpty(value: string | undefined): string | undefined {
+  return value !== undefined && value.length > 0 ? value : undefined;
+}
+
+/**
+ * Recover the cwd the bundle-serve shim was actually launched with (hub#783).
+ *
+ * Cascade:
+ *   1. Supervisor-recorded child cwd, when present.
+ *   2. Else `/proc/<pid>/cwd` on Linux (the inherited hub cwd a first-party
+ *      notes/app child actually has when `SpawnRequest.cwd` was unset).
+ *   3. Else the module's `installDir`.
+ *   4. Else {@link SUPERVISOR_CWD} (`/`) — the supervised production path.
+ */
+export function resolveShimLaunchCwd(
+  args: ResolveShimLaunchCwdArgs = {},
+  deps: ResolveShimLaunchCwdDeps = {},
+): string {
+  const recorded = nonEmpty(args.recordedCwd);
+  if (recorded) return recorded;
+
+  if (typeof args.pid === "number" && Number.isInteger(args.pid) && args.pid > 0) {
+    const readProcCwd = deps.readProcCwd ?? defaultReadProcCwd;
+    const procCwd = nonEmpty(readProcCwd(args.pid));
+    if (procCwd) return procCwd;
+  }
+
+  const installDir = nonEmpty(args.installDir);
+  if (installDir) return installDir;
+
+  return SUPERVISOR_CWD;
+}
 
 export interface ServedResolution {
   /**
@@ -368,7 +434,12 @@ export interface ServedResolution {
 export interface DetectServedResolutionDeps {
   /** Home dir the resolution candidates are anchored on. Defaults to `homedir()`. */
   readonly home?: string;
-  /** Supervisor launch cwd. Defaults to {@link SUPERVISOR_CWD} (`/`). */
+  /**
+   * Explicit launch cwd. When set, it wins over the hub#783 cascade — tests
+   * pin `/` or a fixture dir this way. When omitted, {@link resolveShimLaunchCwd}
+   * recovers the shim's cwd from {@link recordedCwd} / {@link pid} /
+   * {@link installDir}, falling back to {@link SUPERVISOR_CWD}.
+   */
   readonly cwd?: string;
   /** Override `Bun.resolveSync` for tests (passed straight to the shim resolver). */
   readonly resolveSync?: (specifier: string, base: string) => string;
@@ -378,6 +449,15 @@ export interface DetectServedResolutionDeps {
   readonly readJson?: (path: string) => unknown;
   /** Returns the bun-global link target for a package, or null. Shared shape with detect. */
   readonly resolveBunGlobal?: (packageName: string) => string | null;
+  /**
+   * Inputs to {@link resolveShimLaunchCwd} when `cwd` is omitted. Production
+   * `status` fills `pid` from the live supervisor snapshot and `installDir`
+   * from the manifest row. `readProcCwd` is the test seam for `/proc/<pid>/cwd`.
+   */
+  readonly recordedCwd?: string;
+  readonly pid?: number | null;
+  readonly installDir?: string;
+  readonly readProcCwd?: (pid: number) => string | undefined;
 }
 
 /**
@@ -396,7 +476,18 @@ export function detectServedResolution(
 ): ServedResolution {
   const readJson = deps.readJson ?? defaultReadJson;
   const resolveBunGlobal = deps.resolveBunGlobal ?? defaultResolveBunGlobal;
-  const cwd = deps.cwd ?? SUPERVISOR_CWD;
+  const cwd =
+    deps.cwd ??
+    resolveShimLaunchCwd(
+      {
+        ...(deps.recordedCwd !== undefined ? { recordedCwd: deps.recordedCwd } : {}),
+        ...(deps.pid !== undefined ? { pid: deps.pid } : {}),
+        ...(deps.installDir !== undefined ? { installDir: deps.installDir } : {}),
+      },
+      {
+        ...(deps.readProcCwd !== undefined ? { readProcCwd: deps.readProcCwd } : {}),
+      },
+    );
 
   let servedPath: string | undefined;
   try {

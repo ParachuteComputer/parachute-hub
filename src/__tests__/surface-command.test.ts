@@ -451,6 +451,9 @@ describe("deploy token → real git push via git-credential-parachute", () => {
     // The static-token mechanism: the SHIPPED helper reads $PARACHUTE_SURFACE_TOKEN.
     const helperEnv = { PARACHUTE_SURFACE_TOKEN: parsed.token };
     const helperCfg = `credential.helper=${HELPER}`;
+    // Clear inherited helpers first: a host keychain helper can block forever
+    // in non-interactive CI even after the test helper has supplied a token.
+    const helperArgs = ["-c", "credential.helper=", "-c", helperCfg];
     try {
       // Author a commit.
       expect(git(["init", "-q", "-b", "main", work], tmpdir()).code).toBe(0);
@@ -462,7 +465,7 @@ describe("deploy token → real git push via git-credential-parachute", () => {
 
       // Push using ONLY the static deploy token, supplied by the helper script.
       const push = await gitAsync(
-        ["-c", helperCfg, "push", `${base}/git/foo`, "main"],
+        [...helperArgs, "push", `${base}/git/foo`, "main"],
         work,
         helperEnv,
       );
@@ -477,7 +480,7 @@ describe("deploy token → real git push via git-credential-parachute", () => {
       await Bun.write(join(work, "index.html"), "<h1>v2</h1>\n");
       git(["commit", "-qam", "second"], work);
       const push2 = await gitAsync(
-        ["-c", helperCfg, "push", `${base}/git/foo`, "main"],
+        [...helperArgs, "push", `${base}/git/foo`, "main"],
         work,
         helperEnv,
       );

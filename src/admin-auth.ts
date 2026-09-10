@@ -15,10 +15,7 @@
  */
 import type { Database } from "bun:sqlite";
 import { validateAccessToken } from "./jwt-sign.ts";
-import {
-  authenticateNostrRequest,
-  isNostrAuthorization,
-} from "./nostr-http-auth.ts";
+import { authenticateNostrRequest, isNostrAuthorization } from "./nostr-http-auth.ts";
 
 export interface AdminAuthContext {
   /** JWT `sub` — the hub user id. */
@@ -101,12 +98,38 @@ export function nostrAutoProvisionEnabled(): boolean {
   return v === "1" || v === "true" || v === "yes";
 }
 
-export async function requireScope(
+/**
+ * An authenticated caller, before any scope assertion. {@link requireScope} is
+ * this plus a scope check; endpoints that gate on "is anyone at all" rather
+ * than on a capability use it directly.
+ */
+export interface AuthenticatedContext extends AdminAuthContext {
+  /**
+   * True when the caller is a hub admin authenticated over NIP-98, whose
+   * `scopes` are deliberately EMPTY (`principalFromUser` gives an admin no
+   * per-vault scopes — an admin's posture is "no narrowing", not "no access").
+   * A scope check must treat this as satisfying anything; a bare
+   * authentication check ignores it.
+   */
+  unrestricted: boolean;
+}
+
+/**
+ * Authenticate a request — NIP-98 `Authorization: Nostr` or a hub-issued
+ * Bearer — WITHOUT asserting any scope. Throws `AdminAuthError(401)` when the
+ * caller cannot be identified.
+ *
+ * Split out of {@link requireScope} for read-only endpoints whose answer is not
+ * a secret and whose gate is only "an identified principal asked" — e.g.
+ * `GET /api/channel-vault`, which returns a vault NAME (every read of the vault
+ * itself is separately ACL'd). Never use this where the answer varies with, or
+ * discloses, another principal's data.
+ */
+export async function requireAuthenticated(
   db: Database,
   req: Request,
-  requiredScope: string,
   expectedIssuer: string | readonly string[],
-): Promise<AdminAuthContext> {
+): Promise<AuthenticatedContext> {
   if (isNostrAuthorization(req)) {
     let body = new Uint8Array();
     if (req.method !== "GET" && req.method !== "HEAD") {
@@ -117,26 +140,12 @@ export async function requireScope(
         autoProvision: nostrAutoProvisionEnabled(),
         body,
       });
-      if (principal.isHubAdmin) {
-        return {
-          sub: principal.userId,
-          scopes: [requiredScope],
-          clientId: `nostr:${principal.pubkey}`,
-          audience: undefined,
-        };
-      }
-      if (!principal.scopes.includes(requiredScope)) {
-        throw new AdminAuthError(
-          403,
-          `token missing required scope: ${requiredScope}`,
-          requiredScope,
-        );
-      }
       return {
         sub: principal.userId,
         scopes: principal.scopes,
         clientId: `nostr:${principal.pubkey}`,
         audience: undefined,
+        unrestricted: principal.isHubAdmin,
       };
     } catch (err) {
       if (err instanceof AdminAuthError) throw err;
@@ -162,15 +171,35 @@ export async function requireScope(
   const scopes =
     typeof scopeClaim === "string" ? scopeClaim.split(/\s+/).filter((s) => s.length > 0) : [];
 
-  if (!scopes.includes(requiredScope)) {
-    throw new AdminAuthError(403, `token missing required scope: ${requiredScope}`, requiredScope);
-  }
-
   const clientIdRaw = (validated.payload as { client_id?: unknown }).client_id;
   const clientId = typeof clientIdRaw === "string" ? clientIdRaw : undefined;
   const aud = typeof validated.payload.aud === "string" ? validated.payload.aud : undefined;
 
-  return { sub, scopes, clientId, audience: aud };
+  return { sub, scopes, clientId, audience: aud, unrestricted: false };
+}
+
+export async function requireScope(
+  db: Database,
+  req: Request,
+  requiredScope: string,
+  expectedIssuer: string | readonly string[],
+): Promise<AdminAuthContext> {
+  const ctx = await requireAuthenticated(db, req, expectedIssuer);
+  // A NIP-98 hub admin carries no scopes by construction; it satisfies every
+  // requirement and reports the scope it was asked for, exactly as before the
+  // authenticate/authorize split.
+  if (ctx.unrestricted) {
+    return {
+      sub: ctx.sub,
+      scopes: [requiredScope],
+      clientId: ctx.clientId,
+      audience: ctx.audience,
+    };
+  }
+  if (!ctx.scopes.includes(requiredScope)) {
+    throw new AdminAuthError(403, `token missing required scope: ${requiredScope}`, requiredScope);
+  }
+  return { sub: ctx.sub, scopes: ctx.scopes, clientId: ctx.clientId, audience: ctx.audience };
 }
 
 /**

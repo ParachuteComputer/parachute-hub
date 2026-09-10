@@ -27,8 +27,9 @@
  * key.
  */
 import type { Database } from "bun:sqlite";
-import { promises as fs } from "node:fs";
+import { promises as fs, readFileSync } from "node:fs";
 import { join } from "node:path";
+import { decodeJwt } from "jose";
 import { configDir } from "./config.ts";
 import { EXPOSE_STATE_PATH, readExposeState } from "./expose-state.ts";
 import { validateHostAdminToken } from "./host-admin-token-validation.ts";
@@ -135,6 +136,44 @@ export function isOperatorScopeSet(value: unknown): value is OperatorScopeSet {
 
 export function operatorTokenPath(dir: string = configDir()): string {
   return join(dir, OPERATOR_TOKEN_FILENAME);
+}
+
+/**
+ * The `jti` of the operator token currently on disk, or null when there
+ * isn't one (no file, empty file, undecodable, or no `jti` claim).
+ *
+ * Sync + decode-only on purpose. Its callers are guards that must answer
+ * "is the jti in front of me the LIVE operator credential?" (hub#931) —
+ * `parachute auth revoke-token`, `POST /api/auth/revoke-token` and
+ * `parachute doctor`. A guard has to fail OPEN on an unreadable file (null
+ * → no match → the caller's normal path runs), so every failure mode
+ * collapses to the same null; signature verification would add nothing,
+ * because the question is about the bytes on disk, not their validity.
+ */
+export function readOperatorTokenJti(dir: string = configDir()): string | null {
+  let token: string;
+  try {
+    token = readFileSync(operatorTokenPath(dir), "utf8").trim();
+  } catch {
+    return null;
+  }
+  if (token.length === 0) return null;
+  try {
+    const jti = decodeJwt(token).jti;
+    return typeof jti === "string" && jti.length > 0 ? jti : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Refusal shown when a revoke targets the live `operator.token` jti without
+ * break-glass (hub#931). Shared by the CLI and HTTP surfaces so both name
+ * the SAME reason: revoking it doesn't just invalidate a credential, it
+ * takes module-ops down with it, and `rotate-operator` is the safe path.
+ */
+export function liveOperatorTokenRevokeRefusal(jti: string, dir: string = configDir()): string {
+  return `jti ${jti} is the live operator token at ${operatorTokenPath(dir)} — revoking it would break module-ops (start/stop/restart/upgrade) on this box. Run \`parachute auth rotate-operator\` to replace it first`;
 }
 
 export interface MintOperatorTokenOpts {

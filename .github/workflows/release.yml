@@ -169,6 +169,8 @@ jobs:
   test:
     name: test
     runs-on: ubuntu-latest
+    # Keep the release gate bounded the same way as PR verification.
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v6
       - uses: oven-sh/setup-bun@v2
@@ -192,7 +194,7 @@ jobs:
       - name: typecheck
         run: bun run typecheck
       - name: hub tests
-        run: bun test ./src
+        run: bun test --timeout 30000 ./src
       - name: scope-guard tests
         # Run both suites regardless of tag prefix — small extra cost (~1s)
         # for the safety of catching scope-guard regressions before

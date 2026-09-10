@@ -3,7 +3,13 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { HUB_DB_BUSY_TIMEOUT_MS, hubDbPath, migrate, openHubDb } from "../hub-db.ts";
+import {
+  GRANT_ATTRIBUTION_MIGRATION,
+  HUB_DB_BUSY_TIMEOUT_MS,
+  hubDbPath,
+  migrate,
+  openHubDb,
+} from "../hub-db.ts";
 
 interface Harness {
   configDir: string;
@@ -631,6 +637,218 @@ describe("migration v20 — users.hub_role (hub#881)", () => {
           .query<{ n: number }, []>("SELECT COUNT(*) AS n FROM users WHERE hub_role = 'admin'")
           .get();
         expect(n?.n).toBe(0);
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+});
+
+describe("migration v23 — channel_vaults (channel-attached vaults PR 1)", () => {
+  test("a fresh db gets the table, the composite PK, and the inverse index", () => {
+    const h = makeHarness();
+    try {
+      const db = openHubDb(h.dbPath);
+      try {
+        const cols = db
+          .query<{ name: string; type: string; notnull: number; dflt_value: string | null }, []>(
+            "SELECT name, type, \"notnull\", dflt_value FROM pragma_table_info('channel_vaults')",
+          )
+          .all();
+        expect(cols.map((c) => c.name)).toEqual([
+          "relay_host",
+          "channel_id",
+          "vault",
+          "mode",
+          "relay_self_pubkey",
+          "synced_at",
+          "created_at",
+          // Appended by v24 (PR 5); asserted in full here because the ORDER of
+          // this list is the migration history, and an ALTER that landed
+          // somewhere other than the tail would mean a migration was edited in
+          // place rather than added.
+          "last_error",
+          "last_attempt_at",
+        ]);
+        // `mode` defaults to 'sync' so a writer that doesn't know the column
+        // lands on the syncing (not the frozen) side, matching the CLI default.
+        expect(cols.find((c) => c.name === "mode")?.dflt_value).toBe("'sync'");
+        // The two nullable columns PR 4/5 fill.
+        expect(cols.find((c) => c.name === "relay_self_pubkey")?.notnull).toBe(0);
+        expect(cols.find((c) => c.name === "synced_at")?.notnull).toBe(0);
+
+        const pk = db
+          .query<{ name: string; pk: number }, []>(
+            "SELECT name, pk FROM pragma_table_info('channel_vaults') WHERE pk > 0 ORDER BY pk",
+          )
+          .all()
+          .map((c) => c.name);
+        expect(pk).toEqual(["relay_host", "channel_id"]);
+
+        const indexes = db
+          .query<{ name: string }, []>(
+            "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='channel_vaults'",
+          )
+          .all()
+          .map((r) => r.name);
+        expect(indexes).toContain("channel_vaults_vault");
+
+        expect(
+          db
+            .query<{ version: number }, []>("SELECT version FROM schema_version")
+            .all()
+            .map((r) => r.version),
+        ).toContain(23);
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("v23 applies on top of an already-migrated db that has not seen it", () => {
+    const h = makeHarness();
+    try {
+      const db = openHubDb(h.dbPath);
+      try {
+        // Stand up the pre-v23 shape — same drop-the-artifact / unmark-the-
+        // version fixture the v10 / v13 / v20 tests use. The highest
+        // migration before this one is grant attribution (v22, hub#945) —
+        // pin against its exported constant so this doesn't drift.
+        const head = db
+          .query<{ v: number }, []>(
+            "SELECT MAX(version) AS v FROM schema_version WHERE version < 23",
+          )
+          .get();
+        expect(head?.v).toBe(GRANT_ATTRIBUTION_MIGRATION);
+        db.exec("DROP TABLE channel_vaults");
+        db.exec("DELETE FROM schema_version WHERE version = 23");
+
+        migrate(db);
+
+        const tables = db
+          .query<{ name: string }, []>("SELECT name FROM sqlite_master WHERE type='table'")
+          .all()
+          .map((r) => r.name);
+        expect(tables).toContain("channel_vaults");
+        expect(
+          db
+            .query<{ version: number }, []>("SELECT version FROM schema_version")
+            .all()
+            .map((r) => r.version),
+        ).toContain(23);
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("one channel binds to one vault; one vault may back several channels", () => {
+    const h = makeHarness();
+    try {
+      const db = openHubDb(h.dbPath);
+      try {
+        const ins = db.prepare(
+          "INSERT INTO channel_vaults (relay_host, channel_id, vault, mode, created_at) VALUES (?, ?, ?, 'sync', '2026-09-02T00:00:00.000Z')",
+        );
+        ins.run("relay.example", "chan-a", "shared");
+        // Same vault, different channel — allowed (no UNIQUE on `vault`).
+        ins.run("relay.example", "chan-b", "shared");
+        // Same relay + channel again — refused by the composite PK.
+        expect(() => ins.run("relay.example", "chan-a", "other")).toThrow();
+        // The same channel id on a DIFFERENT relay is a different channel.
+        expect(() => ins.run("other.example", "chan-a", "elsewhere")).not.toThrow();
+
+        const n = db.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM channel_vaults").get();
+        expect(n?.n).toBe(3);
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("a row inserted without `mode` lands as 'sync' (the column DEFAULT)", () => {
+    const h = makeHarness();
+    try {
+      const db = openHubDb(h.dbPath);
+      try {
+        db.prepare(
+          "INSERT INTO channel_vaults (relay_host, channel_id, vault, created_at) VALUES (?, ?, ?, ?)",
+        ).run("relay.example", "chan-a", "v1", "2026-09-02T00:00:00.000Z");
+        const row = db
+          .query<{ mode: string; synced_at: string | null }, []>(
+            "SELECT mode, synced_at FROM channel_vaults",
+          )
+          .get();
+        expect(row?.mode).toBe("sync");
+        expect(row?.synced_at).toBeNull();
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+});
+
+describe("migration v24 — freeze diagnostics (channel-attached vaults PR 5)", () => {
+  test("adds two nullable, undefaulted columns and records the version", () => {
+    const h = makeHarness();
+    try {
+      const db = openHubDb(h.dbPath);
+      try {
+        const cols = db
+          .query<{ name: string; notnull: number; dflt_value: string | null }, []>(
+            "SELECT name, \"notnull\", dflt_value FROM pragma_table_info('channel_vaults')",
+          )
+          .all();
+        for (const name of ["last_error", "last_attempt_at"]) {
+          const col = cols.find((c) => c.name === name);
+          expect(col).toBeDefined();
+          // NULL is the honest value for a binding that has never been polled;
+          // a default (""/"unknown") would read as a recorded attempt.
+          expect(col?.notnull).toBe(0);
+          expect(col?.dflt_value).toBeNull();
+        }
+        expect(
+          db
+            .query<{ version: number }, []>("SELECT version FROM schema_version")
+            .all()
+            .map((r) => r.version),
+        ).toContain(24);
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("applies on a db standing at the previous head", () => {
+    const h = makeHarness();
+    try {
+      const db = openHubDb(h.dbPath);
+      try {
+        // Rebuild the pre-v24 shape: SQLite cannot DROP two columns and keep
+        // the composite PK cleanly, so drop the table, replay v23's DDL by
+        // hand, and unmark both versions.
+        db.exec("DROP TABLE channel_vaults");
+        db.exec("DELETE FROM schema_version WHERE version IN (23, 24)");
+        migrate(db);
+
+        const names = db
+          .query<{ name: string }, []>("SELECT name FROM pragma_table_info('channel_vaults')")
+          .all()
+          .map((r) => r.name);
+        expect(names).toContain("last_error");
+        expect(names).toContain("last_attempt_at");
       } finally {
         db.close();
       }

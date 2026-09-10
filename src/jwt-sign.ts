@@ -406,17 +406,42 @@ export function recordTokenMint(db: Database, opts: RecordTokenMintOpts): void {
   }
 }
 
+/** Surface a revoke arrived over. Stored verbatim in `tokens.revoked_via`. */
+export type RevokedVia = "cli" | "http";
+
+/**
+ * Who asked for a revoke, and over which surface (hub#931). Optional
+ * everywhere: an internal sweep (`revokeTokensNamingVault`, refresh-token
+ * rotation) names no actor and leaves both columns NULL rather than
+ * inventing one.
+ */
+export interface RevokeActor {
+  /** HTTP: the bearer's `sub`. CLI: `cli:<unix user>`. */
+  by: string;
+  via: RevokedVia;
+}
+
 /**
  * Mark a `tokens` row revoked by jti. Idempotent: a row already revoked
  * keeps its existing `revoked_at`. Returns true when a row was updated
  * (was un-revoked before), false when no row matches or the row was
  * already revoked. Used by the new admin revoke path, the operator-mint
  * rotation cleanup, and any future explicit-revoke surface.
+ *
+ * `actor` records WHO revoked and over which surface (hub#931). Omitted →
+ * both columns stay NULL, which reads as "unrecorded", not "nobody".
  */
-export function revokeTokenByJti(db: Database, jti: string, now: Date): boolean {
+export function revokeTokenByJti(
+  db: Database,
+  jti: string,
+  now: Date,
+  actor?: RevokeActor,
+): boolean {
   const res = db
-    .prepare("UPDATE tokens SET revoked_at = ? WHERE jti = ? AND revoked_at IS NULL")
-    .run(now.toISOString(), jti);
+    .prepare(
+      "UPDATE tokens SET revoked_at = ?, revoked_by = ?, revoked_via = ? WHERE jti = ? AND revoked_at IS NULL",
+    )
+    .run(now.toISOString(), actor?.by ?? null, actor?.via ?? null, jti);
   return Number(res.changes) > 0;
 }
 
@@ -705,6 +730,14 @@ export interface RefreshTokenRow {
    * the audit row keeps stating what was true. Carries no authority.
    */
   subjectPubkey: string | null;
+  /**
+   * Actor recorded at revoke time (hub#931). HTTP records the bearer's
+   * `sub`; the CLI records `cli:<unix user>`. NULL on every pre-v21 row and
+   * on every actor-less internal sweep — "unrecorded", not "nobody".
+   */
+  revokedBy: string | null;
+  /** Surface the revoke arrived over — `cli` | `http`. NULL as above. */
+  revokedVia: string | null;
 }
 
 /**
@@ -731,6 +764,8 @@ interface TokenRowDb {
   subject: string | null;
   rotated_to: string | null;
   subject_pubkey: string | null;
+  revoked_by: string | null;
+  revoked_via: string | null;
 }
 
 function rowToRefreshToken(row: TokenRowDb): RefreshTokenRow {
@@ -748,6 +783,8 @@ function rowToRefreshToken(row: TokenRowDb): RefreshTokenRow {
     permissions: row.permissions,
     rotatedTo: row.rotated_to ?? null,
     subjectPubkey: row.subject_pubkey ?? null,
+    revokedBy: row.revoked_by ?? null,
+    revokedVia: row.revoked_via ?? null,
   };
 }
 

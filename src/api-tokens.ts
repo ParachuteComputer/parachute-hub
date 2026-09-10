@@ -25,7 +25,9 @@
  *         "created_at": "ISO-8601",
  *         "created_via": "oauth_refresh" | "cli_mint" | "operator_mint" | "connection_provision",
  *         "permissions": "<json-string>" | null,
- *         "subject_pubkey": "<64-hex>" | null
+ *         "subject_pubkey": "<64-hex>" | null,
+ *         "revoked_by": "..." | null,
+ *         "revoked_via": "cli" | "http" | null
  *       }
  *     ],
  *     "next_cursor": "<opaque>" | null
@@ -110,6 +112,16 @@ interface TokenWireShape {
    * `GET /api/auth/attribution?subject=…`, which also carries the signed proof.
    */
   subject_pubkey: string | null;
+  /**
+   * Revocation actor (hub#931, migration v21) — who revoked this row and over
+   * which surface. HTTP records the bearer's `sub`; the CLI records
+   * `cli:<unix user>`. ADDITIVE: null on every pre-v21 row, on every live
+   * row, and on any revoke by an internal sweep that names no actor, so a
+   * consumer that ignores both fields is unaffected. Null means
+   * "unrecorded", never "nobody".
+   */
+  revoked_by: string | null;
+  revoked_via: string | null;
 }
 
 interface TokensListResponse {
@@ -212,6 +224,8 @@ export async function handleApiTokens(req: Request, deps: ApiTokensDeps): Promis
       created_via: r.createdVia,
       permissions: parsePermissions(r.permissions),
       subject_pubkey: r.subjectPubkey,
+      revoked_by: r.revokedBy,
+      revoked_via: r.revokedVia,
     })),
     next_cursor: page.nextCursor,
   };

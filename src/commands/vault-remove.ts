@@ -90,6 +90,7 @@ interface CascadeSummaryWire {
   user_vaults_removed?: number;
   invites_invalidated?: number;
   vault_cap_removed?: boolean;
+  channel_vaults_removed?: number;
   connections_torn_down?: number;
   orphaned_channels?: unknown;
   vault_removed?: boolean;
@@ -158,6 +159,7 @@ function renderCascadeSummary(
   log(`  user_vaults removed:   ${n(c.user_vaults_removed)}`);
   log(`  invites invalidated:   ${n(c.invites_invalidated)}`);
   log(`  storage cap removed:   ${c.vault_cap_removed === true ? "yes" : "no"}`);
+  log(`  channel bindings:      ${n(c.channel_vaults_removed)}`);
   log(`  connections torn down: ${n(c.connections_torn_down)}`);
   log(`  vault removed:         ${c.vault_removed === true ? "yes" : "no"}`);
   log(`  vault module restarted:${c.module_restarted === true ? " yes" : " no"}`);

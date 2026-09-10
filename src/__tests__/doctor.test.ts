@@ -2,8 +2,18 @@ import { describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { type CheckResult, type DoctorDeps, doctor } from "../commands/doctor.ts";
+import { channelGrantVia } from "../channel-reconciler.ts";
+import { upsertChannelVault } from "../channel-vaults.ts";
+import {
+  type CheckResult,
+  type DoctorDeps,
+  type GrantsSnapshot,
+  doctor,
+} from "../commands/doctor.ts";
+import { hubDbPath, openHubDb } from "../hub-db.ts";
+import { recordTokenMint, revokeTokenByJti } from "../jwt-sign.ts";
 import { writePid } from "../process-state.ts";
+import { createUser, upsertUserVault } from "../users.ts";
 
 /**
  * Doctor tests. The headline is the fresh-install-green guard (#717): a
@@ -47,17 +57,41 @@ function seedCurrentManifest(manifestPath: string): void {
 }
 
 /** A hand-rolled (unsigned) JWT — doctor DECODES `iss`, never verifies it. */
-function fakeOperatorToken(iss: string): string {
+function fakeOperatorToken(iss: string, jti?: string): string {
   const b64 = (o: unknown) => Buffer.from(JSON.stringify(o)).toString("base64url");
   return [
     b64({ alg: "none", typ: "JWT" }),
-    b64({ iss, aud: "operator", sub: "u1", pa_scope_set: "admin" }),
+    b64({ iss, aud: "operator", sub: "u1", pa_scope_set: "admin", ...(jti ? { jti } : {}) }),
     "sig",
   ].join(".");
 }
 
-function seedOperatorToken(configDir: string, iss = "http://127.0.0.1:1939"): void {
-  writeFileSync(join(configDir, "operator.token"), `${fakeOperatorToken(iss)}\n`, { mode: 0o600 });
+function seedOperatorToken(configDir: string, iss = "http://127.0.0.1:1939", jti?: string): void {
+  writeFileSync(join(configDir, "operator.token"), `${fakeOperatorToken(iss, jti)}\n`, {
+    mode: 0o600,
+  });
+}
+
+/**
+ * Seed a real hub.db with ONE tokens row for `jti`, optionally already
+ * revoked. Used by the hub#931 checks — doctor reads `tokens.revoked_at`
+ * out of the registry, so the test needs a genuine migrated DB, not a stub.
+ */
+function seedTokenRow(configDir: string, jti: string, revoked: boolean): void {
+  const db = openHubDb(hubDbPath(configDir));
+  try {
+    recordTokenMint(db, {
+      jti,
+      createdVia: "operator_mint",
+      subject: "operator",
+      clientId: "parachute-hub",
+      scopes: ["parachute:host:auth"],
+      expiresAt: new Date("2027-01-01T00:00:00Z").toISOString(),
+    });
+    if (revoked) revokeTokenByJti(db, jti, new Date("2026-06-26T00:00:00Z"));
+  } finally {
+    db.close();
+  }
 }
 
 /**
@@ -254,6 +288,56 @@ describe("doctor — failure modes (each detected in isolation; others stay gree
       expect(op?.fix).toContain("start hub");
       expect(code).toBe(1);
       expectNoUnexpectedNonPass(checks, ["operator-token"]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  // hub#931. The observed shape on the mini: a structurally-valid,
+  // correctly-issued operator.token whose registry row had been revoked.
+  // doctor said issuer-matches → green, while every module-ops call 401'd.
+  test("revoked operator token → operator-token FAILs even though `iss` matches", async () => {
+    const h = makeHarness();
+    try {
+      seedCurrentManifest(h.manifestPath);
+      seedOperatorToken(h.configDir, "http://127.0.0.1:1939", "revoked-jti-931");
+      seedTokenRow(h.configDir, "revoked-jti-931", true);
+      const { code, checks } = await runDoctor(h, healthyDeps());
+      const op = byName(checks, "operator-token");
+      expect(op?.status).toBe("fail");
+      expect(op?.detail).toContain("REVOKED");
+      expect(op?.detail).toContain("revoked-jti-931");
+      expect(op?.fix).toContain("rotate-operator");
+      expect(code).toBe(1);
+      expectNoUnexpectedNonPass(checks, ["operator-token"]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("un-revoked operator token with a registry row → operator-token still PASSES", async () => {
+    const h = makeHarness();
+    try {
+      seedCurrentManifest(h.manifestPath);
+      seedOperatorToken(h.configDir, "http://127.0.0.1:1939", "live-jti-931");
+      seedTokenRow(h.configDir, "live-jti-931", false);
+      const { code, checks } = await runDoctor(h, healthyDeps());
+      expect(byName(checks, "operator-token")?.status).toBe("pass");
+      expect(code).toBe(0);
+      expectNoUnexpectedNonPass(checks, []);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("operator token with a jti but no hub.db → operator-token PASSES (can't tell ≠ broken)", async () => {
+    const h = makeHarness();
+    try {
+      seedCurrentManifest(h.manifestPath);
+      seedOperatorToken(h.configDir, "http://127.0.0.1:1939", "orphan-jti-931");
+      const { code, checks } = await runDoctor(h, healthyDeps());
+      expect(byName(checks, "operator-token")?.status).toBe("pass");
+      expect(code).toBe(0);
     } finally {
       h.cleanup();
     }
@@ -872,6 +956,330 @@ describe("doctor — loopback-hijack check (hub#737)", () => {
         }),
       );
       expect(byName(checks, "loopback-hijack")?.status).toBe("pass");
+    } finally {
+      h.cleanup();
+    }
+  });
+});
+
+describe("doctor — Grants group (inventory + two advisories)", () => {
+  /** A snapshot row with sane defaults; each test overrides what it drives. */
+  function row(over: Partial<GrantsSnapshot["rows"][number]> = {}): GrantsSnapshot["rows"][number] {
+    return {
+      vault: "beta",
+      userId: "u1",
+      username: "alice",
+      role: "member",
+      hubAdmin: false,
+      grantedByUserId: "owner",
+      grantedByPubkey: "a".repeat(64),
+      grantedVia: "mcp",
+      createdAt: "2026-06-27T00:00:00.000Z",
+      ...over,
+    };
+  }
+
+  test("no hub.db → one benign PASS, and the fresh-install-green guard holds", async () => {
+    const h = makeHarness();
+    try {
+      seedCurrentManifest(h.manifestPath);
+      seedOperatorToken(h.configDir);
+      // No readGrants override: the REAL reader runs against a configDir with
+      // no hub.db at all — the truly-fresh case.
+      const { code, checks } = await runDoctor(h, healthyDeps());
+      expect(byName(checks, "grants")?.status).toBe("pass");
+      expect(checks.filter((c) => c.status !== "pass")).toEqual([]);
+      expect(code).toBe(0);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("renders one row per assignment, with grantor and door", async () => {
+    const h = makeHarness();
+    try {
+      seedCurrentManifest(h.manifestPath);
+      seedOperatorToken(h.configDir);
+      const { code, checks } = await runDoctor(
+        h,
+        healthyDeps({
+          readGrants: () => ({
+            attributionSince: "2026-06-01T00:00:00.000Z",
+            rows: [row(), row({ vault: "personal", username: "bob", userId: "u2" })],
+          }),
+        }),
+      );
+      const beta = byName(checks, "grant:beta:alice");
+      expect(beta?.status).toBe("pass");
+      expect(beta?.title).toBe("beta → alice");
+      expect(beta?.detail).toContain("role=member");
+      expect(beta?.detail).toContain(`granted_by_pubkey=${"a".repeat(64)}`);
+      expect(beta?.detail).toContain("granted_via=mcp");
+      expect(beta?.detail).toContain("created_at=2026-06-27T00:00:00.000Z");
+      expect(byName(checks, "grant:personal:bob")?.status).toBe("pass");
+      expect(byName(checks, "grants-least-privilege")?.status).toBe("pass");
+      expect(byName(checks, "grants-attributed")?.status).toBe("pass");
+      expectNoUnexpectedNonPass(checks, []);
+      expect(code).toBe(0);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("a non-admin write assignment WARNs least-privilege (exit still 0)", async () => {
+    const h = makeHarness();
+    try {
+      seedCurrentManifest(h.manifestPath);
+      seedOperatorToken(h.configDir);
+      const { code, checks } = await runDoctor(
+        h,
+        healthyDeps({
+          readGrants: () => ({
+            attributionSince: "2026-06-01T00:00:00.000Z",
+            rows: [row({ role: "write" }), row({ vault: "personal", username: "bob" })],
+          }),
+        }),
+      );
+      const lp = byName(checks, "grants-least-privilege");
+      expect(lp?.status).toBe("warn");
+      expect(lp?.detail).toContain("alice@beta");
+      expect(lp?.detail).toContain("holds admin via write; consider role member");
+      // Advisory only — a warning never fails the run.
+      expect(code).toBe(0);
+      expectNoUnexpectedNonPass(checks, ["grants-least-privilege"]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("a hub admin's write row does NOT trip least-privilege", async () => {
+    // Hub admins are unrestricted by construction; the row adds nothing.
+    const h = makeHarness();
+    try {
+      seedCurrentManifest(h.manifestPath);
+      seedOperatorToken(h.configDir);
+      const { checks } = await runDoctor(
+        h,
+        healthyDeps({
+          readGrants: () => ({
+            attributionSince: "2026-06-01T00:00:00.000Z",
+            rows: [row({ role: "write", hubAdmin: true })],
+          }),
+        }),
+      );
+      expect(byName(checks, "grants-least-privilege")?.status).toBe("pass");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("attribution: post-migration rows without a grantor WARN; pre-migration rows do not", async () => {
+    const h = makeHarness();
+    try {
+      seedCurrentManifest(h.manifestPath);
+      seedOperatorToken(h.configDir);
+      const { checks } = await runDoctor(
+        h,
+        healthyDeps({
+          readGrants: () => ({
+            attributionSince: "2026-06-01T00:00:00.000Z",
+            rows: [
+              // Older than the migration — the hub genuinely wasn't recording.
+              row({
+                username: "old",
+                createdAt: "2026-01-01T00:00:00.000Z",
+                grantedByUserId: null,
+                grantedByPubkey: null,
+                grantedVia: null,
+              }),
+              // Written after it with nothing recorded at all.
+              row({
+                username: "new",
+                createdAt: "2026-06-27T00:00:00.000Z",
+                grantedByUserId: null,
+                grantedByPubkey: null,
+                grantedVia: null,
+              }),
+            ],
+          }),
+        }),
+      );
+      const attributed = byName(checks, "grants-attributed");
+      expect(attributed?.status).toBe("warn");
+      expect(attributed?.detail).toContain("new@beta");
+      expect(attributed?.detail).not.toContain("old@beta");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("a keyless (Bearer/CLI/API) grant counts as attributed — no false positive", async () => {
+    const h = makeHarness();
+    try {
+      seedCurrentManifest(h.manifestPath);
+      seedOperatorToken(h.configDir);
+      const { checks } = await runDoctor(
+        h,
+        healthyDeps({
+          readGrants: () => ({
+            attributionSince: "2026-06-01T00:00:00.000Z",
+            rows: [row({ grantedByPubkey: null, grantedVia: "cli" })],
+          }),
+        }),
+      );
+      expect(byName(checks, "grants-attributed")?.status).toBe("pass");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("the REAL reader reads a real hub.db read-only and reports its rows", async () => {
+    // Exercises the actual SQL + the readonly open, not just the seam.
+    const h = makeHarness();
+    try {
+      seedCurrentManifest(h.manifestPath);
+      seedOperatorToken(h.configDir);
+      const db = openHubDb(hubDbPath(h.configDir));
+      const owner = await createUser(db, "owner", "correct-horse-battery-staple", {
+        passwordChanged: true,
+      });
+      const alice = await createUser(db, "alice", "correct-horse-battery-staple", {
+        allowMulti: true,
+        passwordChanged: true,
+      });
+      upsertUserVault(db, alice.id, "beta", "write", () => new Date(), {
+        grantedByUserId: owner.id,
+        grantedByPubkey: "b".repeat(64),
+        grantedVia: "mcp",
+      });
+      db.close();
+
+      const { code, checks } = await runDoctor(h, healthyDeps());
+      const rendered = byName(checks, "grant:beta:alice");
+      expect(rendered?.status).toBe("pass");
+      expect(rendered?.detail).toContain("role=write");
+      expect(rendered?.detail).toContain(`granted_by_pubkey=${"b".repeat(64)}`);
+      expect(rendered?.detail).toContain("granted_via=mcp");
+      // The owner is a hub admin with no user_vaults row — nothing rendered.
+      expect(byName(checks, "grant:beta:owner")).toBeUndefined();
+      // write on a non-admin trips the advisory; attribution is complete.
+      expect(byName(checks, "grants-least-privilege")?.status).toBe("warn");
+      expect(byName(checks, "grants-attributed")?.status).toBe("pass");
+      expect(code).toBe(0);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("one line per sync channel binding, with the rows that binding owns", async () => {
+    const h = makeHarness();
+    try {
+      seedCurrentManifest(h.manifestPath);
+      seedOperatorToken(h.configDir);
+      const { checks } = await runDoctor(
+        h,
+        healthyDeps({
+          readGrants: () => ({
+            attributionSince: "2026-06-01T00:00:00.000Z",
+            rows: [],
+            channels: [
+              {
+                relayHost: "buzz.techne.coop",
+                channelId: "3ff68a58",
+                vault: "parachute",
+                members: 4,
+                syncedAt: "2026-09-03T12:00:00.000Z",
+                lastError: null,
+                lastAttemptAt: "2026-09-03T12:00:00.000Z",
+              },
+            ],
+          }),
+        }),
+      );
+      const line = byName(checks, "channel-sync:buzz.techne.coop:3ff68a58");
+      expect(line?.status).toBe("pass");
+      expect(line?.title).toBe("3ff68a58 @ buzz.techne.coop");
+      expect(line?.detail).toContain("vault=parachute");
+      expect(line?.detail).toContain("members=4");
+      expect(line?.detail).toContain("synced_at=2026-09-03T12:00:00.000Z");
+      // A hub with bindings but no grants still shows them.
+      expect(byName(checks, "grants")?.status).toBe("pass");
+      expectNoUnexpectedNonPass(checks, []);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("a frozen binding WARNs with its reason — the freeze is otherwise invisible", async () => {
+    const h = makeHarness();
+    try {
+      seedCurrentManifest(h.manifestPath);
+      seedOperatorToken(h.configDir);
+      const { code, checks } = await runDoctor(
+        h,
+        healthyDeps({
+          readGrants: () => ({
+            attributionSince: "2026-06-01T00:00:00.000Z",
+            rows: [],
+            channels: [
+              {
+                relayHost: "buzz.techne.coop",
+                channelId: "3ff68a58",
+                vault: "parachute",
+                members: 4,
+                syncedAt: "2026-09-01T00:00:00.000Z",
+                lastError: "relay_unreachable",
+                lastAttemptAt: "2026-09-03T12:00:00.000Z",
+              },
+            ],
+          }),
+        }),
+      );
+      const line = byName(checks, "channel-sync:buzz.techne.coop:3ff68a58");
+      expect(line?.status).toBe("warn");
+      expect(line?.detail).toContain("last_error=relay_unreachable");
+      expect(line?.detail).toContain("frozen at the last good roster");
+      // Still advisory — doctor never fails a run over a relay outage.
+      expect(code).toBe(0);
+      expectNoUnexpectedNonPass(checks, ["channel-sync:buzz.techne.coop:3ff68a58"]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("the REAL reader counts only the rows a binding owns", async () => {
+    const h = makeHarness();
+    try {
+      seedCurrentManifest(h.manifestPath);
+      seedOperatorToken(h.configDir);
+      const db = openHubDb(hubDbPath(h.configDir));
+      await createUser(db, "owner", "correct-horse-battery-staple", { passwordChanged: true });
+      const synced = await createUser(db, "synced", "correct-horse-battery-staple", {
+        allowMulti: true,
+        passwordChanged: true,
+      });
+      const byHand = await createUser(db, "byhand", "correct-horse-battery-staple", {
+        allowMulti: true,
+        passwordChanged: true,
+      });
+      upsertChannelVault(db, {
+        relayHost: "buzz.techne.coop",
+        channelId: "3ff68a58",
+        vault: "beta",
+      });
+      const via = channelGrantVia("buzz.techne.coop", "3ff68a58");
+      upsertUserVault(db, synced.id, "beta", "member", () => new Date(), { grantedVia: via });
+      // Same vault, granted by a human — counted in `grants`, NOT in the
+      // binding's member count.
+      upsertUserVault(db, byHand.id, "beta", "member", () => new Date(), { grantedVia: "cli" });
+      db.close();
+
+      const { checks } = await runDoctor(h, healthyDeps());
+      const line = byName(checks, "channel-sync:buzz.techne.coop:3ff68a58");
+      expect(line?.detail).toContain("members=1");
+      expect(line?.detail).toContain("synced_at=never");
+      expect(byName(checks, "grant:beta:synced")?.status).toBe("pass");
+      expect(byName(checks, "grant:beta:byhand")?.status).toBe("pass");
     } finally {
       h.cleanup();
     }

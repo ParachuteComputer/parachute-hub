@@ -69,6 +69,34 @@ describe("serveAppAtRoot", () => {
     expect(await res?.text()).toContain("<title>App</title>");
   });
 
+  test("vault-scoped note deep links get the SPA shell (parachute-app#186, #194)", async () => {
+    // `/v/<vault>/n/<note>` is an APP client route, so in serve-app mode it must
+    // reach the shell and let the app's router resolve it. Nothing in
+    // `hub-server.ts` claims `/v` (only `/vault*` and `/vaults*`, which need the
+    // full word) and it is not a reserved prefix, so this is already true — but
+    // it is true by ABSENCE, which is exactly the kind of fact that regresses
+    // silently when someone adds a hub route. These pin it as a contract.
+    //
+    // Every shape the app can be handed: a ULID id, the editor tail, the
+    // percent-encoded single-segment path the app itself emits, the
+    // multi-segment path a human writes out (arbitrarily deep), a vault
+    // referenced by id rather than name, and the bare `/v/<vault>` address.
+    const deepLinks = [
+      "/v/aaron/n/01JBQZ0Q2M8T9V5X7YB3KD4WEN",
+      "/v/aaron/n/01JBQZ0Q2M8T9V5X7YB3KD4WEN/edit",
+      "/v/aaron/n/Projects%2F2026%2FRoadmap",
+      "/v/aaron/n/Projects/2026/Roadmap",
+      "/v/aaron/n/Projects/2026/Roadmap/edit",
+      "/v/box.example_vault_aaron/n/01JBQZ0Q2M8T9V5X7YB3KD4WEN",
+      "/v/aaron",
+    ];
+    for (const p of deepLinks) {
+      const res = serveAppAtRoot(dist, get(p, "text/html"), p);
+      expect(res, p).not.toBeNull();
+      expect(await res?.text()).toContain("<title>App</title>");
+    }
+  });
+
   test("non-HTML unclaimed request → null (branded 404 tail)", () => {
     expect(serveAppAtRoot(dist, get("/nope.json", "application/json"), "/nope.json")).toBeNull();
     // A missing asset fetched with Accept: */* is not an HTML navigation → null.

@@ -23,6 +23,8 @@
  *     `<hub-origin>/account/2fa` (QR + backup codes).
  */
 
+import { appendFileSync } from "node:fs";
+import { userInfo } from "node:os";
 import { createInterface } from "node:readline/promises";
 import {
   DEFAULT_REAP_AGE_MS,
@@ -37,10 +39,12 @@ import {
 import { CONFIG_DIR } from "../config.ts";
 import { GrantError, parseGrantPubkey } from "../grant-access.ts";
 import { listGrantsForUser, revokeGrant } from "../grants.ts";
+import { HUB_SVC } from "../hub-control.ts";
 import { openHubDb } from "../hub-db.ts";
 import { resolveHubIssuer } from "../hub-issuer.ts";
 import { inferAudience } from "../jwt-audience.ts";
 import {
+  type RevokeActor,
   TokenMintPrincipalGoneError,
   findTokenRowByJti,
   recordTokenMint,
@@ -55,8 +59,11 @@ import {
   OperatorTokenExpiredError,
   isOperatorScopeSet,
   issueOperatorToken,
+  liveOperatorTokenRevokeRefusal,
+  readOperatorTokenJti,
   useOperatorTokenWithAutoRotate,
 } from "../operator-token.ts";
+import { logPath as hubLogPath } from "../process-state.ts";
 import { bindPubkeyOperatorAttested, findPubkeyLink } from "../pubkey-links.ts";
 import { isNonRequestableScope } from "../scope-explanations.ts";
 import { rotateSigningKey } from "../signing-keys.ts";
@@ -157,7 +164,9 @@ Usage:
   parachute auth revoke-token <jti>    Mark a registry-row token revoked
                                        by jti. Idempotent: a re-revoke
                                        prints the existing revoked_at and
-                                       exits 0.
+                                       exits 0. Refuses the live
+                                       operator.token jti unless
+                                       --break-glass is passed.
   parachute auth pending-clients       List OAuth clients awaiting approval
   parachute auth approve-client <id>   Approve a pending OAuth client
   parachute auth revoke-client <id>    Deregister (delete) an OAuth client,
@@ -264,7 +273,13 @@ its next 60s poll; resource servers (vault / scribe / agent) on
 scope-guard 0.2.0+ then reject the JWT. Idempotent: re-revoking an
 already-revoked jti prints the existing revoked_at and exits 0.
 Requires \`parachute:host:auth\` on the operator token (the \`auth\`
-or \`admin\` scope-set).
+or \`admin\` scope-set). It REFUSES to revoke the jti currently in
+~/.parachute/operator.token — that credential is what module-ops
+(start/stop/restart/upgrade) authenticates with, so revoking it takes
+the box's lifecycle verbs down. Rotate first (\`rotate-operator\`), or
+pass \`--break-glass\` if killing it is the actual intent. Every revoke
+records the actor (\`revoked_by\` = \`cli:<unix user>\`, \`revoked_via\`
+= \`cli\`) on the registry row.
 
 pending-clients + approve-client gate /oauth/register against operator
 approval (closes #74). Self-served DCR registrations land as 'pending'
@@ -1428,21 +1443,58 @@ async function runMintToken(args: readonly string[], deps: AuthDeps): Promise<nu
   }
 }
 
+/**
+ * The unix account running the CLI — the `revoked_by` discriminator for the
+ * CLI path. `userInfo()` can throw on a host with no passwd entry for the
+ * uid (some container images); an unknown actor is still better than a
+ * failed revoke, so fall back to a literal.
+ */
+function osUserName(): string {
+  try {
+    return userInfo().username || "unknown";
+  } catch {
+    return "unknown";
+  }
+}
+
+/**
+ * Append one audit line to the hub log. Best-effort by design: the file may
+ * not exist (hub never started here) and a failed append must never fail an
+ * already-committed revoke. O_APPEND, so interleaving with a live hub
+ * process's own writes is safe.
+ */
+function appendHubAuditLine(configDir: string, line: string): void {
+  try {
+    appendFileSync(hubLogPath(HUB_SVC, configDir), `${new Date().toISOString()} ${line}\n`);
+  } catch {
+    // Best-effort — see above.
+  }
+}
+
+/**
+ * `--break-glass` — the ONLY flag `revoke-token` accepts. It waives the
+ * live-operator-token guard (hub#931) and nothing else; every other check
+ * (scope gate, row existence, idempotency) still runs.
+ */
+const REVOKE_TOKEN_BREAK_GLASS_FLAG = "--break-glass";
+
 async function runRevokeToken(args: readonly string[], deps: AuthDeps): Promise<number> {
-  // Single positional: the jti. No flags. (If we grow flags later — say,
-  // --reason for an audit string — they can join here without disrupting
-  // the positional contract.)
+  // Single positional: the jti. One flag: --break-glass. (If we grow more —
+  // say, --reason for an audit string — they can join here without
+  // disrupting the positional contract.)
   const positionals = args.filter((a) => !a.startsWith("--"));
   const flags = args.filter((a) => a.startsWith("--"));
-  if (flags.length > 0) {
+  const breakGlass = flags.includes(REVOKE_TOKEN_BREAK_GLASS_FLAG);
+  const unknownFlags = flags.filter((f) => f !== REVOKE_TOKEN_BREAK_GLASS_FLAG);
+  if (unknownFlags.length > 0) {
     console.error(
-      `parachute auth revoke-token: unexpected flag "${flags[0]}" (this command takes a jti positional only)`,
+      `parachute auth revoke-token: unexpected flag "${unknownFlags[0]}" (this command takes a jti positional and ${REVOKE_TOKEN_BREAK_GLASS_FLAG})`,
     );
     return 1;
   }
   if (positionals.length === 0) {
     console.error("parachute auth revoke-token: missing jti argument");
-    console.error("usage: parachute auth revoke-token <jti>");
+    console.error("usage: parachute auth revoke-token <jti> [--break-glass]");
     return 1;
   }
   if (positionals.length > 1) {
@@ -1516,7 +1568,29 @@ async function runRevokeToken(args: readonly string[], deps: AuthDeps): Promise<
       console.log(`already revoked at ${row.revokedAt}: jti=${jti}`);
       return 0;
     }
-    const ok = revokeTokenByJti(db, jti, new Date());
+    // Live-operator-token guard (hub#931). The jti sitting in
+    // operator.token is what module-ops authenticates with; revoking it
+    // 401s every start/stop/restart/upgrade on the box while `doctor` and
+    // the file itself still look fine. Refuse by default and NAME the
+    // reason; --break-glass is there for the case where killing a leaked
+    // operator credential IS the intent. Ordered AFTER the already-revoked
+    // short-circuit — matching the HTTP path — because a row that is
+    // already revoked has nothing left to protect.
+    if (!breakGlass && jti === readOperatorTokenJti(configDir)) {
+      console.error(
+        `parachute auth revoke-token: ${liveOperatorTokenRevokeRefusal(jti, configDir)}`,
+      );
+      console.error(
+        `pass ${REVOKE_TOKEN_BREAK_GLASS_FLAG} if revoking the live operator credential is what you actually want`,
+      );
+      return 1;
+    }
+    // Actor for the registry row + the audit line. The CLI has no bearer
+    // `sub` of its own worth recording (the operator token's sub is the
+    // hub owner on every box), so the useful discriminator is which unix
+    // account ran the command.
+    const actor: RevokeActor = { by: `cli:${osUserName()}`, via: "cli" };
+    const ok = revokeTokenByJti(db, jti, new Date(), actor);
     if (!ok) {
       // Race: row existed, then disappeared or got revoked between our
       // lookups. Surface as not-found rather than silently succeeding —
@@ -1533,7 +1607,16 @@ async function runRevokeToken(args: readonly string[], deps: AuthDeps): Promise<
     // output would mislabel the UUID for any operator grepping on it.
     // `identity=` matches what the helper returns regardless of row type.
     console.log(
-      `revoked: jti=${jti}, identity=${tokenRowIdentity(row)}, scope=${row.scopes.join(" ") || "(none)"}`,
+      `revoked: jti=${jti}, identity=${tokenRowIdentity(row)}, scope=${row.scopes.join(" ") || "(none)"}, revoked_by=${actor.by}`,
+    );
+    // Audit line in the same `key=value` shape the HTTP path emits, appended
+    // to hub.log so "who revoked this" is greppable in ONE place regardless
+    // of which surface did it (hub#931 — the CLI path previously left no
+    // trace anywhere). Best-effort: the hub may never have run on this box,
+    // and a failed audit append must not fail a completed revoke.
+    appendHubAuditLine(
+      configDir,
+      `token revoked: jti=${jti} identity=${tokenRowIdentity(row)} revoked_by=${actor.by} revoked_via=${actor.via}${breakGlass ? " break_glass=1" : ""}`,
     );
     return 0;
   } finally {

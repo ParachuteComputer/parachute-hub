@@ -22,6 +22,7 @@
  */
 import { WORDMARK_TEXT, brandMarkSvg } from "./brand.ts";
 import { renderCsrfHiddenInput } from "./csrf.ts";
+import { NOSTR_LOGIN_STYLES, renderNostrKeyDoor } from "./nostr-login-ui.ts";
 import { type ScopeExplanation, explainScope, riskForExplanation } from "./scope-explanations.ts";
 
 /** Brand palette — kept in sync with parachute.computer/style.css. */
@@ -349,6 +350,7 @@ export function renderLogin(props: LoginViewProps): string {
         </label>
         <button type="submit" class="btn btn-primary">Sign in</button>
       </form>
+      ${renderNostrKeyDoor()}
     </div>`;
   return baseDocument("Sign in to Parachute Hub", body);
 }
@@ -1777,4 +1779,5 @@ const STYLES = `
     .error-help { border-color: #3a362f; color: #a8a29a; }
     .scope-empty { background: #1a1815; }
   }
+${NOSTR_LOGIN_STYLES}
 `;

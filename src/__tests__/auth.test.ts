@@ -7,12 +7,13 @@ import { registerClient } from "../clients.ts";
 import { type AuthDeps, type Runner, auth, authHelp } from "../commands/auth.ts";
 import { findGrant, recordGrant } from "../grants.ts";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
-import { signAccessToken, validateAccessToken } from "../jwt-sign.ts";
+import { findTokenRowByJti, signAccessToken, validateAccessToken } from "../jwt-sign.ts";
 import {
   OPERATOR_TOKEN_AUDIENCE,
   OPERATOR_TOKEN_CLIENT_ID,
   OPERATOR_TOKEN_SCOPES,
   readOperatorTokenFile,
+  readOperatorTokenJti,
   writeOperatorTokenFile,
 } from "../operator-token.ts";
 import { createUser, deleteUser, listUsers, verifyPassword } from "../users.ts";
@@ -2443,6 +2444,101 @@ describe("parachute auth revoke-token", () => {
   test("authHelp lists revoke-token alongside mint-token", () => {
     expect(authHelp()).toContain("revoke-token");
     expect(authHelp()).toContain("revoke-token <jti>");
+  });
+
+  // hub#931. `set-password` writes a real operator.token into the sandbox, so
+  // its jti IS the live operator credential for these tests — the exact shape
+  // that took module-ops down on the mini.
+  function liveOperatorJti(configDir: string): string {
+    const jti = readOperatorTokenJti(configDir);
+    expect(jti).not.toBeNull();
+    return jti!;
+  }
+
+  test("refuses to revoke the live operator.token jti without --break-glass", async () => {
+    const tmp = makeTmp();
+    try {
+      const deps: AuthDeps = {
+        dbPath: tmp.dbPath,
+        configDir: tmp.dir,
+        isInteractive: () => false,
+      };
+      await captureOutput(() => auth(["set-password", "--password", "pw"], deps));
+      const jti = liveOperatorJti(tmp.dir);
+
+      const { code, stderr } = await captureOutput(() => auth(["revoke-token", jti], deps));
+      expect(code).toBe(1);
+      // The error NAMES the reason, and the remedy.
+      expect(stderr).toContain("live operator token");
+      expect(stderr).toContain("module-ops");
+      expect(stderr).toContain("rotate-operator");
+      expect(stderr).toContain("--break-glass");
+
+      // The row is untouched — the guard refuses, it doesn't half-revoke.
+      const db = openHubDb(tmp.dbPath);
+      try {
+        expect(findTokenRowByJti(db, jti)?.revokedAt).toBeNull();
+      } finally {
+        db.close();
+      }
+    } finally {
+      tmp.cleanup();
+    }
+  });
+
+  test("--break-glass revokes the live operator.token jti", async () => {
+    const tmp = makeTmp();
+    try {
+      const deps: AuthDeps = {
+        dbPath: tmp.dbPath,
+        configDir: tmp.dir,
+        isInteractive: () => false,
+      };
+      await captureOutput(() => auth(["set-password", "--password", "pw"], deps));
+      const jti = liveOperatorJti(tmp.dir);
+
+      const { code, stdout } = await captureOutput(() =>
+        auth(["revoke-token", jti, "--break-glass"], deps),
+      );
+      expect(code).toBe(0);
+      expect(stdout).toContain(`revoked: jti=${jti}`);
+
+      const db = openHubDb(tmp.dbPath);
+      try {
+        expect(findTokenRowByJti(db, jti)?.revokedAt).not.toBeNull();
+      } finally {
+        db.close();
+      }
+    } finally {
+      tmp.cleanup();
+    }
+  });
+
+  test("records revoked_by = cli:<unix user> and revoked_via = cli", async () => {
+    const tmp = makeTmp();
+    try {
+      const deps: AuthDeps = {
+        dbPath: tmp.dbPath,
+        configDir: tmp.dir,
+        isInteractive: () => false,
+      };
+      await captureOutput(() => auth(["set-password", "--password", "pw"], deps));
+      const jti = await mintAJti(deps);
+      const { code, stdout } = await captureOutput(() => auth(["revoke-token", jti], deps));
+      expect(code).toBe(0);
+      expect(stdout).toContain("revoked_by=cli:");
+
+      const db = openHubDb(tmp.dbPath);
+      try {
+        const row = findTokenRowByJti(db, jti);
+        expect(row?.revokedBy).toStartWith("cli:");
+        expect(row?.revokedVia).toBe("cli");
+      } finally {
+        db.close();
+      }
+    } finally {
+      tmp.cleanup();
+    }
   });
 });
 

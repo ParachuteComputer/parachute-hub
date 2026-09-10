@@ -3,9 +3,11 @@
  * `/account/mcp`.
  *
  * Hub-native tools live here (list-vaults, create-vault, grant/revoke/
- * list-access). Vault-shaped tools are a live `tools/list` + JSON-RPC
- * proxy (`account-mcp-backend.ts`) onto `/vault/<name>/mcp` — not REST
- * clones. Cloud's twin in the identity worker is still a REST facade and
+ * list-access). The admin-shaped trio needs the `admin` verb on the vault,
+ * which only `user_vaults.role = 'write'` carries — a `member`-role principal
+ * reads and writes the vault but never sees these tools in `tools/list`.
+ * Vault-shaped tools are a live `tools/list` + JSON-RPC proxy
+ * (`account-mcp-backend.ts`) onto `/vault/<name>/mcp` — not REST clones. Cloud's twin in the identity worker is still a REST facade and
  * is out of this cut. Coverage is hub-shaped:
  *
  *   - Bearer is the cloud-shaped connection grant: `account:self:vaults`
@@ -346,8 +348,9 @@ const grantAccessTool: AccountMcpTool = {
   description:
     "Give a Nostr pubkey access to one vault. Creates a key-only hub user if the " +
     "pubkey is not yet linked. Writes one user_vaults row — does not replace the " +
-    "target's other vaults. Role is read or write and cannot be granted unless you " +
-    "can admin that vault.",
+    "target's other vaults. Role is read, member, or write, and cannot be granted " +
+    "unless you can admin that vault. Prefer `member` unless the target genuinely " +
+    "needs to re-grant: `write` carries vault admin.",
   inputSchema: {
     type: "object",
     properties: {
@@ -360,8 +363,11 @@ const grantAccessTool: AccountMcpTool = {
       vault: { type: "string", description: "Installed vault name." },
       role: {
         type: "string",
-        enum: ["read", "write"],
-        description: 'Access role. "write" is full vault authority (read/write/admin).',
+        enum: ["read", "member", "write"],
+        description:
+          'Access role. "read" is read-only; "member" is read+write with NO admin ' +
+          '(cannot grant/revoke/list access); "write" is full vault authority ' +
+          "(read/write/admin, and therefore may re-grant to anyone).",
       },
     },
     required: ["pubkey", "vault", "role"],
@@ -371,7 +377,9 @@ const grantAccessTool: AccountMcpTool = {
     try {
       return await grantAccess(
         ctx.db,
-        ctx.principal,
+        // `via` is stamped at the door, not carried on the principal: the
+        // principal describes WHO, this describes WHICH ENTRANCE.
+        { ...ctx.principal, via: "mcp" },
         args,
         installedNameSet(ctx),
         ctx.now ?? (() => new Date()),
@@ -403,7 +411,7 @@ const revokeAccessTool: AccountMcpTool = {
   },
   async execute(args, ctx) {
     try {
-      return revokeAccess(ctx.db, ctx.principal, args, installedNameSet(ctx));
+      return revokeAccess(ctx.db, { ...ctx.principal, via: "mcp" }, args, installedNameSet(ctx));
     } catch (err) {
       throwGrant(err);
     }
@@ -415,7 +423,8 @@ const listAccessTool: AccountMcpTool = {
   description:
     "List pubkey → vault grants this connection can admin. Omit `vault` for every " +
     "such grant; pass it to filter to one vault. Password-only users without a " +
-    "linked key are not included.",
+    "linked key are not included. Each row carries granted_by_pubkey and " +
+    "granted_via (both null for grants made before the hub recorded a grantor).",
   inputSchema: {
     type: "object",
     properties: {

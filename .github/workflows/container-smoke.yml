@@ -4,7 +4,9 @@
 # X-Forwarded-* forwarding) before it reaches main / Render.
 #
 # Runs on:
-#   - Every PR (catch regressions before merge)
+#   - Every PR into main or next (catch regressions before merge; the merge
+#     train's feature PRs target next, so gating only main would let every
+#     feature PR skip smoke — hub#845, mirroring the #843 fix on pr-verify)
 #   - Every push to main (catch regressions that slipped through PR review)
 #
 # Why a separate workflow from release.yml: release.yml runs on tag push
@@ -17,7 +19,7 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
+    branches: [main, next]
 
 concurrency:
   # One smoke run per ref. Cancel stale runs on rapid PR pushes.

@@ -24,6 +24,11 @@
  *   - Exposure checks only run when expose-state says the box is exposed;
  *     a loopback-only box reads "loopback only" as benign info (PASS), never
  *     a warning.
+ *   - The Grants group inventories `user_vaults` and warns only on positively
+ *     detected conditions (a non-admin `write` row, which carries re-grant
+ *     authority; a post-migration row with no recorded grantor). No hub.db,
+ *     or no assignments, is benign info (PASS) — a box that has never granted
+ *     anything is a normal box.
  *
  * The headline guarantee is the fresh-install fixture test: a sandboxed
  * PARACHUTE_HOME with a minimal-but-current services.json + a valid
@@ -42,7 +47,8 @@
  * network/manager/db call — same discipline as `status.ts`.
  */
 
-import { readFileSync } from "node:fs";
+import { Database } from "bun:sqlite";
+import { existsSync, readFileSync } from "node:fs";
 import { createInterface } from "node:readline/promises";
 import {
   type MissingDependencyError,
@@ -50,9 +56,11 @@ import {
   ensureExecutable,
 } from "@openparachute/depcheck";
 import { decodeJwt } from "jose";
+import { CHANNEL_GRANT_VIA_PREFIX } from "../channel-reconciler.ts";
 import { CONFIG_DIR, SERVICES_MANIFEST_PATH } from "../config.ts";
 import { type ExposeState, readExposeState } from "../expose-state.ts";
 import { HUB_SVC, readHubPort } from "../hub-control.ts";
+import { GRANT_ATTRIBUTION_MIGRATION, hubDbPath } from "../hub-db.ts";
 import {
   HIJACK_INCIDENT_REF,
   type HubInstanceRecord,
@@ -103,7 +111,7 @@ export interface CheckResult {
 }
 
 /** A logical group of checks in the human report. */
-const GROUP_ORDER = ["Hub", "Modules", "Configuration", "Migration", "Exposure"] as const;
+const GROUP_ORDER = ["Hub", "Modules", "Configuration", "Grants", "Migration", "Exposure"] as const;
 type Group = (typeof GROUP_ORDER)[number];
 
 interface GroupedCheck extends CheckResult {
@@ -183,6 +191,62 @@ export interface DoctorDeps {
    * so the check degrades to the instance comparison alone. Tests inject a count.
    */
   countHubListeners?: (port: number) => number | undefined;
+  /**
+   * Read the `user_vaults` assignments (+ the attribution migration's
+   * applied_at) out of `hub.db` for the Grants group. Default opens the DB
+   * **read-only** — doctor never migrates and never writes — and returns
+   * `null` when there is no DB yet or it cannot be read, which the check
+   * renders as benign "nothing granted", never a failure. Tests inject a
+   * snapshot so the group runs without a real hub.db.
+   */
+  readGrants?: (configDir: string) => GrantsSnapshot | null;
+}
+
+/** One `user_vaults` assignment, as the Grants group reports it. */
+export interface GrantAssignment {
+  vault: string;
+  userId: string;
+  username: string;
+  role: string;
+  /** Hub-wide admins are unrestricted by construction — excluded from the least-privilege check. */
+  hubAdmin: boolean;
+  grantedByUserId: string | null;
+  grantedByPubkey: string | null;
+  grantedVia: string | null;
+  createdAt: string;
+}
+
+/**
+ * One `channel_vaults` binding in `sync` mode, as the Grants group reports it
+ * (channel-attached vaults PR 5). Read-only inventory: doctor never runs a
+ * reconcile pass, it reports the one the hub already ran.
+ */
+export interface ChannelSyncStatus {
+  relayHost: string;
+  channelId: string;
+  vault: string;
+  /** `user_vaults` rows on that vault carrying THIS binding's provenance. */
+  members: number;
+  /** Last SUCCESSFUL sync, or `null` for "never". */
+  syncedAt: string | null;
+  /** Reason word from the last failed poll, or `null` when the last one worked. */
+  lastError: string | null;
+  lastAttemptAt: string | null;
+}
+
+export interface GrantsSnapshot {
+  rows: GrantAssignment[];
+  /**
+   * The `sync` bindings, or `[]` on a hub with none (and on a DB older than
+   * the migration that added the columns — an old DB is not a finding).
+   */
+  channels?: ChannelSyncStatus[];
+  /**
+   * `schema_version.applied_at` for {@link GRANT_ATTRIBUTION_MIGRATION}, or
+   * `null` when the migration hasn't run. Rows created before this stamp
+   * predate attribution and are not flagged for lacking it.
+   */
+  attributionSince: string | null;
 }
 
 export interface DoctorOpts {
@@ -270,6 +334,111 @@ function defaultCountHubListeners(port: number): number | undefined {
   }
 }
 
+/**
+ * Read `user_vaults` out of `hub.db` for the Grants group.
+ *
+ * READ-ONLY on purpose, twice over: the `Database` is opened `readonly` so
+ * doctor cannot run a migration as a side effect of diagnosing (the hub owns
+ * schema movement), and any failure — no DB yet, a schema older than the
+ * attribution columns, a locked or corrupt file — returns `null` rather than
+ * throwing, so the check degrades to "nothing to report" instead of turning a
+ * diagnostic into a crash. Same posture as every other probe here.
+ */
+function defaultReadGrants(configDir: string): GrantsSnapshot | null {
+  const path = hubDbPath(configDir);
+  if (!existsSync(path)) return null;
+  let db: Database | undefined;
+  try {
+    db = new Database(path, { readonly: true });
+    const applied = db
+      .query<{ applied_at: string }, [number]>(
+        "SELECT applied_at FROM schema_version WHERE version = ?",
+      )
+      .get(GRANT_ATTRIBUTION_MIGRATION);
+    const rows = db
+      .query<
+        {
+          vault_name: string;
+          user_id: string;
+          username: string;
+          role: string;
+          hub_role: string;
+          granted_by_user_id: string | null;
+          granted_by_pubkey: string | null;
+          granted_via: string | null;
+          created_at: string;
+        },
+        []
+      >(
+        `SELECT uv.vault_name, uv.user_id, u.username, uv.role, u.hub_role,
+                uv.granted_by_user_id, uv.granted_by_pubkey, uv.granted_via, uv.created_at
+           FROM user_vaults uv
+           JOIN users u ON u.id = uv.user_id
+          ORDER BY uv.vault_name ASC, u.username ASC`,
+      )
+      .all();
+    // Separate try: a hub.db that predates migration v24 has no `last_error`
+    // column, and a throw here would take the whole Grants group down with it.
+    // An older DB simply reports no channel bindings.
+    let channels: ChannelSyncStatus[] = [];
+    try {
+      channels = db
+        .query<
+          {
+            relay_host: string;
+            channel_id: string;
+            vault: string;
+            members: number;
+            synced_at: string | null;
+            last_error: string | null;
+            last_attempt_at: string | null;
+          },
+          [string]
+        >(
+          `SELECT cv.relay_host, cv.channel_id, cv.vault, cv.synced_at,
+                  cv.last_error, cv.last_attempt_at,
+                  (SELECT COUNT(*) FROM user_vaults uv
+                    WHERE uv.vault_name = cv.vault
+                      AND uv.granted_via = ? || cv.relay_host || ':' || cv.channel_id) AS members
+             FROM channel_vaults cv
+            WHERE cv.mode = 'sync'
+            ORDER BY cv.relay_host ASC, cv.channel_id ASC`,
+        )
+        .all(CHANNEL_GRANT_VIA_PREFIX)
+        .map((r) => ({
+          relayHost: r.relay_host,
+          channelId: r.channel_id,
+          vault: r.vault,
+          members: r.members,
+          syncedAt: r.synced_at,
+          lastError: r.last_error,
+          lastAttemptAt: r.last_attempt_at,
+        }));
+    } catch {
+      channels = [];
+    }
+    return {
+      attributionSince: applied?.applied_at ?? null,
+      channels,
+      rows: rows.map((r) => ({
+        vault: r.vault_name,
+        userId: r.user_id,
+        username: r.username,
+        role: r.role,
+        hubAdmin: r.hub_role === "admin",
+        grantedByUserId: r.granted_by_user_id,
+        grantedByPubkey: r.granted_by_pubkey,
+        grantedVia: r.granted_via,
+        createdAt: r.created_at,
+      })),
+    };
+  } catch {
+    return null;
+  } finally {
+    db?.close();
+  }
+}
+
 /** Both ends of the pipe must be a TTY for an interactive confirm to make sense. */
 function defaultIsInteractive(): boolean {
   return Boolean(process.stdin.isTTY && process.stdout.isTTY);
@@ -299,6 +468,7 @@ interface ResolvedDeps {
   readInstanceRecord: (configDir: string) => HubInstanceRecord | null;
   probeLoopbackInstance: (port: number) => Promise<LoopbackProbe>;
   countHubListeners: (port: number) => number | undefined;
+  readGrants: (configDir: string) => GrantsSnapshot | null;
 }
 
 function resolveDeps(d: DoctorDeps | undefined): ResolvedDeps {
@@ -316,6 +486,7 @@ function resolveDeps(d: DoctorDeps | undefined): ResolvedDeps {
     readInstanceRecord: d?.readInstanceRecord ?? readHubInstanceFile,
     probeLoopbackInstance: d?.probeLoopbackInstance ?? probeLoopbackInstance,
     countHubListeners: d?.countHubListeners ?? defaultCountHubListeners,
+    readGrants: d?.readGrants ?? defaultReadGrants,
   };
 }
 
@@ -790,6 +961,40 @@ function checkPortDrift(manifestPath: string): CheckResult {
 }
 
 /**
+ * `tokens.revoked_at` for a jti, read from hub.db — or null when the answer
+ * is unavailable for ANY reason (no DB file, table/column absent because
+ * migrations haven't run, DB locked, row missing, row not revoked). Doctor
+ * must run on a box with no hub.db at all, so "can't tell" and "not revoked"
+ * deliberately collapse to the same null.
+ *
+ * `readonly: true` for the same reason `vault/auth-status.ts` uses it:
+ * `openHubDb()` would run migrations as a side effect, and doctor is a
+ * read-only probe that must not mutate the operator's DB — nor contend for a
+ * write lock with the live hub.
+ */
+function defaultProbeRevokedAt(dbPath: string, jti: string): string | null {
+  if (!existsSync(dbPath)) return null;
+  let db: Database | undefined;
+  try {
+    db = new Database(dbPath, { readonly: true });
+    const row = db
+      .query<{ revoked_at: string | null }, [string]>(
+        "SELECT revoked_at FROM tokens WHERE jti = ? LIMIT 1",
+      )
+      .get(jti);
+    return row?.revoked_at ?? null;
+  } catch {
+    return null;
+  } finally {
+    try {
+      db?.close();
+    } catch {
+      // ignore
+    }
+  }
+}
+
+/**
  * operator.token exists, parses, and its `iss` matches a hub-legitimate issuer.
  *
  * Absent token → PASS/info (a box that hasn't created its first admin yet, or
@@ -804,13 +1009,24 @@ function checkPortDrift(manifestPath: string): CheckResult {
  *   - `iss` is foreign to that set → FAIL: the recurring "not signed in to the
  *     hub" / issuer-mismatch class (hub#481). Fix is `start hub` (self-heals)
  *     or `auth rotate-operator`.
+ *   - registry row for the token's `jti` has `revoked_at` set → FAIL
+ *     (hub#931). This is the shape that read as healthy for hours on the
+ *     mini: a structurally-valid, correctly-issued JWT whose row had been
+ *     revoked, so every module-ops call 401'd while doctor said green.
+ *     An `iss` match alone was never proof the credential still works.
  *
  * Deliberately a DECODE-only `iss` check, not a full signature/JWKS validation:
  * doctor must run without a live hub or DB, and an unsigned-but-decodable token
  * still tells us the issuer-mismatch story. The known-issuer set is the same
  * one the real validation layers `iss` against on top of the signature check.
+ * The revocation lookup is likewise best-effort — no hub.db, no `jti` claim,
+ * or an unreadable DB means "can't tell", which stays out of the way of the
+ * `iss` verdict rather than manufacturing a failure.
  */
-function checkOperatorToken(configDir: string): CheckResult {
+function checkOperatorToken(
+  configDir: string,
+  probeRevokedAt: (dbPath: string, jti: string) => string | null = defaultProbeRevokedAt,
+): CheckResult {
   const path = operatorTokenPath(configDir);
   let token: string;
   try {
@@ -834,9 +1050,11 @@ function checkOperatorToken(configDir: string): CheckResult {
   }
 
   let iss: string | undefined;
+  let jti: string | undefined;
   try {
     const payload = decodeJwt(token);
     iss = typeof payload.iss === "string" ? payload.iss : undefined;
+    jti = typeof payload.jti === "string" && payload.jti.length > 0 ? payload.jti : undefined;
   } catch {
     return {
       name: "operator-token",
@@ -854,6 +1072,22 @@ function checkOperatorToken(configDir: string): CheckResult {
       detail: "operator.token has no `iss` claim",
       fix: "parachute auth rotate-operator",
     };
+  }
+
+  // Registry check BEFORE the issuer verdict: a revoked credential is the
+  // more specific — and more actionable — failure, and unlike `iss` it can't
+  // be self-healed by `start hub`.
+  if (jti) {
+    const revokedAt = probeRevokedAt(hubDbPath(configDir), jti);
+    if (revokedAt) {
+      return {
+        name: "operator-token",
+        title: "operator.token valid + issuer matches",
+        status: "fail",
+        detail: `operator.token (jti=${jti}) was REVOKED at ${revokedAt} — the JWT still parses and its issuer may still match, but the hub rejects it, so module-ops (start/stop/restart/upgrade) will 401`,
+        fix: "parachute auth rotate-operator",
+      };
+    }
   }
 
   // Build the issuer set the live auth path validates against (loopback aliases
@@ -1052,6 +1286,153 @@ function checkMigration(
   return out;
 }
 
+/**
+ * Who holds what on which vault, and two advisories about it.
+ *
+ * The inventory is the point: `user_vaults` is the only place a hub records
+ * "this account may reach this vault", and until now the only way to read it
+ * was to open `hub.db` by hand. Every assignment renders as one PASS row —
+ * an inventory line, not a verdict.
+ *
+ * Two checks sit on top:
+ *
+ *   - `grants-least-privilege` (WARN) — `role = 'write'` maps to
+ *     `["read","write","admin"]` (`vaultVerbsForRole`), and `admin` is exactly
+ *     what `callerCanAdminVault` reads, so every write-role assignee can grant
+ *     that vault to anyone. That is usually not what the operator meant;
+ *     `member` is read+write with no re-grant. Hub admins are skipped — they
+ *     are unrestricted by construction, so the row says nothing extra.
+ *   - `grants-attributed` (WARN) — a row written AFTER the attribution
+ *     migration with no grantor at all. Rows older than the migration are not
+ *     flagged: the hub genuinely wasn't recording, so "unknown" is the honest
+ *     value and flagging it would be the "unfamiliar = broken" bug this file
+ *     exists to avoid. A row with a hub user id but no pubkey (Bearer / CLI /
+ *     API grant — no key signed it) counts as attributed; demanding a pubkey
+ *     there would false-positive on every non-NIP-98 door.
+ *
+ * Channel-attached vaults (PR 5) add one line per `sync` binding underneath:
+ * vault, how many rows that binding currently owns, when it last synced, and
+ * the last failure reason if the most recent poll failed. WARN in exactly that
+ * last case — a frozen binding is working as designed (grants retained,
+ * `synced_at` stale) and is therefore invisible without being told, which is
+ * the whole reason to print it. A binding that has never synced on a hub with
+ * no reader key never records a failure, so opting out costs no warning.
+ *
+ * No hub.db, or an unreadable one → one benign PASS. A box that has never
+ * granted anything is a normal box.
+ */
+function checkGrants(configDir: string, deps: ResolvedDeps): CheckResult[] {
+  const snapshot = deps.readGrants(configDir);
+  if (snapshot === null) {
+    return [
+      {
+        name: "grants",
+        title: "Vault grants",
+        status: "pass",
+        detail: "no readable hub database — nothing granted on this box yet",
+      },
+    ];
+  }
+  const channelChecks = channelSyncChecks(snapshot.channels ?? []);
+  if (snapshot.rows.length === 0) {
+    return [
+      {
+        name: "grants",
+        title: "Vault grants",
+        status: "pass",
+        detail: "no vault assignments recorded",
+      },
+      ...channelChecks,
+    ];
+  }
+
+  const out: CheckResult[] = [];
+  for (const r of snapshot.rows) {
+    out.push({
+      name: `grant:${r.vault}:${r.username}`,
+      title: `${r.vault} → ${r.username}`,
+      status: "pass",
+      detail:
+        `role=${r.role} granted_by_pubkey=${r.grantedByPubkey ?? "-"} ` +
+        `granted_via=${r.grantedVia ?? "-"} created_at=${r.createdAt}`,
+    });
+  }
+
+  const broad = snapshot.rows.filter((r) => !r.hubAdmin && r.role === "write");
+  out.push(
+    broad.length === 0
+      ? {
+          name: "grants-least-privilege",
+          title: "Least privilege",
+          status: "pass",
+          detail: "no non-admin assignment carries the re-granting `write` role",
+        }
+      : {
+          name: "grants-least-privilege",
+          title: "Least privilege",
+          status: "warn",
+          detail: `${broad
+            .map((r) => `${r.username}@${r.vault}`)
+            .join(", ")} holds admin via write; consider role member`,
+        },
+  );
+
+  const since = snapshot.attributionSince;
+  const unattributed = snapshot.rows.filter(
+    (r) =>
+      since !== null &&
+      r.createdAt >= since &&
+      r.grantedByPubkey === null &&
+      r.grantedByUserId === null,
+  );
+  out.push(
+    unattributed.length === 0
+      ? {
+          name: "grants-attributed",
+          title: "Grant attribution",
+          status: "pass",
+          detail:
+            since === null
+              ? "attribution migration has not run yet — nothing expected to carry a grantor"
+              : "every grant made since attribution landed records who made it",
+        }
+      : {
+          name: "grants-attributed",
+          title: "Grant attribution",
+          status: "warn",
+          detail: `${unattributed
+            .map((r) => `${r.username}@${r.vault}`)
+            .join(", ")} granted since attribution landed but record no grantor`,
+        },
+  );
+  out.push(...channelChecks);
+  return out;
+}
+
+/** One inventory line per `sync` channel binding. Read-only; never reconciles. */
+function channelSyncChecks(channels: readonly ChannelSyncStatus[]): CheckResult[] {
+  return channels.map((c) => {
+    const synced = c.syncedAt ?? "never";
+    const base = `vault=${c.vault} members=${c.members} synced_at=${synced}`;
+    if (c.lastError === null) {
+      return {
+        name: `channel-sync:${c.relayHost}:${c.channelId}`,
+        title: `${c.channelId} @ ${c.relayHost}`,
+        status: "pass",
+        detail: base,
+      };
+    }
+    return {
+      name: `channel-sync:${c.relayHost}:${c.channelId}`,
+      title: `${c.channelId} @ ${c.relayHost}`,
+      status: "warn",
+      detail:
+        `${base} last_error=${c.lastError} last_attempt_at=${c.lastAttemptAt ?? "-"} ` +
+        `— grants are frozen at the last good roster (${c.members} row(s) retained)`,
+    };
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Tier 2 checks (guarded hard — never FAIL on not-configured)
 // ---------------------------------------------------------------------------
@@ -1190,6 +1571,7 @@ async function runChecks(
   const portDrift = checkPortDrift(manifestPath);
   const operator = checkOperatorToken(configDir);
   const migration = checkMigration(configDir, manifestPath, deps);
+  const grants = checkGrants(configDir, deps);
   const versionDrift = checkVersionDrift(manifest);
 
   const grouped: GroupedCheck[] = [];
@@ -1199,6 +1581,7 @@ async function runChecks(
   add("Hub", [hub, hijack]);
   add("Modules", [...modules, ...bins]);
   add("Configuration", [manifestCheck, portDrift, operator]);
+  add("Grants", grants);
   add("Migration", migration);
   add("Exposure", [exposure, versionDrift]);
   return grouped;

@@ -11,7 +11,12 @@
  * additive `tokens.subject_pubkey` attribution snapshot (v17, hub#833
  * phase 1), the durable attribution proof archive (v18, hub#860), and a
  * live `tokens.user_id` backfill where `subject` already equals a
- * `users.id` (v19, hub#833 per-account mint).
+ * `users.id` (v19, hub#833 per-account mint), stored hub roles on the users
+ * row (v20, hub#881), the additive `tokens.revoked_by` /
+ * `tokens.revoked_via` revocation-actor columns (v21, hub#931), grant
+ * attribution on `user_vaults` (v22), and the `channel_vaults` binding
+ * table that attaches a Buzz channel to a vault (v23, design
+ * "Channel-attached vaults — membership becomes access").
  *
  * Each open() runs `migrate()` to bring the schema up to date. A
  * `schema_version` table records every applied migration so re-opens are
@@ -744,6 +749,146 @@ const MIGRATIONS: readonly Migration[] = [
        WHERE id = (SELECT id FROM users ORDER BY created_at ASC LIMIT 1);
     `,
   },
+  {
+    version: 21,
+    sql: `
+      -- Who revoked this token, and over which surface (hub#931). Before
+      -- this migration a revoked row recorded only \`revoked_at\`, so a
+      -- credential that died mid-upgrade left NO trace of the actor — the
+      -- CLI path in particular wrote nothing anywhere.
+      --
+      --   * revoked_by (TEXT) — the actor. HTTP records the bearer's
+      --     \`sub\`; the CLI records \`cli:<unix user>\`.
+      --   * revoked_via (TEXT) — 'cli' | 'http'. TEXT, not a flag, so a
+      --     third surface can land without a migration.
+      --
+      -- Both nullable with NO backfill and NO default: every pre-v21 row,
+      -- and every revoke by an internal sweep that names no actor
+      -- (\`revokeTokensNamingVault\`, refresh rotation), keeps NULL. Same
+      -- posture as \`tokens.subject_pubkey\` (v17) — we do not fabricate
+      -- attribution we never had. NULL means "unrecorded", not "nobody".
+      ALTER TABLE tokens ADD COLUMN revoked_by TEXT;
+      ALTER TABLE tokens ADD COLUMN revoked_via TEXT;
+    `,
+  },
+  {
+    version: 22,
+    sql: `
+      -- Grant attribution on \`user_vaults\` (hub lockdown). Until now a row
+      -- said WHO HAS access and nothing about WHO GAVE IT: an operator
+      -- looking at an unexpected assignment had no way to tell whether the
+      -- owner made it, a write-role assignee re-granted it, or it arrived
+      -- through the admin API. Three nullable columns, no backfill:
+      --
+      --   * granted_by_user_id (TEXT NULL) — the hub account that granted.
+      --   * granted_by_pubkey  (TEXT NULL) — the Nostr key that SIGNED the
+      --     granting request, when there was one (NIP-98 only). Several
+      --     agents with their own keys routinely link to one hub user, so
+      --     the user id alone cannot name the actor; this can.
+      --   * granted_via        (TEXT NULL) — 'mcp' | 'cli' | 'api'. No CHECK
+      --     constraint: this is an attribution label, never an authority
+      --     input, so an unrecognised value is a display concern, not a
+      --     privilege one.
+      --
+      -- Deliberately NO backfill. Every pre-existing row was written before
+      -- the hub recorded a grantor, so any value we invented here would be a
+      -- fabricated audit trail. NULL reads as "unknown", which is true.
+      -- \`doctor\`'s grants-attributed check therefore only looks at rows
+      -- created AFTER this migration's applied_at.
+      --
+      -- Nullable rather than NOT NULL DEFAULT: a writer that doesn't know
+      -- about these columns should leave "unknown", not claim an actor.
+      ALTER TABLE user_vaults ADD COLUMN granted_by_user_id TEXT;
+      ALTER TABLE user_vaults ADD COLUMN granted_by_pubkey TEXT;
+      ALTER TABLE user_vaults ADD COLUMN granted_via TEXT;
+    `,
+  },
+  {
+    version: 23,
+    sql: `
+      -- Channel-attached vaults, PR 1 (design "Channel-attached vaults —
+      -- membership becomes access", §1). Binds ONE Buzz channel to ONE
+      -- Parachute vault so a later reconciler can turn channel membership
+      -- into \`user_vaults\` rows. This PR ships the binding only: no
+      -- roster fetch, no grants, no reconciler.
+      --
+      -- Schema:
+      --   * (relay_host, channel_id) composite PK — one binding per channel.
+      --     A vault MAY back several channels, so there is no UNIQUE on
+      --     \`vault\`; the index below serves the inverse lookup ("which
+      --     channels point at vault X?"), the same shape
+      --     \`user_vaults_vault\` (v10) serves.
+      --   * relay_host — stored LOWER-CASED and scheme-less, matching
+      --     \`relayHostOf\` in parachute-surface's parachute-mcp
+      --     (packages/parachute-mcp/src/channel.ts). Hostnames are
+      --     case-insensitive but the vault PATHS derived from them are not,
+      --     so a case difference would fork one channel into two bindings.
+      --   * vault — a vault INSTANCE NAME, same name space as
+      --     \`user_vaults.vault_name\` / services.json / \`invites.vault_name\`.
+      --     No FK: there is no vaults table on the hub (names resolve
+      --     through services.json), the established hub pattern.
+      --   * mode — 'sync' | 'frozen'. TEXT with a 'sync' default rather than
+      --     a flag so a third mode can land without a migration, and NO
+      --     CHECK constraint: the same fail-closed-at-the-reader posture
+      --     \`vaultVerbsForRole\` takes on \`user_vaults.role\` (v10) and
+      --     \`isHubAdmin\` takes on \`users.hub_role\` (v20). 'frozen' means
+      --     "keep the grants you have, stop syncing" — the answer to the
+      --     relay-unreachable question in the design.
+      --   * relay_self_pubkey — the relay's NIP-11 \`self\` key, pinned
+      --     trust-on-first-use so PR 4 can verify the signature on the kind
+      --     39002 roster it fetches. NULL until a roster fetch exists.
+      --   * synced_at — last successful roster sync (PR 5). NULL means
+      --     "never synced", which is every row this PR writes; \`doctor\`
+      --     renders it so a stale binding is visible rather than silent.
+      --
+      -- No backfill: the table is new and nothing else writes a binding.
+      CREATE TABLE channel_vaults (
+        relay_host TEXT NOT NULL,
+        channel_id TEXT NOT NULL,
+        vault TEXT NOT NULL,
+        mode TEXT NOT NULL DEFAULT 'sync',
+        relay_self_pubkey TEXT,
+        synced_at TEXT,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (relay_host, channel_id)
+      );
+      CREATE INDEX channel_vaults_vault ON channel_vaults (vault);
+    `,
+  },
+  {
+    version: 24,
+    sql: `
+      -- Channel-attached vaults, PR 5: make a FROZEN binding legible.
+      --
+      -- The design's answer to "relay unreachable: freeze or drop?" is
+      -- freeze — the reconciler leaves every \`user_vaults\` row alone and
+      -- leaves \`synced_at\` stale. That is the right behaviour and the
+      -- WORST possible failure to diagnose: a hub whose roster stopped
+      -- updating looks exactly like a hub whose roster stopped changing.
+      -- \`synced_at\` alone says "not recently", never "and here is why".
+      --
+      --   * last_error (TEXT NULL) — the most recent \`RosterFailure\`
+      --     reason word (\`relay_unreachable\`, \`relay_rejected\`,
+      --     \`relay_key_changed\`, …). The REASON only: no response body,
+      --     no URL, no key material. Cleared to NULL on the next success,
+      --     so a non-NULL value always means "the last attempt failed".
+      --   * last_attempt_at (TEXT NULL) — when that attempt ran. Paired
+      --     with \`synced_at\`, the two answer "how long has this been
+      --     broken" without a log dig: attempting-but-failing shows a
+      --     fresh \`last_attempt_at\` against a stale \`synced_at\`.
+      --
+      -- Diagnostics, never authority: nothing reads either column to
+      -- decide what to grant. Writing them on a failed poll is therefore
+      -- NOT a violation of "on failure, touch nothing" — the invariant
+      -- that matters is that no grant row moves and \`synced_at\` does not
+      -- advance, and both hold.
+      --
+      -- Nullable, no backfill, no default: a pre-v24 binding never had an
+      -- attempt recorded, and NULL honestly says so.
+      ALTER TABLE channel_vaults ADD COLUMN last_error TEXT;
+      ALTER TABLE channel_vaults ADD COLUMN last_attempt_at TEXT;
+    `,
+  },
 ];
 
 /**
@@ -769,6 +914,15 @@ const MIGRATIONS: readonly Migration[] = [
  * wait.
  */
 export const HUB_DB_BUSY_TIMEOUT_MS = 5000;
+
+/**
+ * Migration that added `user_vaults.granted_by_user_id` / `granted_by_pubkey`
+ * / `granted_via`. `doctor`'s `grants-attributed` check reads this version's
+ * `schema_version.applied_at` to know which rows COULD have carried a grantor
+ * — rows older than it are unattributed because the hub wasn't recording yet,
+ * which is not a finding.
+ */
+export const GRANT_ATTRIBUTION_MIGRATION = 22;
 
 export function openHubDb(path: string = hubDbPath()): Database {
   mkdirSync(dirname(path), { recursive: true });
