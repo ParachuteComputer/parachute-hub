@@ -715,3 +715,44 @@ describe("startChannelReconciler + live subscription", () => {
     expect(reconciler?.subscriptionStates().size).toBe(0);
   });
 });
+
+for (const present of [true, false]) {
+  test(present
+    ? "P9 AUTH appends signed delegation tag"
+    : "P10 absent tag keeps exactly relay and challenge", async () => {
+    const tag = ["auth", "a".repeat(64), "", "b".repeat(128)];
+    env.PARACHUTE_BUZZ_AUTH_TAG_FILE = join(dir, "test.authtag");
+    if (present) writeFileSync(env.PARACHUTE_BUZZ_AUTH_TAG_FILE, JSON.stringify(tag));
+    const subs = startChannelSubscriptions(subDeps());
+    try {
+      await until(() => relay.auths.length > 0);
+      const auth = relay.auths[0]!;
+      expect(auth.tags).toEqual([
+        ["relay", relay.url],
+        ["challenge", relay.challenge],
+        ...(present ? [tag] : []),
+      ]);
+      expect(auth.kind).toBe(KIND_CLIENT_AUTH);
+      expect(auth.pubkey).toBe(readerPubkey);
+      expect(verifyNostrEvent(auth).ok).toBe(true);
+    } finally {
+      subs?.stop();
+    }
+  });
+}
+
+test("P11 malformed delegation sends no AUTH and does not reconnect", async () => {
+  env.PARACHUTE_BUZZ_AUTH_TAG_FILE = join(dir, "test.authtag");
+  writeFileSync(env.PARACHUTE_BUZZ_AUTH_TAG_FILE, "malformed-private-canary");
+  const subs = startChannelSubscriptions(subDeps());
+  try {
+    await until(() => relay.connections > 0);
+    await Bun.sleep(150);
+    expect(relay.auths).toEqual([]);
+    expect(logs.filter((line) => /auth tag is malformed/.test(line))).toHaveLength(1);
+    expect(logs.join("\n")).not.toContain("malformed-private-canary");
+    expect(relay.connections).toBe(1);
+  } finally {
+    subs?.stop();
+  }
+});

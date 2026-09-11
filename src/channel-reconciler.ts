@@ -83,6 +83,7 @@
  * a poll that is already walking the same rows.
  */
 import type { Database } from "bun:sqlite";
+import { loadBuzzAuthTag } from "./buzz-auth-tag.ts";
 import { loadBuzzReaderKey } from "./buzz-reader-key.ts";
 import {
   type FetchChannelRosterResult,
@@ -621,6 +622,13 @@ export function startChannelReconciler<H = ReturnType<typeof setInterval>>(
     // than needing a restart.
     log(
       `parachute hub: Buzz reader key at ${bootKey.path} is ${bootKey.reason}; channel membership sync is OFF until it is fixed.`,
+    );
+  }
+
+  const bootTag = loadBuzzAuthTag(deps.rosterOptions?.env, deps.rosterOptions?.configDir);
+  if (!bootTag.ok && bootTag.reason !== "not_configured") {
+    log(
+      `parachute hub: Buzz auth tag at ${bootTag.path} is ${bootTag.reason}; channel membership sync is OFF until it is fixed.`,
     );
   }
 

@@ -425,6 +425,31 @@ never passes it on a command line.
 A hub with no key configured is the normal case — channel-attached vaults are
 opt-in, and the roster fetch simply reports `not_configured`.
 
+### Delegated membership (NIP-OA auth tag)
+
+A closed Buzz relay can admit the reader by an owner's delegation. The auth-tag
+file is optional; omitting it is the normal case. To present a delegation, put
+its four-element JSON array on one line in `~/.parachute/buzz-reader.authtag`
+(or `<PARACHUTE_HOME>/buzz-reader.authtag`):
+
+```json
+["auth","<owner-pubkey-hex-64>","<conditions>","<sig-hex-128>"]
+```
+
+Conditions are usually an empty string. Blank lines and `#` comments before the
+first JSON line are ignored, as are trailing lines. Override the file path with
+`PARACHUTE_BUZZ_AUTH_TAG_FILE=/path/to/tag`. The hub rereads it on every roster
+poll and NIP-42 challenge, so edits need no restart. A broken file reports
+`auth_tag_unreadable` for roster polling and prevents socket authentication.
+
+The tag is not secret: it rides requests in the clear, so no `chmod 600` is
+required. The hub checks its structure; the relay verifies the attestation. It
+is sent as `x-auth-tag` on `POST /query` and as a third tag on the NIP-42 AUTH
+event. It is never logged.
+
+Do not add the reader key to a channel as a member — the relay tears down its
+subscription when it is removed.
+
 ## Already have parachute-vault installed?
 
 Install the hub and `parachute vault ...` forwards to your existing `parachute-vault` binary:
