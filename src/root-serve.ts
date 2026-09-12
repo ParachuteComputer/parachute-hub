@@ -66,19 +66,31 @@ export const ROOT_SERVE_RESERVED_PREFIXES: readonly string[] = [
  * `resolve` is the test seam (defaults to the real package resolution). Return
  * value is the dist dir, or `null` when the app can't be resolved (not installed
  * / ships no `dist/`).
+ * `log` is the second test seam: one line, on the first successful resolution
+ * only, naming the dist root the origin root will serve for the rest of the
+ * process (hub#961). Nothing is logged on failure — the caller in hub-server.ts
+ * already warns once for that.
  */
 export function makeAppDistResolver(
   resolve: () => string = () => resolveBundleDistFrom({ pkg: APP_PACKAGE }),
+  log: (line: string) => void = console.log,
 ): () => string | null {
   let cached: string | null = null;
   return () => {
     if (cached !== null) return cached;
     try {
       cached = resolve();
-      return cached;
     } catch {
       return null;
     }
+    // hub#961: name the dist root the origin root will serve, once, at the
+    // moment it is chosen (the first serve-app request after boot, or after a
+    // later `parachute install app`). Memoized from here on — this is the line
+    // to read when `/` and `/app` disagree.
+    log(
+      `[hub] root_mode=serve-app: serving ${APP_PACKAGE} from ${cached} (memoized for this process; restart the hub to re-resolve)`,
+    );
+    return cached;
   };
 }
 
