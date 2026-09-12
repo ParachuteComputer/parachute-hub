@@ -143,10 +143,11 @@ export function normalizeMount(raw: string): string {
  * Candidate base directories that `Bun.resolveSync` walks from when looking
  * for `<package>/package.json`. Order matters:
  *
- *   1. `process.cwd()` — works when the shim is invoked from inside the
- *      package's own checkout (e.g. via `installDir` cwd in lifecycle.ts) or
- *      from any project that depends on the package. OMITTED when cwd is `/`
- *      (see the hub#780 carve-out below).
+ *   1. `process.cwd()` — admitted ONLY when `localInstallRoot` finds a real
+ *      `node_modules/<pkg>/package.json` at or above it (hub#961); works when
+ *      the shim is invoked from inside the package's own checkout or from any
+ *      project that depends on the package. OMITTED when cwd is `/`
+ *      (hub#780 carve-out below).
  *   2. `~/.bun/install/global/node_modules` — modern Bun's global-install
  *      layout. This is where `bun add -g <package>` lands the package, and
  *      where `bun link <package>` symlinks it.
@@ -172,6 +173,15 @@ export function normalizeMount(raw: string): string {
  * loses nothing legitimate and forces resolution through the global link table
  * — the intended source for a supervised service.
  *
+ * hub#961 — the general case. Any cwd with no `node_modules` above it behaves
+ * like `/`: `Bun.resolveSync` takes Bun's auto-install path and answers from
+ * `~/.bun/install/cache` at `latest`. The hub's generated systemd unit sets no
+ * `WorkingDirectory`, so a Linux hub runs from `$HOME` and root-serve
+ * (`root-serve.ts`, which resolves with the HUB's cwd) served the cached npm
+ * stable at `/` while `/app` served the installed rc (techne, 2026-09-11).
+ * `resolveBundleDistFrom` therefore admits candidate (1) only when
+ * `localInstallRoot` succeeds; `notesDistCandidates` itself stays a pure ordering.
+ *
  * Exported (and parameterized via `cwd`/`home`) so tests can drive the
  * resolution order against a real fixture install without monkey-patching
  * `Bun.resolveSync`.
@@ -184,6 +194,28 @@ export function notesDistCandidates(cwd: string, home: string): string[] {
   return cwd === "/" ? globals : [cwd, ...globals];
 }
 
+/**
+ * hub#961 — the nearest directory at or above `cwd` holding a real
+ * `node_modules/<pkg>/package.json`, or undefined when there is none. This is
+ * the Node-style ancestor walk `Bun.resolveSync` performs BEFORE it falls back
+ * to auto-install, done by hand so the cwd candidate is admitted only when that
+ * walk can succeed on its own — never when Bun would answer from its cache.
+ * `exists` is the caller's `existsSync` seam. Terminates at the filesystem root.
+ */
+export function localInstallRoot(
+  cwd: string,
+  pkg: string,
+  exists: (path: string) => boolean,
+): string | undefined {
+  let dir = cwd;
+  for (;;) {
+    if (exists(join(dir, "node_modules", pkg, "package.json"))) return dir;
+    const parent = dirname(dir);
+    if (parent === dir) return undefined;
+    dir = parent;
+  }
+}
+
 export interface ResolveBundleDistDeps {
   cwd?: string;
   home?: string;
@@ -191,6 +223,7 @@ export interface ResolveBundleDistDeps {
   pkg?: string;
   /** Override `Bun.resolveSync` for tests. */
   resolveSync?: (specifier: string, base: string) => string;
+  /** Override `existsSync` for tests. Used for BOTH the dist/ check and the hub#961 local-install walk — one seam, deliberately. */
   existsSync?: (path: string) => boolean;
 }
 
@@ -201,8 +234,19 @@ export function resolveBundleDistFrom(deps: ResolveBundleDistDeps = {}): string 
   const resolveSync = deps.resolveSync ?? Bun.resolveSync;
   const exists = deps.existsSync ?? existsSync;
   const candidates = notesDistCandidates(cwd, home);
+  // hub#961: candidate (1) — the cwd — is admitted only when a Node-style
+  // ancestor walk from it finds a real node_modules/<pkg>. Without one,
+  // Bun.resolveSync does not fail: it takes Bun's auto-install path and answers
+  // from ~/.bun/install/cache at `latest`, shadowing the global install at (2).
+  const cwdEligible = cwd !== "/" && localInstallRoot(cwd, pkg, exists) !== undefined;
   const resolveErrors: string[] = [];
-  for (const base of candidates) {
+  for (const [i, base] of candidates.entries()) {
+    if (i === 0 && cwd !== "/" && !cwdEligible) {
+      resolveErrors.push(
+        `  - ${base}: skipped — no node_modules/${pkg}/package.json here or in any parent directory (hub#961: resolving from a cwd without a local install would answer from Bun's auto-install cache, never the intended install)`,
+      );
+      continue;
+    }
     let pkgPath: string;
     try {
       pkgPath = resolveSync(`${pkg}/package.json`, base);

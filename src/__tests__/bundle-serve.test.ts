@@ -403,7 +403,10 @@ describe("resolveBundleDistFrom (hub#194)", () => {
           }
           throw new Error(`unexpected base: ${base}`);
         },
-        existsSync: (p) => p === "/cwd-with-app/node_modules/@openparachute/app/dist",
+        // hub#961: the cwd is admitted only when a real local install exists — model it.
+        existsSync: (p) =>
+          p === "/cwd-with-app/node_modules/@openparachute/app/package.json" ||
+          p === "/cwd-with-app/node_modules/@openparachute/app/dist",
       });
       expect(out).toBe("/cwd-with-app/node_modules/@openparachute/app/dist");
       // Only the cwd candidate should be probed — we short-circuit on hit.
@@ -413,10 +416,10 @@ describe("resolveBundleDistFrom (hub#194)", () => {
     }
   });
 
-  test("falls through to global node_modules when cwd resolve fails (hub#194 root cause)", () => {
-    // The exact scenario from hub#194: hub repo's cwd has no dependency on
-    // notes, so the first candidate throws ResolveMessage. Bun does NOT
-    // auto-consult ~/.bun/install/global, so we have to try it explicitly.
+  test("skips a cwd with no local install and resolves from global node_modules (hub#194 root cause, hub#961 guard)", () => {
+    // hub#194 scenario, post-hub#961: the hub repo cwd has no local install of the
+    // package, so the cwd candidate is skipped without being probed and resolution
+    // goes straight to ~/.bun/install/global.
     const f = makeFixture();
     try {
       const calls: string[] = [];
@@ -426,7 +429,7 @@ describe("resolveBundleDistFrom (hub#194)", () => {
         resolveSync: (specifier, base) => {
           calls.push(base);
           if (base === "/hub-repo-cwd-without-notes") {
-            throw new Error(`Cannot find module '${specifier}' from '${base}'`);
+            throw new Error("hub#961: cwd must not be probed without a local install");
           }
           // Real Bun.resolveSync against the global node_modules dir
           // resolves into the package's package.json.
@@ -435,9 +438,7 @@ describe("resolveBundleDistFrom (hub#194)", () => {
         // Use real existsSync — the fixture has dist/ on disk.
       });
       expect(out).toBe(f.dist);
-      // Both candidates probed, in order.
-      expect(calls[0]).toBe("/hub-repo-cwd-without-notes");
-      expect(calls[1]).toBe(join(f.home, ".bun/install/global/node_modules"));
+      expect(calls).toEqual([join(f.home, ".bun/install/global/node_modules")]);
     } finally {
       f.cleanup();
     }
@@ -452,6 +453,7 @@ describe("resolveBundleDistFrom (hub#194)", () => {
       resolveBundleDistFrom({
         cwd: "/cwd",
         home: "/h",
+        existsSync: (p) => p === "/cwd/node_modules/@openparachute/app/package.json",
         resolveSync: (_specifier, base) => {
           probed.push(base);
           throw new Error(`Cannot find module from '${base}'`);
@@ -555,6 +557,7 @@ describe("resolveBundleDistFrom --package (hub-parity P5)", () => {
       resolveBundleDistFrom({
         cwd: "/cwd",
         home: "/h",
+        existsSync: () => true,
         resolveSync: (specifier) => {
           specifiers.push(specifier);
           throw new Error("not found");
