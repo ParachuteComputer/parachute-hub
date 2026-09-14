@@ -48,6 +48,7 @@
  * are programmer errors (a bad argument), never network or parse failures.
  */
 import type { Database } from "bun:sqlite";
+import { loadBuzzAuthTag } from "./buzz-auth-tag.ts";
 import { loadBuzzReaderKey } from "./buzz-reader-key.ts";
 import { getChannelVault, pinRelaySelfPubkey } from "./channel-vaults.ts";
 import { type NostrEvent, parseNostrEvent, verifyNostrEvent } from "./nostr-event.ts";
@@ -90,6 +91,8 @@ export const MAX_ROSTER_TAGS = 2048;
  *     of a hub that has not opted in; not an error.
  *   - `key_unreadable` — a key file exists but could not be loaded. Distinct
  *     from `not_configured` so an operator typo is visible as a typo.
+ *   - `auth_tag_unreadable` — an auth-tag file exists but could not be loaded.
+ *     Distinct from an absent optional tag so an operator typo is visible.
  *   - `not_bound` — no `channel_vaults` row for this (relay, channel).
  *   - `relay_unreachable` — DNS, TCP, TLS, timeout, or a non-JSON response.
  *   - `relay_rejected` — the relay answered with a non-2xx status. Usually
@@ -115,6 +118,7 @@ export const MAX_ROSTER_TAGS = 2048;
 export type RosterFailure =
   | "not_configured"
   | "key_unreadable"
+  | "auth_tag_unreadable"
   | "not_bound"
   | "relay_unreachable"
   | "relay_rejected"
@@ -286,6 +290,7 @@ async function fetchRosterEvents(
   channelId: string,
   secretKeyHex: string,
   opts: RosterFetchOptions,
+  authTagJson?: string,
 ): Promise<{ ok: true; events: unknown[] } | RosterFetchFailure> {
   const doFetch = opts.fetchImpl ?? fetch;
   const url = `${originFor(relayHost, opts)}/query`;
@@ -302,7 +307,11 @@ async function fetchRosterEvents(
   try {
     res = await doFetch(url, {
       method: "POST",
-      headers: { authorization, "content-type": "application/json" },
+      headers: {
+        authorization,
+        "content-type": "application/json",
+        ...(authTagJson ? { "x-auth-tag": authTagJson } : {}),
+      },
       body,
       signal: AbortSignal.timeout(opts.timeoutMs ?? DEFAULT_ROSTER_TIMEOUT_MS),
     });
@@ -313,7 +322,11 @@ async function fetchRosterEvents(
     // 401/403 here almost always means "this key is not seated in the
     // community or the channel". Status only — the body can echo request
     // material we signed.
-    return { ok: false, reason: "relay_rejected", detail: `query status ${res.status}` };
+    return {
+      ok: false,
+      reason: "relay_rejected",
+      detail: `query status ${res.status} auth_tag=${authTagJson ? "presented" : "absent"}`,
+    };
   }
   let parsed: unknown;
   try {
@@ -386,6 +399,12 @@ export async function fetchChannelRoster(
       : { ok: false, reason: "key_unreadable", detail: `reader key ${loaded.reason}` };
   }
 
+  const authTag = loadBuzzAuthTag(opts.env, opts.configDir);
+  if (!authTag.ok && authTag.reason !== "not_configured") {
+    return { ok: false, reason: "auth_tag_unreadable", detail: `auth tag ${authTag.reason}` };
+  }
+  const authTagJson = authTag.ok ? authTag.tagJson : undefined;
+
   const binding = getChannelVault(db, relayHost, channelId);
   if (binding === null) return { ok: false, reason: "not_bound" };
 
@@ -404,7 +423,13 @@ export async function fetchChannelRoster(
     };
   }
 
-  const fetched = await fetchRosterEvents(relayHost, channelId, loaded.key.secretKeyHex, opts);
+  const fetched = await fetchRosterEvents(
+    relayHost,
+    channelId,
+    loaded.key.secretKeyHex,
+    opts,
+    authTagJson,
+  );
   if (!fetched.ok) return fetched;
 
   const selected = selectRosterEvent(fetched.events, channelId);

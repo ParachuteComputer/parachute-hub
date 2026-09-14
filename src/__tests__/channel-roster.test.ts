@@ -14,6 +14,9 @@
  * `method`, `payload`), which is the only check we have that the hub's
  * outbound signer matches `buzz-relay`'s verifier.
  */
+import { reconcileBinding } from "../channel-reconciler.ts";
+import { doctor, type CheckResult } from "../commands/doctor.ts";
+import { vaultChannels } from "../commands/vault-channels.ts";
 import type { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
@@ -62,6 +65,8 @@ interface FakeRelay {
   stop: () => void;
   /** Every `Authorization` value the fake saw on `/query`. */
   seenAuth: string[];
+  seenAuthTags: (string | null)[];
+  seenNip11AuthTags: (string | null)[];
   /** Every filter body the fake saw on `/query`. */
   seenFilters: unknown[];
 }
@@ -79,6 +84,8 @@ function startFakeRelay(cfg: {
   queryStatus?: number;
 }): FakeRelay {
   const seenAuth: string[] = [];
+  const seenAuthTags: (string | null)[] = [];
+  const seenNip11AuthTags: (string | null)[] = [];
   const seenFilters: unknown[] = [];
   const server = Bun.serve({
     port: 0,
@@ -86,6 +93,7 @@ function startFakeRelay(cfg: {
     async fetch(req) {
       const url = new URL(req.url);
       if (req.method === "GET" && url.pathname === "/") {
+        seenNip11AuthTags.push(req.headers.get("x-auth-tag"));
         if (cfg.nip11Status && cfg.nip11Status !== 200) {
           return new Response("nope", { status: cfg.nip11Status });
         }
@@ -96,6 +104,7 @@ function startFakeRelay(cfg: {
       if (req.method === "POST" && url.pathname === "/query") {
         const auth = req.headers.get("authorization") ?? "";
         seenAuth.push(auth);
+        seenAuthTags.push(req.headers.get("x-auth-tag"));
         const body = new Uint8Array(await req.arrayBuffer());
         try {
           seenFilters.push(JSON.parse(new TextDecoder().decode(body)));
@@ -130,6 +139,8 @@ function startFakeRelay(cfg: {
     origin: `http://127.0.0.1:${server.port}`,
     stop: () => server.stop(true),
     seenAuth,
+    seenAuthTags,
+    seenNip11AuthTags,
     seenFilters,
   };
 }
@@ -349,7 +360,11 @@ describe("fetchChannelRoster", () => {
       queryStatus: 403,
     });
     const res = await fetchChannelRoster(db, RELAY_HOST, CHANNEL, optsFor(relay));
-    expect(res).toMatchObject({ ok: false, reason: "relay_rejected", detail: "query status 403" });
+    expect(res).toMatchObject({
+      ok: false,
+      reason: "relay_rejected",
+      detail: "query status 403 auth_tag=absent",
+    });
     expect(getChannelVault(db, RELAY_HOST, CHANNEL)?.relaySelfPubkey).toBeNull();
   });
 
@@ -473,4 +488,132 @@ describe("fetchChannelRoster", () => {
     expect(DEFAULT_ROSTER_TIMEOUT_MS).toBeGreaterThan(0);
     expect(Number.isFinite(DEFAULT_ROSTER_TIMEOUT_MS)).toBe(true);
   });
+});
+
+const delegationTag = ["auth", "a".repeat(64), "", "b".repeat(128)];
+function configureTag(contents?: string): void {
+  env.PARACHUTE_BUZZ_AUTH_TAG_FILE = join(dir, "test.authtag");
+  if (contents !== undefined) writeFileSync(env.PARACHUTE_BUZZ_AUTH_TAG_FILE, contents);
+}
+
+for (const present of [true, false]) {
+  test(present
+    ? "P5 canonical auth tag on query only"
+    : "P6 absent auth tag preserves complete roster result", async () => {
+    configureTag(present ? `# delegation\n ${JSON.stringify(delegationTag)} \nignored` : undefined);
+    const secret = randomSecret();
+    const pubkey = pubkeyForSecret(secret);
+    const relay = fake({
+      nip11Self: pubkey,
+      events: [
+        rosterEvent(secret, CHANNEL, [
+          ["1".repeat(64), "owner"],
+          ["2".repeat(64), "guest"],
+        ]),
+      ],
+    });
+    const result = await fetchChannelRoster(db, RELAY_HOST, CHANNEL, optsFor(relay));
+    expect(relay.seenAuthTags).toEqual([present ? JSON.stringify(delegationTag) : null]);
+    expect(relay.seenNip11AuthTags).toEqual([null]);
+    expect(result).toEqual({
+      ok: true,
+      roster: [
+        { pubkey: "1".repeat(64), role: "owner" },
+        { pubkey: "2".repeat(64), role: "guest" },
+      ],
+      eventCreatedAt: 1_800_000_000,
+      relaySelfPubkey: pubkey,
+      pinned: true,
+      skipped: 0,
+    });
+  });
+}
+
+test("P7 malformed auth tag fails before relay contact", async () => {
+  configureTag("malformed-private-canary");
+  const relay = fake({ nip11Self: pubkeyForSecret(randomSecret()), events: [] });
+  expect(await fetchChannelRoster(db, RELAY_HOST, CHANNEL, optsFor(relay))).toEqual({
+    ok: false,
+    reason: "auth_tag_unreadable",
+    detail: "auth tag malformed",
+  });
+  expect(relay.seenAuth).toEqual([]);
+  expect(relay.seenNip11AuthTags).toEqual([]);
+});
+
+for (const present of [true, false]) {
+  test(`P8 rejected query reports auth tag ${present ? "presented" : "absent"}`, async () => {
+    configureTag(present ? JSON.stringify(delegationTag) : undefined);
+    const relay = fake({
+      nip11Self: pubkeyForSecret(randomSecret()),
+      events: [],
+      queryStatus: 403,
+    });
+    expect(await fetchChannelRoster(db, RELAY_HOST, CHANNEL, optsFor(relay))).toEqual({
+      ok: false,
+      reason: "relay_rejected",
+      detail: `query status 403 auth_tag=${present ? "presented" : "absent"}`,
+    });
+  });
+}
+
+test("P12 failed auth tag poll reaches doctor and sync-channels", async () => {
+  configureTag("malformed-private-canary");
+  const relay = fake({ nip11Self: pubkeyForSecret(randomSecret()), events: [] });
+  const binding = getChannelVault(db, RELAY_HOST, CHANNEL)!;
+  const result = await reconcileBinding(binding, {
+    db,
+    rosterOptions: optsFor(relay),
+    log: () => {},
+  });
+  const persisted = getChannelVault(db, RELAY_HOST, CHANNEL)!;
+  const lines: string[] = [];
+  await doctor({
+    configDir: dir,
+    manifestPath: join(dir, "services.json"),
+    json: true,
+    print: (line) => {
+      lines.push(line);
+    },
+    deps: {
+      probeHubHealth: async () => false,
+      probeModuleHealth: async () => false,
+      probePublicHealth: async () => false,
+      queryHubUnitState: () => ({ state: "no-unit" }),
+      which: () => null,
+      readGrants: () => ({
+        attributionSince: null,
+        rows: [],
+        channels: [
+          {
+            relayHost: RELAY_HOST,
+            channelId: CHANNEL,
+            vault: VAULT,
+            members: 0,
+            syncedAt: persisted.syncedAt,
+            lastError: persisted.lastError,
+            lastAttemptAt: persisted.lastAttemptAt,
+          },
+        ],
+      }),
+    },
+  });
+  const checks = (JSON.parse(lines.join("\n")) as { checks: CheckResult[] }).checks;
+  const row = checks.find((c) => c.name === `channel-sync:${RELAY_HOST}:${CHANNEL}`);
+  expect(row?.status).toBe("warn");
+  expect(row?.detail).toContain("last_error=auth_tag_unreadable");
+  const output: string[] = [];
+  await vaultChannels("sync-channels", [], {
+    resolveBearer: async () => "test",
+    log: (line) => {
+      output.push(line);
+    },
+    fetch: (async () =>
+      Response.json({
+        ran: true,
+        results: [{ ...result, relay_host: result.relayHost, channel_id: result.channelId }],
+      })) as unknown as typeof fetch,
+  });
+  expect(output.join("\n")).toContain("failed:auth_tag_unreadable");
+  expect(persisted.lastError).toBe("auth_tag_unreadable");
 });

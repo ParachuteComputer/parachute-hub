@@ -83,6 +83,7 @@
  * only a public key and a signature; no event JSON is ever logged.
  */
 import type { Database } from "bun:sqlite";
+import { loadBuzzAuthTag } from "./buzz-auth-tag.ts";
 import { loadBuzzReaderKey } from "./buzz-reader-key.ts";
 import { KIND_GROUP_MEMBERS, MAX_ROSTER_TAGS } from "./channel-roster.ts";
 import { type ChannelVault, getChannelVault, listChannelVaults } from "./channel-vaults.ts";
@@ -538,6 +539,14 @@ export function startChannelSubscriptions(
         );
         return;
       }
+      const authTag = loadBuzzAuthTag(deps.env, deps.configDir);
+      if (!authTag.ok && authTag.reason !== "not_configured") {
+        rateLimited(
+          `sub ${this.host} authtag_${authTag.reason}`,
+          `channel subscription: Buzz auth tag is ${authTag.reason}; not authenticating to ${this.host}.`,
+        );
+        return;
+      }
       let event: NostrEvent;
       try {
         event = signNostrEvent(
@@ -547,6 +556,7 @@ export function startChannelSubscriptions(
             tags: [
               ["relay", wsUrlFor(this.host)],
               ["challenge", challenge],
+              ...(authTag.ok ? [authTag.tag] : []),
             ],
             content: "",
           },

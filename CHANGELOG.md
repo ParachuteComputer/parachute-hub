@@ -6,6 +6,62 @@ All notable changes to `@openparachute/hub` are documented here. The format foll
 >
 > This backfill covers the 0.6.x line only. Two pre-existing gaps remain undocumented and are **not** addressed here: the `0.5.13` stable itself (the file's newest entry is `0.5.13-rc.48`, never the stable) and the entire `0.5.14-rc` chain (rc.1–rc.21 on npm), which never promoted to a `0.5.14` stable — its work folded forward into 0.6.0.
 
+## [0.7.19-rc.5] - 2026-09-13
+
+**A delegated Buzz auth tag, and a root `/` that can no longer serve Bun's
+install cache.** Two PRs on `next` after 0.7.19-rc.4, cut as a `next` → `main`
+batch. Version bump only; no new code in this commit. Merging this to `main`
+publishes `@rc` (this rc is ahead of `@latest` 0.7.18, so `@rc` stays a safe
+channel to point a box at). No schema migration.
+
+- **The Buzz reader can present a NIP-OA auth tag (#960, refs #953).** A closed
+  relay that will not seat the hub's reader key as a channel member can now
+  admit it by an owner's delegation instead. `loadBuzzAuthTag` reads an
+  optional one-line four-element JSON array — `["auth", <64-hex owner>,
+  <conditions>, <128-hex sig>]` — from `<PARACHUTE_HOME>/buzz-reader.authtag`
+  (`PARACHUTE_BUZZ_AUTH_TAG_FILE` overrides the path), and validates
+  **structure only**: the relay owns signature and conditions verification, and
+  a hub that second-guessed it would only be a second, wrong policy. Present,
+  the canonical JSON rides `POST /query` as the `x-auth-tag` header and NIP-42
+  AUTH as a third tag. Absent is `not_configured` and both wire paths are
+  byte-identical to today — this is opt-in, and no file is the normal case. A
+  file that exists but is unreadable, empty, or malformed is the new
+  `auth_tag_unreadable` roster failure: it stops roster polling and socket
+  authentication rather than quietly retrying unauthenticated, and surfaces
+  through the existing operator output (`doctor`, `vault channels`) like every
+  other reason word. The file is reread on every poll and every challenge, so
+  fixing a typo needs no restart. Contents are never logged — parser and
+  filesystem error text is dropped, not echoed. `relay_rejected` now carries
+  `auth_tag=presented|absent` beside the status, so a 403 says whether a
+  delegation was even offered. Unlike the reader key this is not a secret: it
+  travels in the clear and needs no `chmod 600`.
+
+- **A hub cwd with no local install can no longer shadow the installed app
+  (#963, closes #961, refs #780 #783 #957).** `resolveBundleDistFrom` probes
+  `process.cwd()` first, and when nothing at or above that cwd holds a
+  `node_modules/<pkg>`, `Bun.resolveSync` does not fail — it takes Bun's
+  auto-install path and answers from `~/.bun/install/cache` at `latest`,
+  beating the real global install at candidate (2). The hub's generated systemd
+  user unit sets no `WorkingDirectory`, so a Linux hub runs from `$HOME`, and
+  `root-serve.ts` resolves with the hub's own cwd: on techne (2026-09-11, hub
+  0.7.19-rc.4) `GET /` served the cached npm stable while `GET /app/` — a
+  supervisor child, resolving from its `installDir` — served the installed
+  0.22.15-rc.1. Two different `index-*.js` hashes on one box, surviving a full
+  restart. New `localInstallRoot` performs the Node-style ancestor walk by
+  hand, and the cwd candidate is admitted only when that walk succeeds;
+  otherwise it is skipped with its reason kept in the resolution error. The
+  hub#780 `/` carve-out is unchanged and `notesDistCandidates` stays a pure
+  ordering. Also logs the chosen dist once, on the first successful root
+  resolution — `[hub] root_mode=serve-app: serving @openparachute/app from
+  <dist>`, memoized for the process — so `/` and `/app` disagreeing is legible
+  from the journal instead of from asset hashes. The `WorkingDirectory=/`
+  drop-in applied to techne as a workaround is unnecessary after this, and
+  harmless to leave. The mechanism is environment-dependent (it did not
+  reproduce on a box whose Bun cache lacked the `@latest` stable), so the pins
+  are stubbed-resolver pins by design, as in hub#780.
+
+Do not suffix-drop 0.7.19 until this rc has lived.
+
 ## [0.7.19-rc.4] - 2026-09-05
 
 **Channel-attached vaults, the human key door, and grant attribution.**
