@@ -6,6 +6,52 @@ All notable changes to `@openparachute/hub` are documented here. The format foll
 >
 > This backfill covers the 0.6.x line only. Two pre-existing gaps remain undocumented and are **not** addressed here: the `0.5.13` stable itself (the file's newest entry is `0.5.13-rc.48`, never the stable) and the entire `0.5.14-rc` chain (rc.1–rc.21 on npm), which never promoted to a `0.5.14` stable — its work folded forward into 0.6.0.
 
+## [0.7.19] - 2026-09-22
+
+**Stable promotion of 0.7.19-rc.5.** No new code. Suffix-drop only. npm `@rc`
+is 0.7.19-rc.5; this is the matching `@latest`.
+
+The 0.7.19 line (rc.1-rc.5) runs four additive schema migrations on upgrade,
+all from the rc.4 batch: v21 `tokens.revoked_by` / `revoked_via` (#944), v22
+grant attribution on `user_vaults` (#945), v23 `channel_vaults` (#947), v24
+that table's `last_error` / `last_attempt_at` (#950). rc.5 adds none.
+
+Two new doors. A Nostr key now signs in to the browser, not just MCP:
+challenge/verify mint a session through the password door's own path, divert
+a TOTP-enrolled user to the second factor, and refuse unlinked keys without
+consulting auto-provision (#949), behind a NIP-07-only sign-in section on
+`/login` and the OAuth login view plus a new `GET /login/2fa` (#951). And a
+Buzz channel can be bound to a vault so channel membership becomes vault
+access: binding and operator surface (#947), a relay-signed roster fetch with
+a trust-on-first-use relay key (#948), a once-a-minute reconciler writing
+ordinary `user_vaults` rows tagged `granted_via = 'channel:<host>:<id>'` that
+freezes on outage (#950), and a live subscription that changes only when a
+reconcile runs (#953); reason words sharpened in #954 and #958. Both need the
+hub's Buzz reader key (`PARACHUTE_BUZZ_NSEC_FILE`, a path, never an inline env
+secret), and rc.5 adds an optional NIP-OA delegation tag file so a closed
+relay can admit that reader by an owner's delegation (#960).
+
+Behaviour changes: `write` no longer implies `admin` — the new `member` role is
+read+write with no re-grant, and grant/revoke/list-access are hidden and
+refused for it (#945); revoking the live operator token now needs
+`--break-glass` / `break_glass: true`, else 409 `live_operator_token` (#944);
+`grant-access`, `revoke-access` and `auth link-pubkey` accept an `npub1…`
+(#936, #940); NIP-98 honors `X-Forwarded-Proto` only from a non-loopback peer
+(#924); lone UTF-16 surrogates are refused at NIP-01 parse (#956). Account-MCP
+stamps the signing pubkey onto the vault hop token as
+`permissions.principal_pubkey` (#937) — the consumer half is in
+parachute-vault, and an older vault ignoring the claim is a no-op. A hub whose
+cwd holds no local install no longer serves Bun's install cache copy of
+`@openparachute/app` at `/` while `/app/` serves the installed one (#963,
+closes #961).
+
+Also in this line: the account key-link stepper UI (#923, closes #880),
+optional hop-JWT reuse behind `PARACHUTE_ACCOUNT_MCP_HOP_TTL_SECONDS` (#929,
+default unchanged), `vault` back on OAuth token responses (#946), a `doctor`
+Grants group (#945), SERVED-DRIFT for a bare-directory launch (#957), the
+NIP-98 HTTP auth wire contract (#935), and release/CI work (#927, #930, #932,
+#933, #942, #943, #952, #955).
+
 ## [0.7.19-rc.5] - 2026-09-13
 
 **A delegated Buzz auth tag, and a root `/` that can no longer serve Bun's
