@@ -42,7 +42,12 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { recordLoginUnlock } from "./admin-lock.ts";
 import { provisionVault } from "./admin-vaults.ts";
-import { type OperationsRegistry, runInstall, specFor } from "./api-modules-ops.ts";
+import {
+  type OperationsRegistry,
+  restartSupervisedModule,
+  runInstall,
+  specFor,
+} from "./api-modules-ops.ts";
 import { CURATED_MODULES, type CuratedModuleShort } from "./api-modules.ts";
 import {
   BOOTSTRAP_TOKEN_PREFIX,
@@ -89,6 +94,7 @@ import {
   createSession,
   findActiveSession,
 } from "./sessions.ts";
+import { enableSemanticSearch, parseSemanticSearchField } from "./setup-semantic-search.ts";
 import type { Supervisor } from "./supervisor.ts";
 import { createUser, isSeedAdminUsername, userCount, validateUsername } from "./users.ts";
 import { sanitizePublicOrigin } from "./vault-hub-origin-env.ts";
@@ -444,6 +450,14 @@ export interface SetupWizardDeps {
    */
   provisionVaultImpl?: typeof provisionVault;
   /**
+   * Test seam for the vault step's semantic-search opt-in (hub#966).
+   * Production omits this and uses the real {@link enableSemanticSearch}
+   * (PUT the vault's embeddings toggle, then restart vault via the
+   * supervisor). Tests inject a stub to assert it runs only when the box is
+   * ticked, only after the vault op succeeds, and never fails the op.
+   */
+  enableSemanticSearchImpl?: typeof enableSemanticSearch;
+  /**
    * Test seam: stub the bun-link detection used by `runInstall` to
    * short-circuit `bun add -g` when a package is already linked
    * locally (smoke 2026-05-27 finding 1). Production omits this and
@@ -734,6 +748,11 @@ export interface RenderVaultStepProps {
    */
   cloudHost?: boolean;
   /**
+   * Re-tick the semantic-search checkbox after a validation failure
+   * (hub#966). Defaults to unchecked — the opt-in stays an opt-in.
+   */
+  semanticSearch?: boolean;
+  /**
    * When an install op is in progress, render the polling shape: no
    * form, just the op log + auto-refresh.
    */
@@ -746,7 +765,7 @@ export interface RenderVaultStepProps {
 }
 
 export function renderVaultStep(props: RenderVaultStepProps): string {
-  const { csrfToken, errorMessage, operation, vaultName, cloudHost } = props;
+  const { csrfToken, errorMessage, operation, vaultName, cloudHost, semanticSearch } = props;
   if (operation) return renderVaultOpStep({ operation });
   const error = errorMessage ? `<p class="error-banner">${escapeHtml(errorMessage)}</p>` : "";
   // hub#168 Cut 2: three-branch vault step. The browser form now sends
@@ -859,6 +878,13 @@ export function renderVaultStep(props: RenderVaultStepProps): string {
             <span class="vault-mode-desc">Only useful if you re-ran the wizard on an existing vault. Otherwise picks the same shape as merge.</span>
           </label>
         </fieldset>
+        <label class="vault-mode-option semantic-search-field">
+          <input type="checkbox" name="semantic_search" value="on"${semanticSearch ? " checked" : ""} />
+          <span class="vault-mode-title">Semantic search — find notes by meaning</span>
+          <span class="vault-mode-desc">Runs locally (~34 MB model); no text leaves this machine.
+            Off by default — you can turn it on later from the vault admin's
+            Semantic search page. Applies to every vault on this machine.</span>
+        </label>
         <button type="submit" class="btn btn-primary">Continue</button>
       </form>
       <script>
@@ -871,6 +897,7 @@ export function renderVaultStep(props: RenderVaultStepProps): string {
           var radios = document.querySelectorAll('input[name="mode"]');
           var nameField = document.querySelector('.vault-name-field');
           var importBlock = document.querySelector('.vault-import-block');
+          var semanticField = document.querySelector('.semantic-search-field');
           function sync() {
             var picked = document.querySelector('input[name="mode"]:checked');
             var shows = picked ? (picked.dataset.shows || '') : '';
@@ -878,6 +905,8 @@ export function renderVaultStep(props: RenderVaultStepProps): string {
             var importVisible = shows.indexOf('import') !== -1;
             if (nameField) nameField.style.display = nameVisible ? '' : 'none';
             if (importBlock) importBlock.style.display = importVisible ? '' : 'none';
+            // Semantic search needs a vault to talk to; skip creates none.
+            if (semanticField) semanticField.style.display = nameVisible ? '' : 'none';
           }
           radios.forEach(function (r) { r.addEventListener('change', sync); });
           sync();
@@ -2077,6 +2106,11 @@ export async function handleSetupVaultPost(req: Request, deps: SetupWizardDeps):
     return badRequestPage("Invalid vault mode", "mode must be one of create, import, skip.");
   }
 
+  // Semantic-search opt-in (hub#966). Off unless the box was ticked / the CLI
+  // sent `semantic_search: true`. Acted on only AFTER the vault op succeeds —
+  // see `runSemanticSearchFollowUp`.
+  const semanticSearch = parseSemanticSearchField(form.get("semantic_search"));
+
   // Skip path (hub#168 Cut 2): module is already installed (init.ts
   // ran `install vault --no-create`); we just persist a flag that
   // `deriveWizardState` consults to skip the vault step on subsequent
@@ -2084,7 +2118,15 @@ export async function handleSetupVaultPost(req: Request, deps: SetupWizardDeps):
   if (rawMode === "skip") {
     setSetting(deps.db, "setup_vault_skipped", "true");
     if (form.isJson) {
-      return jsonOkResponse({ step: "expose", message: "vault step skipped" });
+      // Semantic search needs a vault to PUT the toggle to; skip creates none.
+      // Say so rather than silently dropping the answer (the browser form
+      // hides the checkbox for skip, so only the CLI can get here with it on).
+      return jsonOkResponse({
+        step: "expose",
+        message: semanticSearch
+          ? "vault step skipped — semantic search not enabled (no vault yet; turn it on from the vault admin later)"
+          : "vault step skipped",
+      });
     }
     return redirect("/admin/setup");
   }
@@ -2138,6 +2180,7 @@ export async function handleSetupVaultPost(req: Request, deps: SetupWizardDeps):
           csrfToken: csrfTokenStr,
           vaultName: rawName,
           errorMessage: v.error,
+          semanticSearch,
         }),
         400,
       );
@@ -2167,6 +2210,7 @@ export async function handleSetupVaultPost(req: Request, deps: SetupWizardDeps):
           csrfToken: csrfTokenStr,
           vaultName: rawName,
           errorMessage: "Remote URL is required to import a vault. Paste a git clone URL.",
+          semanticSearch,
         }),
         400,
       );
@@ -2178,7 +2222,12 @@ export async function handleSetupVaultPost(req: Request, deps: SetupWizardDeps):
         return jsonErrorResponse(400, "Invalid import_mode", err);
       }
       return htmlResponse(
-        renderVaultStep({ csrfToken: csrfTokenStr, vaultName: rawName, errorMessage: err }),
+        renderVaultStep({
+          csrfToken: csrfTokenStr,
+          vaultName: rawName,
+          errorMessage: err,
+          semanticSearch,
+        }),
         400,
       );
     }
@@ -2277,7 +2326,7 @@ export async function handleSetupVaultPost(req: Request, deps: SetupWizardDeps):
         `${FIRST_VAULT_SHORT} already supervised (status=${supervisorState?.status}) — creating vault "${vaultName}"`,
       );
       void provision(vaultName, { issuer: deps.issuer, manifestPath: deps.manifestPath })
-        .then((provisioned) => {
+        .then(async (provisioned) => {
           if (provisioned.ok) {
             registry.update(
               op.id,
@@ -2286,6 +2335,12 @@ export async function handleSetupVaultPost(req: Request, deps: SetupWizardDeps):
                 ? `vault "${vaultName}" created`
                 : `vault "${vaultName}" already exists`,
             );
+            if (semanticSearch) {
+              await runSemanticSearchFollowUp(op.id, registry, deps, {
+                vaultName,
+                userId: session.userId,
+              });
+            }
           } else {
             registry.update(
               op.id,
@@ -2319,6 +2374,15 @@ export async function handleSetupVaultPost(req: Request, deps: SetupWizardDeps):
         { status: "succeeded" },
         `${FIRST_VAULT_SHORT} already supervised (status=${supervisorState?.status}) — a concurrent install is provisioning the vault`,
       );
+      // No follow-up here: the in-flight install owns the vault's first boot,
+      // and racing it with a restart would be worse than asking the operator.
+      if (semanticSearch) {
+        registry.update(
+          op.id,
+          {},
+          "semantic search not enabled here (a concurrent install owns the vault) — turn it on from the vault admin's Semantic search page",
+        );
+      }
     }
   } else if (registry) {
     // hub#267: thread the typed name through `PARACHUTE_VAULT_NAME` so
@@ -2359,53 +2423,61 @@ export async function handleSetupVaultPost(req: Request, deps: SetupWizardDeps):
       spawnEnv,
     })
       .then(async () => {
-        if (!importToRun) return;
-        const opState = registry.get(op.id);
-        if (!opState || opState.status !== "succeeded") return;
-        // Import is a follow-up step: mark op back to running, POST to
-        // vault, surface the result in the op log.
-        registry.update(
-          op.id,
-          { status: "running" },
-          `vault up — starting import from ${importToRun.remoteUrl} (mode=${importToRun.mode})`,
-        );
-        try {
-          // Mint a short-lived per-vault admin Bearer for the import POST.
-          // Vault validates audience `vault.<name>` + scope `vault:<name>:admin`
-          // (see admin-vault-admin-token.ts for the canonical shape — same
-          // contract the SPA Manage link uses). The token only needs to
-          // live until vault accepts the HTTP request (the clone itself
-          // happens inside vault after the auth check passes); 5 min is
-          // a generous safety net covering the supervisor's boot-grace
-          // retries on a sluggish host. Deliberate divergence from the
-          // SPA's 10-min TTL because this token is one-shot, not refreshed.
-          const minted = await signAccessToken(deps.db, {
-            sub: importerUserId,
-            scopes: [`vault:${vaultName}:admin`],
-            audience: `vault.${vaultName}`,
-            clientId: "parachute-hub-setup-wizard",
-            issuer: vaultIssuer,
-            ttlSeconds: 5 * 60,
-            vaultScope: [vaultName],
-          });
-          const result = await postVaultImportImpl({
-            vaultName,
-            vaultPort,
-            bearerToken: minted.token,
-            remoteUrl: importToRun.remoteUrl,
-            mode: importToRun.mode,
-            ...(importToRun.pat ? { pat: importToRun.pat } : {}),
-          });
+        // Import is a follow-up step, only on a green install.
+        if (importToRun && registry.get(op.id)?.status === "succeeded") {
+          // Mark op back to running, POST to vault, surface the result in the
+          // op log.
           registry.update(
             op.id,
-            { status: "succeeded" },
-            `import succeeded — notes_imported=${result.notes_imported ?? 0}, tags_imported=${
-              result.tags_imported ?? 0
-            }, attachments_imported=${result.attachments_imported ?? 0}`,
+            { status: "running" },
+            `vault up — starting import from ${importToRun.remoteUrl} (mode=${importToRun.mode})`,
           );
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          registry.update(op.id, { status: "failed", error: msg }, `import failed: ${msg}`);
+          try {
+            // Mint a short-lived per-vault admin Bearer for the import POST.
+            // Vault validates audience `vault.<name>` + scope `vault:<name>:admin`
+            // (see admin-vault-admin-token.ts for the canonical shape — same
+            // contract the SPA Manage link uses). The token only needs to
+            // live until vault accepts the HTTP request (the clone itself
+            // happens inside vault after the auth check passes); 5 min is
+            // a generous safety net covering the supervisor's boot-grace
+            // retries on a sluggish host. Deliberate divergence from the
+            // SPA's 10-min TTL because this token is one-shot, not refreshed.
+            const minted = await signAccessToken(deps.db, {
+              sub: importerUserId,
+              scopes: [`vault:${vaultName}:admin`],
+              audience: `vault.${vaultName}`,
+              clientId: "parachute-hub-setup-wizard",
+              issuer: vaultIssuer,
+              ttlSeconds: 5 * 60,
+              vaultScope: [vaultName],
+            });
+            const result = await postVaultImportImpl({
+              vaultName,
+              vaultPort,
+              bearerToken: minted.token,
+              remoteUrl: importToRun.remoteUrl,
+              mode: importToRun.mode,
+              ...(importToRun.pat ? { pat: importToRun.pat } : {}),
+            });
+            registry.update(
+              op.id,
+              { status: "succeeded" },
+              `import succeeded — notes_imported=${result.notes_imported ?? 0}, tags_imported=${
+                result.tags_imported ?? 0
+              }, attachments_imported=${result.attachments_imported ?? 0}`,
+            );
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            registry.update(op.id, { status: "failed", error: msg }, `import failed: ${msg}`);
+          }
+        }
+        // Semantic search (hub#966) runs after import, if any, so the vault
+        // restart never lands mid-clone — and only while the op is still green.
+        if (semanticSearch && registry.get(op.id)?.status === "succeeded") {
+          await runSemanticSearchFollowUp(op.id, registry, deps, {
+            vaultName,
+            userId: importerUserId,
+          });
         }
       })
       .catch((err) => {
@@ -2437,6 +2509,63 @@ export async function handleSetupVaultPost(req: Request, deps: SetupWizardDeps):
     });
   }
   return redirect(redirectUrl);
+}
+
+/**
+ * Semantic-search follow-up for the vault op (hub#966). Runs after the vault
+ * is up (and after an import, if any): flips the op back to `running` so the
+ * poll page / CLI keep waiting, mints the same short-lived per-vault admin
+ * Bearer the import follow-up uses, PUTs the vault's embeddings toggle and —
+ * when the vault reports `restart_required` — restarts vault through the
+ * supervisor so the boot-time provider picks it up.
+ *
+ * NEVER fails the op. Semantic search is optional; the vault itself is fine.
+ * Whatever happens, the op ends `succeeded` with one log line saying what
+ * happened and, on failure, how to finish by hand.
+ */
+async function runSemanticSearchFollowUp(
+  opId: string,
+  registry: OperationsRegistry,
+  deps: SetupWizardDeps,
+  ctx: { vaultName: string; userId: string },
+): Promise<void> {
+  const { vaultName, userId } = ctx;
+  registry.update(opId, { status: "running" }, "turning on semantic search…");
+  let line: string;
+  try {
+    const supervisor = deps.supervisor;
+    const minted = await signAccessToken(deps.db, {
+      sub: userId,
+      scopes: [`vault:${vaultName}:admin`],
+      audience: `vault.${vaultName}`,
+      clientId: "parachute-hub-setup-wizard",
+      issuer: deps.issuer,
+      ttlSeconds: 5 * 60,
+      vaultScope: [vaultName],
+    });
+    const enable = deps.enableSemanticSearchImpl ?? enableSemanticSearch;
+    const result = await enable({
+      vaultName,
+      vaultPort: specFor(FIRST_VAULT_SHORT).seedEntry?.().port ?? 1940,
+      bearerToken: minted.token,
+      restartVault: async () => {
+        if (!supervisor) return "no module supervisor on this hub surface";
+        return restartSupervisedModule(FIRST_VAULT_SHORT, {
+          db: deps.db,
+          issuer: deps.issuer,
+          manifestPath: deps.manifestPath,
+          configDir: deps.configDir,
+          supervisor,
+          registry,
+        });
+      },
+    });
+    line = result.message;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    line = `semantic search not enabled (${msg}) — turn it on from the vault admin's Semantic search page`;
+  }
+  registry.update(opId, { status: "succeeded" }, line);
 }
 
 /**
@@ -3349,7 +3478,8 @@ const STYLES = `
     transition: border-color 0.15s ease, background 0.15s ease;
   }
   .vault-mode-option:hover { border-color: ${PALETTE.accent}; }
-  .vault-mode-option input[type=radio] {
+  .vault-mode-option input[type=radio],
+  .vault-mode-option input[type=checkbox] {
     margin-top: 0.25rem;
     accent-color: ${PALETTE.accent};
     flex-shrink: 0;

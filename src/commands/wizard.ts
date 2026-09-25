@@ -106,6 +106,14 @@ export interface RunCliWizardOpts {
   vaultImportPat?: string;
   vaultImportReplace?: boolean;
   /**
+   * Semantic-search opt-in (hub#966) — `--semantic-search` /
+   * `--no-semantic-search`. Rides the vault POST as `semantic_search`; the
+   * hub turns the vault's embeddings setting on and restarts vault once the
+   * vault is up. Unset → ask (default No); unset on a non-TTY → off, never a
+   * throw (it's optional, like transcription).
+   */
+  semanticSearch?: boolean;
+  /**
    * Pre-supply the expose-mode answer. One of `localhost | tailnet |
    * public`. The on-box CLI surface defaults to `localhost` because
    * that's what an operator running `parachute init` typically wants;
@@ -560,6 +568,25 @@ async function walkAccountStep(
 }
 
 /**
+ * The semantic-search question (hub#966). Flag wins; otherwise ask once,
+ * default No — it's a ~34 MB model download plus background indexing, so it
+ * stays opt-in like the vault's own default. Headless with no flag and no
+ * injected prompt → off without asking (never the throwing default prompt:
+ * an optional extra must not abort a scripted setup).
+ */
+async function resolveSemanticSearch(
+  opts: RunCliWizardOpts & { prompt: (q: string) => Promise<string>; promptInjected?: boolean },
+): Promise<boolean> {
+  if (opts.semanticSearch !== undefined) return opts.semanticSearch;
+  if (opts.promptInjected !== true && !process.stdin.isTTY) return false;
+  opts.log("");
+  opts.log("  Semantic search — find notes by meaning, not just keywords.");
+  opts.log("  Runs locally (~34 MB model); no text leaves this machine.");
+  const raw = (await opts.prompt("  Turn on semantic search? [y/N]: ")).trim().toLowerCase();
+  return raw === "y" || raw === "yes";
+}
+
+/**
  * Vault step. Three modes:
  *   * create — name input → POST /admin/setup/vault with mode=create
  *   * import — name + remote_url + (optional) pat + mode (merge/replace)
@@ -574,6 +601,7 @@ async function walkVaultStep(
   state: WizardStateSnapshot,
   opts: RunCliWizardOpts & {
     prompt: (q: string) => Promise<string>;
+    promptInjected?: boolean;
     fetchImpl: (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
     sleep: (ms: number) => Promise<void>;
   },
@@ -622,6 +650,8 @@ async function walkVaultStep(
       vaultName = raw === "" ? "default" : raw;
     }
     jsonBody.vault_name = vaultName;
+    const semanticSearch = await resolveSemanticSearch(opts);
+    if (semanticSearch) jsonBody.semantic_search = true;
   }
   if (mode === "import") {
     let remoteUrl = opts.vaultImportRemoteUrl;
@@ -652,6 +682,10 @@ async function walkVaultStep(
   if (mode === "skip") {
     if (res.status === 303 || res.status === 302 || res.status === 200) {
       log("  ✓ Vault step skipped (you can create or import a vault later from /admin).");
+      if (opts.semanticSearch === true) {
+        log("  · Semantic search not enabled — there's no vault yet. Turn it on later from");
+        log("    the vault admin's Semantic search page.");
+      }
       return 0;
     }
     log(`  ✗ Skip-step POST failed (${res.status}): ${res.bodyText.slice(0, 200)}`);
@@ -699,6 +733,9 @@ async function walkVaultStep(
   );
   if (finalState.status === "succeeded") {
     log(mode === "import" ? "  ✓ Vault imported." : "  ✓ Vault ready.");
+    // The semantic-search follow-up never fails the op, so its outcome
+    // (on / saved-but-restart-failed / couldn't reach the vault) is only in
+    // the op log, which the poll already streamed above. Nothing more to add.
     return 0;
   }
   log(`  ✗ Vault ${mode} failed: ${finalState.error ?? "(no detail)"}.`);
@@ -775,7 +812,7 @@ export async function runCliWizard(opts: RunCliWizardOpts): Promise<number> {
   const sleep = opts.sleep ?? defaultSleep;
   const log = opts.log;
   const hubUrl = opts.hubUrl.replace(/\/+$/, "");
-  const ctx = { ...opts, prompt, fetchImpl, sleep };
+  const ctx = { ...opts, prompt, fetchImpl, sleep, promptInjected: opts.prompt !== undefined };
   const jar: CookieJar = {};
 
   log("");
@@ -926,6 +963,12 @@ export function parseWizardArgs(args: readonly string[]): ParsedWizardArgs | { e
       case "--skip-vault":
         out.opts.vaultMode = "skip";
         break;
+      case "--semantic-search":
+        out.opts.semanticSearch = true;
+        break;
+      case "--no-semantic-search":
+        out.opts.semanticSearch = false;
+        break;
       case "--expose-mode":
         if (!consumeValue()) return { error: `${key} requires a value` };
         if (value !== "localhost" && value !== "tailnet" && value !== "public") {
@@ -973,6 +1016,7 @@ export async function runSetupWizardCommand(args: readonly string[]): Promise<nu
         "                              [--bootstrap-token <token>]\n" +
         "                              [--vault-mode create|import|skip] [--vault-name <name>]\n" +
         "                              [--vault-import-url <url>] [--vault-import-pat <pat>] [--vault-import-replace]\n" +
+        "                              [--semantic-search | --no-semantic-search]\n" +
         "                              [--transcribe-mode none|local|groq|openai] [--transcribe-key <key>]\n" +
         "                              [--config-dir <path>]\n" +
         "                              [--expose-mode localhost|tailnet|public]",

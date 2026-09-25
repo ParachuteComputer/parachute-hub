@@ -1062,6 +1062,28 @@ export async function handleRestart(
 }
 
 /**
+ * In-process twin of {@link handleRestart} for hub-internal callers that hold
+ * no HTTP request or Bearer (the first-run wizard's semantic-search opt-in,
+ * hub#966, restarts vault so its boot-time embedding provider picks up the
+ * new setting). Same spawn-req rebuild, same supervisor call; returns
+ * `undefined` on success or an operator-facing error string. Never throws.
+ */
+export async function restartSupervisedModule(
+  short: CuratedModuleShort,
+  deps: ApiModulesOpsDeps,
+): Promise<string | undefined> {
+  const resolved = await resolveSpawnRequest(short, deps);
+  if (!resolved.ok) return resolved.message;
+  try {
+    const state = await deps.supervisor.restart(short, resolved.req);
+    if (!state) return `${short} is not currently supervised`;
+    return undefined;
+  } catch (err) {
+    return err instanceof Error ? err.message : String(err);
+  }
+}
+
+/**
  * GET /api/modules/:short/logs — synchronous.
  *
  * Serves the supervisor's bounded per-module ring buffer (§6.5): the most
