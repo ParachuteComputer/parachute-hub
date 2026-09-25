@@ -278,6 +278,9 @@ Flags:
   --vault-import-pat <pat>       PAT for private repo import (optional)
   --vault-import-replace         use replace mode (default is merge)
   --skip-vault                   shorthand for --vault-mode skip
+  --semantic-search              turn on semantic search (local ~34 MB model,
+                                 no text leaves the machine); restarts vault
+  --no-semantic-search           leave semantic search off without asking
   --expose-mode <mode>           pre-pick the expose-mode answer
 
 Examples:

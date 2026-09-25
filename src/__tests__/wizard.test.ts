@@ -312,6 +312,16 @@ describe("parseWizardArgs", () => {
     expect(r.opts.configDir).toBe("/tmp/ph");
   });
 
+  test("--semantic-search / --no-semantic-search set the opt-in (hub#966)", () => {
+    const on = parseWizardArgs(["--hub-url", "http://127.0.0.1:1939", "--semantic-search"]);
+    const off = parseWizardArgs(["--hub-url", "http://127.0.0.1:1939", "--no-semantic-search"]);
+    const unset = parseWizardArgs(["--hub-url", "http://127.0.0.1:1939"]);
+    if ("error" in on || "error" in off || "error" in unset) throw new Error("parse failed");
+    expect(on.opts.semanticSearch).toBe(true);
+    expect(off.opts.semanticSearch).toBe(false);
+    expect(unset.opts.semanticSearch).toBeUndefined();
+  });
+
   test("rejects invalid --transcribe-mode", () => {
     const r = parseWizardArgs(["--hub-url", "http://x", "--transcribe-mode", "garbage"]);
     expect("error" in r).toBe(true);
@@ -729,6 +739,126 @@ describe("runCliWizard", () => {
         value: origIsTTY,
         configurable: true,
       });
+    }
+  });
+});
+
+describe("runCliWizard — semantic-search opt-in (hub#966)", () => {
+  const base = {
+    hubUrl: "http://127.0.0.1:1939",
+    sleep: async () => {},
+    accountUsername: "admin",
+    accountPassword: "longpassword",
+    vaultName: "default",
+    exposeMode: "localhost" as const,
+  };
+
+  test("--semantic-search sends semantic_search: true on the vault POST", async () => {
+    const { state, fetchImpl } = makeFakeHub();
+    const code = await runCliWizard({
+      ...base,
+      log: () => {},
+      fetchImpl,
+      vaultMode: "create",
+      semanticSearch: true,
+    });
+    expect(code).toBe(0);
+    const vaultBody = state.posted[1]?.body as Record<string, unknown>;
+    expect(vaultBody.semantic_search).toBe(true);
+  });
+
+  test("--no-semantic-search sends nothing and never asks", async () => {
+    const { state, fetchImpl } = makeFakeHub();
+    const prompts: string[] = [];
+    const code = await runCliWizard({
+      ...base,
+      log: () => {},
+      fetchImpl,
+      vaultMode: "create",
+      semanticSearch: false,
+      prompt: async (q) => {
+        prompts.push(q);
+        return "";
+      },
+    });
+    expect(code).toBe(0);
+    expect(prompts.some((q) => q.includes("semantic search"))).toBe(false);
+    const vaultBody = state.posted[1]?.body as Record<string, unknown>;
+    expect(vaultBody.semantic_search).toBeUndefined();
+  });
+
+  test("interactive: a blank answer defaults to NO (it's an opt-in)", async () => {
+    const { state, fetchImpl } = makeFakeHub();
+    const prompts: string[] = [];
+    const code = await runCliWizard({
+      ...base,
+      log: () => {},
+      fetchImpl,
+      vaultMode: "create",
+      prompt: async (q) => {
+        prompts.push(q);
+        return "";
+      },
+    });
+    expect(code).toBe(0);
+    expect(prompts.some((q) => q.includes("Turn on semantic search? [y/N]"))).toBe(true);
+    const vaultBody = state.posted[1]?.body as Record<string, unknown>;
+    expect(vaultBody.semantic_search).toBeUndefined();
+  });
+
+  test("interactive: 'y' turns it on", async () => {
+    const { state, fetchImpl } = makeFakeHub();
+    const code = await runCliWizard({
+      ...base,
+      log: () => {},
+      fetchImpl,
+      vaultMode: "create",
+      prompt: async (q) => (q.includes("semantic search") ? "y" : ""),
+    });
+    expect(code).toBe(0);
+    const vaultBody = state.posted[1]?.body as Record<string, unknown>;
+    expect(vaultBody.semantic_search).toBe(true);
+  });
+
+  test("skip mode never asks, and a --semantic-search flag says it wasn't applied", async () => {
+    const { state, fetchImpl } = makeFakeHub();
+    const logs: string[] = [];
+    const prompts: string[] = [];
+    const code = await runCliWizard({
+      ...base,
+      log: (l) => logs.push(l),
+      fetchImpl,
+      vaultMode: "skip",
+      semanticSearch: true,
+      prompt: async (q) => {
+        prompts.push(q);
+        return "";
+      },
+    });
+    expect(code).toBe(0);
+    expect(prompts.some((q) => q.includes("semantic search"))).toBe(false);
+    const vaultBody = state.posted[1]?.body as Record<string, unknown>;
+    expect(vaultBody.semantic_search).toBeUndefined();
+    expect(logs.join("\n")).toContain("Semantic search not enabled");
+  });
+
+  test("headless with no flag defaults to off instead of throwing", async () => {
+    const { state, fetchImpl } = makeFakeHub();
+    const isTTY = process.stdin.isTTY;
+    Object.defineProperty(process.stdin, "isTTY", { value: false, configurable: true });
+    try {
+      const code = await runCliWizard({
+        ...base,
+        log: () => {},
+        fetchImpl,
+        vaultMode: "create",
+        // no prompt seam, no semanticSearch → must not hit the throwing default
+      });
+      expect(code).toBe(0);
+      const vaultBody = state.posted[1]?.body as Record<string, unknown>;
+      expect(vaultBody.semantic_search).toBeUndefined();
+    } finally {
+      Object.defineProperty(process.stdin, "isTTY", { value: isTTY, configurable: true });
     }
   });
 });
