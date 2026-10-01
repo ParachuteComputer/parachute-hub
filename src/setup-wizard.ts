@@ -99,6 +99,7 @@ import type { Supervisor } from "./supervisor.ts";
 import { createUser, isSeedAdminUsername, userCount, validateUsername } from "./users.ts";
 import { sanitizePublicOrigin } from "./vault-hub-origin-env.ts";
 import { DEFAULT_VAULT_NAME, validateVaultName } from "./vault-name.ts";
+import { vaultRenameReservedUntil } from "./vault-rename-guard.ts";
 
 // --- shared chrome --------------------------------------------------------
 
@@ -2188,6 +2189,14 @@ export async function handleSetupVaultPost(req: Request, deps: SetupWizardDeps):
     vaultName = v.name;
   }
 
+  const renameReservation = vaultRenameReservedUntil(deps.db, vaultName);
+  if (renameReservation)
+    return jsonErrorResponse(
+      409,
+      "Vault name reserved",
+      `Renamed vault name is reserved until ${renameReservation}`,
+    );
+
   // Import path (hub#168 Cut 2): collect the remote URL + optional PAT
   // + replace flag up front so a malformed input fails fast before we
   // spawn the vault. The actual import POST to vault's
@@ -2325,7 +2334,11 @@ export async function handleSetupVaultPost(req: Request, deps: SetupWizardDeps):
         { status: "running" },
         `${FIRST_VAULT_SHORT} already supervised (status=${supervisorState?.status}) — creating vault "${vaultName}"`,
       );
-      void provision(vaultName, { issuer: deps.issuer, manifestPath: deps.manifestPath })
+      void provision(vaultName, {
+        db: deps.db,
+        issuer: deps.issuer,
+        manifestPath: deps.manifestPath,
+      })
         .then(async (provisioned) => {
           if (provisioned.ok) {
             registry.update(
@@ -2357,6 +2370,7 @@ export async function handleSetupVaultPost(req: Request, deps: SetupWizardDeps):
       // No registry (test-only path): provision synchronously so the vault is
       // actually created; there's no op to poll.
       const provisioned = await provision(vaultName, {
+        db: deps.db,
         issuer: deps.issuer,
         manifestPath: deps.manifestPath,
       });

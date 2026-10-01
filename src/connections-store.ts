@@ -16,6 +16,7 @@
  */
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
+import { renameVaultScopes } from "./scope-explanations.ts";
 
 /** The source side — an event a module emits, with an operator-set filter. */
 export interface ConnectionSource {
@@ -202,3 +203,35 @@ export function getConnection(storePath: string, id: string): ConnectionRecord |
 
 /** Re-export for the unused-import linter when only the type is consumed. */
 export const _emptyConnectionsFile = emptyFile;
+
+/** Rename hub-owned connection metadata. Remote credentials are immutable JWTs
+ * and must be renewed; trigger names and sink params are module-owned. */
+export function renameConnectionsForVault(
+  storePath: string,
+  oldName: string,
+  newName: string,
+): number {
+  let count = 0;
+  const records = readConnections(storePath).map((record) => {
+    const scope = record.provisioned?.scope;
+    const nextScope = scope ? renameVaultScopes(scope, oldName, newName) : scope;
+    if (
+      record.source.vault !== oldName &&
+      record.provisioned?.vault !== oldName &&
+      scope === nextScope
+    )
+      return record;
+    count++;
+    return {
+      ...record,
+      source: { ...record.source, ...(record.source.vault === oldName ? { vault: newName } : {}) },
+      provisioned: {
+        ...record.provisioned,
+        ...(record.provisioned?.vault === oldName ? { vault: newName } : {}),
+        ...(nextScope !== undefined ? { scope: nextScope } : {}),
+      },
+    };
+  });
+  if (count) writeAll(storePath, records);
+  return count;
+}

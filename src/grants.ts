@@ -27,7 +27,7 @@
 
 import type { Database } from "bun:sqlite";
 import { ACCOUNT_VAULTS_UNNARROWED, accountVaultsScope } from "@openparachute/door-contract";
-import { vaultScopeName } from "./scope-explanations.ts";
+import { renameVaultScopes, vaultScopeName } from "./scope-explanations.ts";
 
 const HUB_ACCOUNT_VAULTS_BOUND = accountVaultsScope("self");
 
@@ -345,6 +345,23 @@ export function revokeGrant(db: Database, userId: string, clientId: string): boo
   return res.changes > 0;
 }
 
+/** Rename the exact vault reference; called inside the rename transaction. */
+export function renameGrantsForVault(db: Database, oldName: string, newName: string): number {
+  const rows = db.prepare("SELECT user_id, client_id, scopes FROM grants").all() as GrantRow[];
+  let count = 0;
+  for (const row of rows) {
+    const scopes = renameVaultScopes(row.scopes, oldName, newName);
+    if (scopes === row.scopes) continue;
+    db.prepare("UPDATE grants SET scopes = ? WHERE user_id = ? AND client_id = ?").run(
+      scopes,
+      row.user_id,
+      row.client_id,
+    );
+    count++;
+  }
+  return count;
+}
+
 /**
  * Vault-delete cascade step (B1, 2026-06-09 hub-module-boundary): REWRITE
  * every grant whose scope list names the deleted vault, removing the
@@ -361,6 +378,7 @@ export function revokeGrant(db: Database, userId: string, clientId: string): boo
  * name is a LIKE wildcard. Unnamed scopes (`vault:read`) and non-vault
  * scopes are preserved.
  */
+
 export function rewriteGrantsRemovingVault(
   db: Database,
   vaultName: string,

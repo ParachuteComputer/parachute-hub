@@ -482,6 +482,14 @@ export function revokeInvite(db: Database, tokenHash: string, now: Date = new Da
   return res.changes > 0;
 }
 
+/** Rename the exact vault reference; called inside the rename transaction. */
+export function renameInvitesForVault(db: Database, oldName: string, newName: string): number {
+  return Number(
+    db.prepare("UPDATE invites SET vault_name = ? WHERE vault_name = ?").run(newName, oldName)
+      .changes,
+  );
+}
+
 /**
  * Vault-delete cascade step (B1, 2026-06-09 hub-module-boundary): invalidate
  * every UNREDEEMED invite pinned to the deleted vault. An un-revoked pending
@@ -491,6 +499,7 @@ export function revokeInvite(db: Database, tokenHash: string, now: Date = new Da
  * `=` comparison — no pattern matching. Returns the number of invites
  * newly revoked.
  */
+
 export function revokeInvitesForVault(
   db: Database,
   vaultName: string,

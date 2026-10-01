@@ -1,5 +1,7 @@
+import type { Database } from "bun:sqlite";
 /**
  * `POST /vaults` — provision a new vault on the host.
+ * `POST /vaults/<name>/rename` — rename a vault with its identity cascade.
  * `DELETE /vaults/<name>` — destroy a vault WITH the identity cascade
  * (B1, 2026-06-09 hub-module-boundary migration — see `handleDeleteVault`).
  *
@@ -65,7 +67,7 @@
  * the CLI itself rejects an existing name with exit 1, but a re-POST is
  * usually a UI retry, not an error to the caller.
  */
-import type { Database } from "bun:sqlite";
+import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import {
   type AdminAuthContext,
   type AdminAuthError,
@@ -73,23 +75,26 @@ import {
   requireScope,
 } from "./admin-auth.ts";
 import { type ConnectionsDeps, teardownConnection } from "./admin-connections.ts";
-import { removeChannelVaultsForVault } from "./channel-vaults.ts";
+import { removeChannelVaultsForVault, renameChannelVaultsForVault } from "./channel-vaults.ts";
 import { SERVICES_MANIFEST_PATH } from "./config.ts";
-import { readConnections } from "./connections-store.ts";
-import { rewriteGrantsRemovingVault } from "./grants.ts";
-import { revokeInvitesForVault } from "./invites.ts";
+import { readConnections, renameConnectionsForVault } from "./connections-store.ts";
+import { renameGrantsForVault, rewriteGrantsRemovingVault } from "./grants.ts";
+import { renameInvitesForVault, revokeInvitesForVault } from "./invites.ts";
 import { inferAudience } from "./jwt-audience.ts";
 import {
   ACCESS_TOKEN_TTL_SECONDS,
   recordTokenMint,
+  renameTokensForVault,
   revokeTokensNamingVault,
   signAccessToken,
 } from "./jwt-sign.ts";
+import { vaultScopeName } from "./scope-explanations.ts";
 import { findService, type readManifest, readManifestLenient } from "./services-manifest.ts";
 import { enrichedPath } from "./spawn-path.ts";
-import { getUserById, removeVaultAssignments } from "./users.ts";
-import { removeVaultCap } from "./vault-caps.ts";
-import { RESERVED_VAULT_NAMES, VAULT_NAME_CHARSET_RE } from "./vault-name.ts";
+import { getUserById, removeVaultAssignments, renameVaultAssignments } from "./users.ts";
+import { removeVaultCap, renameVaultCap } from "./vault-caps.ts";
+import { RESERVED_VAULT_NAMES, VAULT_NAME_CHARSET_RE, validateVaultName } from "./vault-name.ts";
+import { vaultRenameReservedUntil } from "./vault-rename-guard.ts";
 import { type WellKnownVaultEntry, isVaultEntry, vaultInstanceNameFor } from "./well-known.ts";
 
 /** Scope required to call POST /vaults. */
@@ -430,6 +435,8 @@ export type ProvisionVaultResult =
 export async function provisionVault(
   name: string,
   deps: {
+    db: Database;
+    now?: () => Date;
     issuer: string;
     manifestPath?: string;
     runCommand?: CreateVaultDeps["runCommand"];
@@ -450,6 +457,14 @@ export async function provisionVault(
   if (RESERVED_VAULT_NAMES.has(name)) {
     return { ok: false, status: 400, message: `"${name}" is a reserved vault name` };
   }
+
+  const reservedUntil = vaultRenameReservedUntil(deps.db, name, deps.now?.());
+  if (reservedUntil)
+    return {
+      ok: false,
+      status: 409,
+      message: `vault name "${name}" is reserved after rename until ${reservedUntil}`,
+    };
 
   // Idempotency: if the vault already exists, return the existing entry.
   const existing = findExistingVault(manifestPath, name);
@@ -511,6 +526,7 @@ export async function handleCreateVault(req: Request, deps: CreateVaultDeps): Pr
   const { name } = parsed.body;
 
   const provisioned = await provisionVault(name, {
+    db: deps.db,
     issuer: deps.issuer,
     manifestPath,
     runCommand,
@@ -1082,4 +1098,184 @@ export async function handleDeleteVault(
     }),
     { status: 200, headers: { "content-type": "application/json" } },
   );
+}
+
+/** Rename mechanics first, then one synchronous identity transaction. Like
+ * delete, no pre-stop is performed; the injected restart evicts open stores.
+ *
+ * Vault auth enforces aud=vault.<name> and named scopes (vault auth.ts /
+ * scope-guard), so an old access JWT cannot enter the renamed vault. Reserving
+ * the old name for one access TTL (+ clock tolerance) prevents resurrection
+ * without revoking the jti shared by an OAuth refresh row. Unrefreshable mints
+ * are revoked and published on the revocation feed. Auth codes are invalidated
+ * so a code obtained before rename cannot mint a fresh old-name family.
+ */
+export async function handleRenameVault(
+  req: Request,
+  rawName: string,
+  deps: DeleteVaultDeps,
+): Promise<Response> {
+  if (req.method !== "POST") return new Response("method not allowed", { status: 405 });
+  try {
+    await requireScope(deps.db, req, HOST_ADMIN_SCOPE, deps.knownIssuers ?? [deps.issuer]);
+  } catch (err) {
+    return adminAuthErrorResponse(err as AdminAuthError);
+  }
+  let body: unknown;
+  try {
+    body = await req.json();
+  } catch {
+    return jsonError(400, "invalid_request", "body must be JSON");
+  }
+  const rawNew =
+    body && typeof body === "object" ? (body as Record<string, unknown>).new_name : undefined;
+  if (typeof rawNew !== "string")
+    return jsonError(400, "invalid_request", "new_name must be a string");
+  const oldValidation = validateVaultName(rawName);
+  const newValidation = validateVaultName(rawNew);
+  if (!oldValidation.ok) return jsonError(400, "invalid_request", oldValidation.error);
+  if (!newValidation.ok) return jsonError(400, "invalid_request", newValidation.error);
+  const oldName = oldValidation.name;
+  const newName = newValidation.name;
+  const manifestPath = deps.manifestPath ?? SERVICES_MANIFEST_PATH;
+  const now = deps.now?.() ?? new Date();
+  if (!findExistingVault(manifestPath, oldName))
+    return jsonError(404, "not_found", `no vault named "${oldName}"`);
+  if (findExistingVault(manifestPath, newName))
+    return jsonError(409, "already_exists", `vault "${newName}" already exists`);
+  const reserved = vaultRenameReservedUntil(deps.db, newName, now);
+  if (reserved) return jsonError(409, "name_reserved", `name reserved until ${reserved}`);
+  const run = deps.runCommand ?? defaultRunCommand;
+  // Snapshot the non-DB store after mechanics; compensate it on transaction
+  // failure. No async work occurs between this store's write and DB commit.
+  let originalStore: Buffer | undefined;
+  let result: RunResult;
+  try {
+    result = await run(["parachute-vault", "rename", oldName, newName, "--yes"]);
+    if (result.exitCode !== 0)
+      return jsonError(
+        500,
+        "rename_failed",
+        `vault CLI exited ${result.exitCode}: ${result.stderr.trim().slice(-500)}`,
+      );
+  } catch (err) {
+    return jsonError(500, "rename_failed", String(err));
+  }
+  let summary: {
+    grants_rewritten: number;
+    user_vaults_renamed: number;
+    invites_renamed: number;
+    vault_cap_renamed: number;
+    channel_vaults_renamed: number;
+    tokens_rescoped: number;
+    tokens_revoked: string[];
+    tokens_revoked_count: number;
+    connections_renamed: number;
+    old_name_reserved_until: string;
+  };
+  let connectionsWritten = false;
+  try {
+    if (existsSync(deps.connectionsStorePath))
+      originalStore = readFileSync(deps.connectionsStorePath);
+    const cascadeNow = deps.now?.() ?? new Date();
+    summary = deps.db.transaction(() => {
+      const tokens = renameTokensForVault(deps.db, oldName, newName, cascadeNow);
+      const counts = {
+        grants_rewritten: renameGrantsForVault(deps.db, oldName, newName),
+        user_vaults_renamed: renameVaultAssignments(deps.db, oldName, newName),
+        invites_renamed: renameInvitesForVault(deps.db, oldName, newName),
+        vault_cap_renamed: renameVaultCap(deps.db, oldName, newName),
+        channel_vaults_renamed: renameChannelVaultsForVault(deps.db, oldName, newName),
+        tokens_rescoped: tokens.rescoped,
+        tokens_revoked: tokens.revoked,
+        tokens_revoked_count: tokens.revoked.length,
+      };
+      for (const row of deps.db
+        .query<{ code: string; scopes: string }, []>(
+          "SELECT code, scopes FROM auth_codes WHERE used_at IS NULL",
+        )
+        .all()) {
+        if (row.scopes.split(" ").some((scope) => vaultScopeName(scope) === oldName)) {
+          deps.db.prepare("DELETE FROM auth_codes WHERE code = ?").run(row.code);
+        }
+      }
+      deps.db
+        .prepare("UPDATE hub_settings SET value = ? WHERE key = 'setup_vault_name' AND value = ?")
+        .run(newName, oldName);
+      // 15-minute access TTL exceeds the <=10-minute unregistered interactive
+      // mint limit. Add 60 seconds for downstream JWT clock tolerance.
+      const until = new Date(
+        cascadeNow.getTime() + (ACCESS_TOKEN_TTL_SECONDS + 60) * 1000,
+      ).toISOString();
+      deps.db
+        .prepare("INSERT OR REPLACE INTO hub_settings (key, value, updated_at) VALUES (?, ?, ?)")
+        .run(`vault_rename_reserved:${oldName}`, until, cascadeNow.toISOString());
+      connectionsWritten = true;
+      const connectionsRenamed = renameConnectionsForVault(
+        deps.connectionsStorePath,
+        oldName,
+        newName,
+      );
+      return { ...counts, connections_renamed: connectionsRenamed, old_name_reserved_until: until };
+    })();
+  } catch (err) {
+    const outcomes: string[] = [`identity transaction rolled back: ${String(err)}`];
+    if (connectionsWritten) {
+      try {
+        if (originalStore) writeFileSync(deps.connectionsStorePath, originalStore);
+        else rmSync(deps.connectionsStorePath, { force: true });
+      } catch (restoreError) {
+        outcomes.push(`connections restore failed: ${String(restoreError)}`);
+      }
+    }
+    try {
+      const reverse = await run(["parachute-vault", "rename", newName, oldName, "--yes"]);
+      outcomes.push(
+        reverse.exitCode === 0
+          ? "reverse CLI rename succeeded"
+          : `reverse CLI rename failed (${reverse.exitCode}): ${reverse.stderr.trim().slice(-500)}`,
+      );
+    } catch (reverseError) {
+      outcomes.push(`reverse CLI rename failed: ${String(reverseError)}`);
+    }
+    return jsonError(500, "cascade_failed", outcomes.join("; "));
+  }
+  const warnings: string[] = [];
+  if (deps.restartVaultModule) {
+    try {
+      await deps.restartVaultModule();
+    } catch (err) {
+      warnings.push(`vault module restart failed: ${String(err)}`);
+    }
+  } else
+    warnings.push(
+      "vault module restart unavailable; restart the vault module to evict cached stores",
+    );
+  if (summary.connections_renamed)
+    warnings.push(
+      "Connection metadata renamed; renew credential connections and re-provision event connections whose vault JWTs were revoked.",
+    );
+  warnings.push(
+    "Module-owned channel configurations and saved client URLs must be updated; agent connector grants naming the old vault must be requested and approved again.",
+  );
+  // selfRegister owns services.json: read its new mount, never edit it here.
+  const mount = findExistingVault(manifestPath, newName)?.path ?? `/vault/${newName}`;
+  let backupPath: string | null = null;
+  try {
+    const parsed = JSON.parse(result.stdout) as { backup_path?: unknown };
+    if (typeof parsed.backup_path === "string") backupPath = parsed.backup_path;
+  } catch {
+    backupPath =
+      /(?:backup(?:_path| path)?|Backup(?: saved)?(?: to)?)\s*:\s*(.+)/i
+        .exec(result.stdout)?.[1]
+        ?.trim() ?? null;
+  }
+  return Response.json({
+    old: oldName,
+    new: newName,
+    backup_path: backupPath,
+    ...summary,
+    mounts: { mcp: `${mount}/mcp`, rest: mount },
+    warnings,
+  });
 }

@@ -28,8 +28,9 @@ import {
   jwtVerify,
 } from "jose";
 import { attributionPubkey } from "./pubkey-links.ts";
-import { vaultScopeName } from "./scope-explanations.ts";
+import { renameVaultScopes, vaultScopeName } from "./scope-explanations.ts";
 import { getActiveSigningKey, getAllPublicKeys } from "./signing-keys.ts";
+import { vaultRenameReservedUntil } from "./vault-rename-guard.ts";
 
 export const ACCESS_TOKEN_TTL_SECONDS = 15 * 60;
 export const REFRESH_TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000;
@@ -135,6 +136,7 @@ export async function signAccessToken(
     .setAudience(opts.audience)
     .setJti(jti)
     .sign(priv);
+  assertVaultNamesAvailable(db, opts.scopes, opts.now?.() ?? new Date());
   return { token, jti, expiresAt: new Date(exp * 1000).toISOString() };
 }
 
@@ -239,6 +241,7 @@ export class TokenMintPrincipalGoneError extends Error {
 }
 
 export function signRefreshToken(db: Database, opts: SignRefreshTokenOpts): SignedRefreshToken {
+  assertVaultNamesAvailable(db, opts.scopes, opts.now?.() ?? new Date());
   const token = randomBytes(32).toString("base64url");
   const refreshTokenHash = createHash("sha256").update(token).digest("hex");
   const now = opts.now?.() ?? new Date();
@@ -445,6 +448,33 @@ export function revokeTokenByJti(
   return Number(res.changes) > 0;
 }
 
+/** JWTs are immutable. Preserve refresh hashes/families; only future refreshes
+ * get the renamed scopes/audience. Unrefreshable mints must be re-minted.
+ * A separate name-reuse tombstone covers outstanding access JWTs, including
+ * unregistered short-lived mints, without revoking the shared refresh jti. */
+export function renameTokensForVault(
+  db: Database,
+  oldName: string,
+  newName: string,
+  now: Date,
+): { rescoped: number; revoked: string[] } {
+  const rows = db
+    .query<{ jti: string; scopes: string; refresh_token_hash: string | null }, []>(
+      "SELECT jti, scopes, refresh_token_hash FROM tokens WHERE revoked_at IS NULL",
+    )
+    .all();
+  const result = { rescoped: 0, revoked: [] as string[] };
+  for (const row of rows) {
+    const scopes = renameVaultScopes(row.scopes, oldName, newName);
+    if (scopes === row.scopes) continue;
+    if (row.refresh_token_hash !== null) {
+      db.prepare("UPDATE tokens SET scopes = ? WHERE jti = ?").run(scopes, row.jti);
+      result.rescoped++;
+    } else if (revokeTokenByJti(db, row.jti, now)) result.revoked.push(row.jti);
+  }
+  return result;
+}
+
 /**
  * Revoke every un-revoked tokens row whose recorded scopes NAME the given
  * vault (`vault:<name>:<verb>`) — the B1 vault-delete registry sweep
@@ -459,6 +489,7 @@ export function revokeTokenByJti(
  * Returns the number of rows newly revoked. Idempotent (already-revoked
  * rows are filtered by the WHERE and by `revokeTokenByJti`).
  */
+
 export function revokeTokensNamingVault(db: Database, vaultName: string, now: Date): number {
   const rows = db
     .query<{ jti: string; scopes: string }, []>(
@@ -851,4 +882,15 @@ export function liveFamilyRefreshRows(
     )
     .all(familyId, now.toISOString());
   return rows.map(rowToRefreshToken);
+}
+
+/** Prevent a mint already in flight during rename from persisting a stale
+ * refresh family, or a stale client from minting into a reserved old name. */
+function assertVaultNamesAvailable(db: Database, scopes: string[], now: Date): void {
+  for (const scope of scopes) {
+    const name = vaultScopeName(scope);
+    if (name && vaultRenameReservedUntil(db, name, now)) {
+      throw new Error(`vault "${name}" was renamed; obtain scopes for its new name`);
+    }
+  }
 }

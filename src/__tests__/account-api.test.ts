@@ -157,7 +157,7 @@ describe("handleAccountCapabilities", () => {
       expect(body.vault_url_template).toBe(`${ISSUER}/vault/{name}`);
       expect(body.capabilities).toEqual({
         vault_create: true,
-        vault_rename: false,
+        vault_rename: true,
         vault_delete: true,
       });
       expect(body.plans).toEqual([]);
