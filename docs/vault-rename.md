@@ -1,4 +1,4 @@
-# Vault rename (PR body draft)
+# Vault rename
 
 `POST /vaults/<old>/rename` with `{"new_name":"<new>"}` and
 `parachute vault rename <old> <new>` now rename a vault with its hub identity.
@@ -9,14 +9,19 @@ wire-contract capability, not a change to the contract type. The existing
 false conformance vector describes cloud and remains unchanged.
 
 The vault CLI owns filesystem moves, SQLite backup, vault.yaml, default_vault,
-and services.json self-registration. The hub calls
+and services.json self-registration. Its rename command is offline: it has no
+cross-process lock, and rollback copies a VACUUM snapshot over vault.db.
+The hub stops the vault module before
 `parachute-vault rename old new --yes`, then commits the identity cascade in one
-SQLite transaction. A CLI failure leaves identity untouched. A transaction
-failure rolls it back, restores connection metadata, attempts the reverse CLI
-rename, and reports both outcomes. Like delete, there is no pre-stop; the
-supervisor restart follows the successful cascade. Restart failures are
-reported as warnings on the committed rename. The response includes the backup
-path, new mounts, counts, revoked jtis, reservation expiry, and repair warnings.
+SQLite transaction. Every vault on the host is briefly offline during the
+rename; a success response includes a warning stating this. Without a supervisor,
+the hub refuses with 503 `supervisor_unavailable` before running the CLI.
+A CLI failure leaves identity untouched. A transaction failure rolls it back,
+restores connection metadata, and attempts the reverse CLI rename while the
+module remains stopped. The hub attempts to restart on every exit path,
+including a failed stop. Restart failures append to error descriptions or become
+warnings on a committed rename. The response includes the backup path, new
+mounts, counts, revoked jtis, reservation expiry, and repair warnings.
 
 ## Token policy
 
@@ -82,14 +87,13 @@ module deletion does; operators must use the hub surface during this interval.
 The SQLite transaction and connection-file compensation protect handled
 failures, not sudden process/power loss between filesystem and DB commits.
 The module CLI backup and reported reverse-rename outcome support recovery.
-No services were restarted during development; tests inject the CLI and restart.
+No services were restarted during development; tests inject the CLI, stop, and restart.
 
 ## Validation
 
 - `bun run typecheck`: passed.
-- `bun test ./src/__tests__/admin-vaults-rename.test.ts ./src/__tests__/account-api.test.ts ./src/__tests__/admin-vaults.test.ts`:
-  91 passed, 0 failed, 409 assertions across 3 files (11 rename tests).
-- `bunx biome check .`: 30 errors and 4 warnings in untouched files; no fixes
-  applied there. A targeted Biome check of all 22 touched TypeScript files passed.
-- Door-contract sources/vectors were inspected but unchanged; package tests
-  were not needed. No full-suite run, live-state access, or service restart.
+- `bun test ./src/__tests__/admin-vaults-rename.test.ts ./src/__tests__/admin-vaults.test.ts ./src/__tests__/account-api.test.ts ./src/__tests__/jwt-sign.test.ts ./src/__tests__/oauth-handlers.test.ts ./src/__tests__/grants.test.ts ./src/__tests__/invites.test.ts ./src/__tests__/channel-vaults.test.ts ./src/__tests__/vault-caps.test.ts`:
+  488 passed, 0 failed, 1,814 assertions across 9 files (19 rename tests).
+- `bunx biome check` on the touched files: passed for all 10 TypeScript files;
+  Biome does not check Markdown.
+- No live-state access or service restart. The companion vault PR is unchanged.

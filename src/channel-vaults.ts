@@ -270,7 +270,6 @@ export function renameChannelVaultsForVault(
  * re-created same-name vault doesn't silently inherit another channel's
  * members. Exact `=` match, no pattern. Returns rows deleted.
  */
-
 export function removeChannelVaultsForVault(db: Database, vault: string): number {
   const res = db.prepare("DELETE FROM channel_vaults WHERE vault = ?").run(vault);
   return Number(res.changes);

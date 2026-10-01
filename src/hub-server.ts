@@ -3234,6 +3234,9 @@ export function hubFetch(
           // store handle + re-runs selfRegister (services.json path rebuild).
           ...(supervisor
             ? {
+                stopVaultModule: async () => {
+                  await supervisor.stop("vault");
+                },
                 restartVaultModule: async () => {
                   await supervisor.restart("vault");
                 },
@@ -4269,6 +4272,9 @@ export function hubFetch(
             ...(deps?.deleteVaultRunCommand ? { runCommand: deps.deleteVaultRunCommand } : {}),
             ...(supervisor
               ? {
+                  stopVaultModule: async () => {
+                    await supervisor.stop("vault");
+                  },
                   restartVaultModule: async () => {
                     await supervisor.restart("vault");
                   },

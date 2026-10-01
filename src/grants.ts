@@ -378,7 +378,6 @@ export function renameGrantsForVault(db: Database, oldName: string, newName: str
  * name is a LIKE wildcard. Unnamed scopes (`vault:read`) and non-vault
  * scopes are preserved.
  */
-
 export function rewriteGrantsRemovingVault(
   db: Database,
   vaultName: string,

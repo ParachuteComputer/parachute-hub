@@ -65,6 +65,7 @@ import {
   REFRESH_GRACE_MS,
   RefreshTokenInsertError,
   type RefreshTokenRow,
+  VaultNameReservedError,
   findRefreshToken,
   findTokenRowByJti,
   linkRotation,
@@ -2777,56 +2778,62 @@ async function handleTokenAuthorizationCode(
   );
   if ("errorResponse" in audienceResolution) return audienceResolution.errorResponse;
   const audience = audienceResolution.audience;
-  const access = await signAccessToken(db, {
-    sub: redeemed.userId,
-    scopes: redeemed.scopes,
-    audience,
-    clientId: redeemed.clientId,
-    issuer: deps.issuer,
-    // vault_scope claim — Phase 2 per-user vault pin (Phase 1 had a single
-    // `assigned_vault` column; Phase 2 PR 2 generalized to `assigned_vaults`
-    // via `user_vaults`). Non-empty list for non-admin users with at least
-    // one assigned vault; empty for first-admin (unrestricted sentinel).
-    // Zero-vault non-admin is also empty by `vaultScopeForUser`, but the
-    // OAuth flow refuses to mint a vault-scoped token for them upstream
-    // (see the zero-vault gate in `handleConsentSubmit` + the same-hub
-    // auto-trust posture check), so we never reach here with that user
-    // posture. The narrowing in `handleConsentSubmit` already rewrote
-    // `vault:<verb>` → `vault:<assigned>:<verb>`, so the auth code's
-    // scopes are pre-aligned; this claim is the explicit "owned vaults"
-    // signal PR 5 consumes downstream.
-    vaultScope: vaultScopeForUser(db, redeemed.userId),
-    now: deps.now,
-  });
-  // Phase 1 (#212) registry exemption: code-grant access tokens piggyback
-  // on the paired refresh token's `tokens` row (they share `jti` by
-  // design). We don't write a separate access-token row — revocation acts
-  // on the shared jti / family, and the 15-min access TTL bounds the
-  // window before per-jti re-validation is needed. A separate per-jti
-  // access-token row would double registry write volume on every OAuth
-  // grant + every refresh rotation; not worth the trade today.
-  const refresh = signRefreshToken(db, {
-    jti: access.jti,
-    userId: redeemed.userId,
-    clientId: redeemed.clientId,
-    scopes: redeemed.scopes,
-    now: deps.now,
-  });
-  const services = buildServicesCatalog(
-    (deps.loadServicesManifest ?? readServicesManifest)(),
-    deps.issuer,
-    redeemed.scopes,
-  );
-  const vault = singleVaultName(redeemed.scopes);
-  return jsonResponse({
-    access_token: access.token,
-    token_type: "Bearer",
-    expires_in: ACCESS_TOKEN_TTL_SECONDS,
-    refresh_token: refresh.token,
-    scope: redeemed.scopes.join(" "),
-    ...(vault ? { vault } : {}),
-    services,
-  });
+  try {
+    const access = await signAccessToken(db, {
+      sub: redeemed.userId,
+      scopes: redeemed.scopes,
+      audience,
+      clientId: redeemed.clientId,
+      issuer: deps.issuer,
+      // vault_scope claim — Phase 2 per-user vault pin (Phase 1 had a single
+      // `assigned_vault` column; Phase 2 PR 2 generalized to `assigned_vaults`
+      // via `user_vaults`). Non-empty list for non-admin users with at least
+      // one assigned vault; empty for first-admin (unrestricted sentinel).
+      // Zero-vault non-admin is also empty by `vaultScopeForUser`, but the
+      // OAuth flow refuses to mint a vault-scoped token for them upstream
+      // (see the zero-vault gate in `handleConsentSubmit` + the same-hub
+      // auto-trust posture check), so we never reach here with that user
+      // posture. The narrowing in `handleConsentSubmit` already rewrote
+      // `vault:<verb>` → `vault:<assigned>:<verb>`, so the auth code's
+      // scopes are pre-aligned; this claim is the explicit "owned vaults"
+      // signal PR 5 consumes downstream.
+      vaultScope: vaultScopeForUser(db, redeemed.userId),
+      now: deps.now,
+    });
+    // Phase 1 (#212) registry exemption: code-grant access tokens piggyback
+    // on the paired refresh token's `tokens` row (they share `jti` by
+    // design). We don't write a separate access-token row — revocation acts
+    // on the shared jti / family, and the 15-min access TTL bounds the
+    // window before per-jti re-validation is needed. A separate per-jti
+    // access-token row would double registry write volume on every OAuth
+    // grant + every refresh rotation; not worth the trade today.
+    const refresh = signRefreshToken(db, {
+      jti: access.jti,
+      userId: redeemed.userId,
+      clientId: redeemed.clientId,
+      scopes: redeemed.scopes,
+      now: deps.now,
+    });
+    const services = buildServicesCatalog(
+      (deps.loadServicesManifest ?? readServicesManifest)(),
+      deps.issuer,
+      redeemed.scopes,
+    );
+    const vault = singleVaultName(redeemed.scopes);
+    return jsonResponse({
+      access_token: access.token,
+      token_type: "Bearer",
+      expires_in: ACCESS_TOKEN_TTL_SECONDS,
+      refresh_token: refresh.token,
+      scope: redeemed.scopes.join(" "),
+      ...(vault ? { vault } : {}),
+      services,
+    });
+  } catch (err) {
+    if (err instanceof VaultNameReservedError)
+      return jsonResponse({ error: "invalid_grant", error_description: err.message }, 400);
+    throw err;
+  }
 }
 
 async function handleTokenRefresh(
@@ -2970,69 +2977,78 @@ async function rotateAndRespond(
   );
   if ("errorResponse" in audienceResolution) return audienceResolution.errorResponse;
   const audience = audienceResolution.audience;
-  const access = await signAccessToken(db, {
-    sub: refreshUserId,
-    scopes: row.scopes,
-    audience,
-    clientId: row.clientId,
-    issuer: deps.issuer,
-    // vault_scope claim — re-derived from the user's *current*
-    // `assigned_vaults` at refresh time (not snapshotted onto the refresh-
-    // token row). An admin who changes a user's vault assignments between
-    // mint and refresh sees the new value on the next refresh; existing
-    // access tokens carry their original claim until their 15-minute TTL
-    // elapses. Same posture as the design's "OAuth issuer reads
-    // `assigned_vaults` at mint time, not at session-creation time" pin.
-    vaultScope: vaultScopeForUser(db, refreshUserId),
-    now: deps.now,
-  });
-  let refresh: ReturnType<typeof signRefreshToken>;
   try {
-    refresh = db.transaction(() => {
-      db.prepare("UPDATE tokens SET revoked_at = ? WHERE jti = ?").run(now.toISOString(), row.jti);
-      const minted = signRefreshToken(db, {
-        jti: access.jti,
-        userId: refreshUserId,
-        clientId: row.clientId,
-        scopes: row.scopes,
-        familyId: row.familyId,
-        now: deps.now,
-      });
-      // Link old→new so the grace-window check (hub#685) can tell the
-      // immediate predecessor apart from an older ancestor on replay.
-      linkRotation(db, row.jti, access.jti);
-      return minted;
-    })();
-  } catch (err) {
-    // Concurrent rotation: a sibling refresh of the same row already
-    // committed and ours collides on the `tokens.jti` PRIMARY KEY (or any
-    // other INSERT-time DB error). Surface a clean `invalid_grant` 400 —
-    // RFC 6749 §5.2 — instead of letting the SQLite error bubble as a 500
-    // (#108). The transaction is already rolled back at this point, so
-    // the row's revoked_at is unchanged for the losing request.
-    if (err instanceof RefreshTokenInsertError) {
-      return jsonResponse(
-        { error: "invalid_grant", error_description: "refresh_token rotation conflict" },
-        400,
-      );
+    const access = await signAccessToken(db, {
+      sub: refreshUserId,
+      scopes: row.scopes,
+      audience,
+      clientId: row.clientId,
+      issuer: deps.issuer,
+      // vault_scope claim — re-derived from the user's *current*
+      // `assigned_vaults` at refresh time (not snapshotted onto the refresh-
+      // token row). An admin who changes a user's vault assignments between
+      // mint and refresh sees the new value on the next refresh; existing
+      // access tokens carry their original claim until their 15-minute TTL
+      // elapses. Same posture as the design's "OAuth issuer reads
+      // `assigned_vaults` at mint time, not at session-creation time" pin.
+      vaultScope: vaultScopeForUser(db, refreshUserId),
+      now: deps.now,
+    });
+    let refresh: ReturnType<typeof signRefreshToken>;
+    try {
+      refresh = db.transaction(() => {
+        db.prepare("UPDATE tokens SET revoked_at = ? WHERE jti = ?").run(
+          now.toISOString(),
+          row.jti,
+        );
+        const minted = signRefreshToken(db, {
+          jti: access.jti,
+          userId: refreshUserId,
+          clientId: row.clientId,
+          scopes: row.scopes,
+          familyId: row.familyId,
+          now: deps.now,
+        });
+        // Link old→new so the grace-window check (hub#685) can tell the
+        // immediate predecessor apart from an older ancestor on replay.
+        linkRotation(db, row.jti, access.jti);
+        return minted;
+      })();
+    } catch (err) {
+      // Concurrent rotation: a sibling refresh of the same row already
+      // committed and ours collides on the `tokens.jti` PRIMARY KEY (or any
+      // other INSERT-time DB error). Surface a clean `invalid_grant` 400 —
+      // RFC 6749 §5.2 — instead of letting the SQLite error bubble as a 500
+      // (#108). The transaction is already rolled back at this point, so
+      // the row's revoked_at is unchanged for the losing request.
+      if (err instanceof RefreshTokenInsertError) {
+        return jsonResponse(
+          { error: "invalid_grant", error_description: "refresh_token rotation conflict" },
+          400,
+        );
+      }
+      throw err;
     }
+    const services = buildServicesCatalog(
+      (deps.loadServicesManifest ?? readServicesManifest)(),
+      deps.issuer,
+      row.scopes,
+    );
+    const vault = singleVaultName(row.scopes);
+    return jsonResponse({
+      access_token: access.token,
+      token_type: "Bearer",
+      expires_in: ACCESS_TOKEN_TTL_SECONDS,
+      refresh_token: refresh.token,
+      scope: row.scopes.join(" "),
+      ...(vault ? { vault } : {}),
+      services,
+    });
+  } catch (err) {
+    if (err instanceof VaultNameReservedError)
+      return jsonResponse({ error: "invalid_grant", error_description: err.message }, 400);
     throw err;
   }
-  const services = buildServicesCatalog(
-    (deps.loadServicesManifest ?? readServicesManifest)(),
-    deps.issuer,
-    row.scopes,
-  );
-  const vault = singleVaultName(row.scopes);
-  return jsonResponse({
-    access_token: access.token,
-    token_type: "Bearer",
-    expires_in: ACCESS_TOKEN_TTL_SECONDS,
-    refresh_token: refresh.token,
-    scope: row.scopes.join(" "),
-    ...(vault ? { vault } : {}),
-    services,
-  });
 }
 
 // --- /oauth/revoke ---------------------------------------------------------

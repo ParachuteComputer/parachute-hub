@@ -489,7 +489,6 @@ export function renameTokensForVault(
  * Returns the number of rows newly revoked. Idempotent (already-revoked
  * rows are filtered by the WHERE and by `revokeTokenByJti`).
  */
-
 export function revokeTokensNamingVault(db: Database, vaultName: string, now: Date): number {
   const rows = db
     .query<{ jti: string; scopes: string }, []>(
@@ -884,13 +883,20 @@ export function liveFamilyRefreshRows(
   return rows.map(rowToRefreshToken);
 }
 
+export class VaultNameReservedError extends Error {
+  constructor(name: string) {
+    super(`vault "${name}" was renamed; obtain scopes for its new name`);
+    this.name = "VaultNameReservedError";
+  }
+}
+
 /** Prevent a mint already in flight during rename from persisting a stale
  * refresh family, or a stale client from minting into a reserved old name. */
 function assertVaultNamesAvailable(db: Database, scopes: string[], now: Date): void {
   for (const scope of scopes) {
     const name = vaultScopeName(scope);
     if (name && vaultRenameReservedUntil(db, name, now)) {
-      throw new Error(`vault "${name}" was renamed; obtain scopes for its new name`);
+      throw new VaultNameReservedError(name);
     }
   }
 }

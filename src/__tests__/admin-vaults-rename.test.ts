@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -13,6 +14,7 @@ import { recordGrant } from "../grants.ts";
 import { openHubDb } from "../hub-db.ts";
 import { issueInvite } from "../invites.ts";
 import {
+  VaultNameReservedError,
   findTokenRowByJti,
   recordTokenMint,
   signAccessToken,
@@ -30,6 +32,7 @@ let db: ReturnType<typeof openHubDb>;
 let deps: DeleteVaultDeps;
 let commands: string[][];
 let restarted: number;
+let events: string[];
 let bearer: string;
 function manifest(names: string[]) {
   writeManifest(
@@ -52,6 +55,7 @@ beforeEach(async () => {
   db = openHubDb(join(dir, "hub.db"));
   rotateSigningKey(db);
   commands = [];
+  events = [];
   restarted = 0;
   deps = {
     db,
@@ -60,10 +64,15 @@ beforeEach(async () => {
     connectionsStorePath: join(dir, "connections.json"),
     agentOrigin: null,
     resolveVaultOrigin: () => null,
+    stopVaultModule: async () => {
+      events.push("stop");
+    },
     restartVaultModule: async () => {
+      events.push("restart");
       restarted++;
     },
     runCommand: async (cmd) => {
+      events.push(`CLI ${cmd[2]} → ${cmd[3]}`);
       commands.push([...cmd]);
       manifest([cmd[3]!, "ab", "axb"]);
       return {
@@ -162,9 +171,23 @@ async function seed() {
 describe("POST /vaults/<name>/rename", () => {
   test("rewrites all identities exactly, preserves refresh family and mints the new scope/audience", async () => {
     const { client, access, refresh } = await seed();
+    const restart = deps.restartVaultModule!;
+    deps.restartVaultModule = async () => {
+      expect(db.query("SELECT vault FROM channel_vaults").get()).toEqual({ vault: "renamed" });
+      events.push("cascade");
+      await restart();
+    };
     const response = await rename();
+    expect(events).toEqual(["stop", "CLI a_b → renamed", "cascade", "restart"]);
     expect(response.status).toBe(200);
-    const body = await response.json();
+    const body = (await response.json()) as {
+      warnings: string[];
+      error: string;
+      error_description: string;
+    };
+    expect(body.warnings).toContain(
+      "Every vault on the host was briefly offline during the rename.",
+    );
     expect(body).toMatchObject({
       old: "a_b",
       new: "renamed",
@@ -230,6 +253,7 @@ describe("POST /vaults/<name>/rename", () => {
     expect(commands).toHaveLength(1);
     // A rename into the reserved name is also blocked.
     expect((await rename("renamed", "a_b")).status).toBe(409);
+    expect(events).toEqual(["stop", "CLI a_b → renamed", "cascade", "restart"]);
     await expect(
       signAccessToken(db, {
         sub: "operator",
@@ -238,7 +262,7 @@ describe("POST /vaults/<name>/rename", () => {
         issuer,
         clientId: "test",
       }),
-    ).rejects.toThrow("was renamed");
+    ).rejects.toBeInstanceOf(VaultNameReservedError);
   });
   test("401/403 auth gate", async () => {
     expect((await rename("a_b", "renamed", null)).status).toBe(401);
@@ -253,6 +277,7 @@ describe("POST /vaults/<name>/rename", () => {
     ).token;
     expect((await rename("a_b", "renamed", read)).status).toBe(403);
     expect(commands).toHaveLength(0);
+    expect(events).toEqual([]);
   });
   test("missing, collision, invalid and reserved names", async () => {
     expect((await rename("missing")).status).toBe(404);
@@ -261,10 +286,14 @@ describe("POST /vaults/<name>/rename", () => {
       expect((await rename("a_b", name)).status).toBe(400);
     expect((await rename("admin")).status).toBe(400);
     expect(commands).toHaveLength(0);
+    expect(events).toEqual([]);
   });
   test("CLI failure leaves identity tables untouched", async () => {
     const { access } = await seed();
-    deps.runCommand = async () => ({ exitCode: 1, stdout: "", stderr: "disk full" });
+    deps.runCommand = async () => {
+      events.push("CLI");
+      return { exitCode: 1, stdout: "", stderr: "disk full" };
+    };
     const response = await rename();
     expect(response.status).toBe(500);
     expect(((await response.json()) as { error_description: string }).error_description).toContain(
@@ -273,7 +302,8 @@ describe("POST /vaults/<name>/rename", () => {
     expect(findTokenRowByJti(db, access.jti)?.scopes).toEqual(["vault:a_b:read"]);
     expect(findTokenRowByJti(db, "operator-old")?.revokedAt).toBeNull();
     expect(db.query("SELECT vault FROM channel_vaults").get()).toEqual({ vault: "a_b" });
-    expect(restarted).toBe(0);
+    expect(restarted).toBe(1);
+    expect(events).toEqual(["stop", "CLI", "restart"]);
   });
   test.each([false, true])(
     "cascade failure rolls back the DB and reports reverse CLI outcome (failure=%s)",
@@ -285,6 +315,7 @@ describe("POST /vaults/<name>/rename", () => {
       const run = deps.runCommand!;
       deps.runCommand = async (cmd) => {
         if (cmd[2] === "renamed" && reverseFails) {
+          events.push(`CLI ${cmd[2]} → ${cmd[3]}`);
           commands.push([...cmd]);
           return { exitCode: 2, stdout: "", stderr: "reverse blocked" };
         }
@@ -299,6 +330,7 @@ describe("POST /vaults/<name>/rename", () => {
           ? "reverse CLI rename failed (2): reverse blocked"
           : "reverse CLI rename succeeded",
       );
+      expect(events).toEqual(["stop", "CLI a_b → renamed", "CLI renamed → a_b", "restart"]);
       expect(commands[1]).toEqual(["parachute-vault", "rename", "renamed", "a_b", "--yes"]);
       expect(findTokenRowByJti(db, "operator-old")?.revokedAt).toBeNull();
       expect(findTokenRowByJti(db, access.jti)?.scopes).toEqual(["vault:a_b:read"]);
@@ -354,8 +386,7 @@ describe("POST /vaults/<name>/rename", () => {
     expect(db.query("SELECT vault FROM channel_vaults").get()).toEqual({ vault: "a_b" });
     expect(commands).toHaveLength(2);
   });
-  test("JSON backup output and no-supervisor warning", async () => {
-    deps.restartVaultModule = undefined;
+  test("JSON backup output", async () => {
     deps.runCommand = async () => {
       manifest(["renamed"]);
       return { exitCode: 0, stderr: "", stdout: JSON.stringify({ backup_path: "/tmp/backup.db" }) };
@@ -363,7 +394,137 @@ describe("POST /vaults/<name>/rename", () => {
     const response = await rename();
     const body = (await response.json()) as { backup_path: string; warnings: string[] };
     expect(body.backup_path).toBe("/tmp/backup.db");
-    expect(body.warnings.join(" ")).toContain("restart unavailable");
+    expect(response.status).toBe(200);
+  });
+  test("no supervisor refuses before CLI", async () => {
+    deps.stopVaultModule = undefined;
+    deps.restartVaultModule = undefined;
+    const response = await rename();
+    expect(response.status).toBe(503);
+    expect(await response.json()).toMatchObject({ error: "supervisor_unavailable" });
+    expect(commands).toEqual([]);
+    expect(events).toEqual([]);
+  });
+  test.each([false, true])("stop failure attempts restart (restart fails=%s)", async (fails) => {
+    deps.stopVaultModule = async () => {
+      events.push("stop");
+      throw new Error("stop broke");
+    };
+    if (fails)
+      deps.restartVaultModule = async () => {
+        events.push("restart");
+        throw new Error("start broke");
+      };
+    const response = await rename();
+    expect(response.status).toBe(500);
+    const body = (await response.json()) as {
+      warnings: string[];
+      error: string;
+      error_description: string;
+    };
+    expect(body.error).toBe("stop_failed");
+    expect(body.error_description).toContain("stop broke");
+    if (fails) expect(body.error_description).toContain("start broke");
+    expect(commands).toEqual([]);
+    expect(events).toEqual(["stop", "restart"]);
+  });
+  test.each([false, true])("CLI throw restarts (restart fails=%s)", async (fails) => {
+    deps.runCommand = async () => {
+      events.push("CLI");
+      throw new Error("spawn broke");
+    };
+    if (fails)
+      deps.restartVaultModule = async () => {
+        events.push("restart");
+        throw new Error("start broke");
+      };
+    const response = await rename();
+    expect(response.status).toBe(500);
+    const body = (await response.json()) as {
+      warnings: string[];
+      error: string;
+      error_description: string;
+    };
+    expect(body.error).toBe("rename_failed");
+    expect(body.error_description).toContain("spawn broke");
+    if (fails) expect(body.error_description).toContain("start broke");
+    expect(events).toEqual(["stop", "CLI", "restart"]);
+  });
+  test.each([false, true])(
+    "reserved-name refresh returns invalid_grant (inside transaction=%s)",
+    async (insideTransaction) => {
+      const { client, access, refresh } = await seed();
+      const reserve = () =>
+        db
+          .prepare("INSERT OR REPLACE INTO hub_settings (key, value, updated_at) VALUES (?, ?, ?)")
+          .run(
+            "vault_rename_reserved:a_b",
+            new Date(Date.now() + 960000).toISOString(),
+            new Date().toISOString(),
+          );
+      if (!insideTransaction) reserve();
+      let clockCalls = 0;
+      const response = await handleToken(
+        db,
+        new Request(`${issuer}/oauth/token`, {
+          method: "POST",
+          body: new URLSearchParams({
+            grant_type: "refresh_token",
+            refresh_token: refresh.token,
+            client_id: client.clientId,
+          }),
+        }),
+        {
+          issuer,
+          now: () => {
+            if (++clockCalls === 4 && insideTransaction) {
+              expect(db.inTransaction).toBe(true);
+              expect(findTokenRowByJti(db, access.jti)?.revokedAt).not.toBeNull();
+              reserve();
+            }
+            return new Date();
+          },
+          loadServicesManifest: () => ({ services: [] }),
+        },
+      );
+      expect(response.status).toBe(400);
+      expect(await response.json()).toMatchObject({ error: "invalid_grant" });
+      expect(findTokenRowByJti(db, access.jti)?.revokedAt).toBeNull();
+      expect(findTokenRowByJti(db, access.jti)?.rotatedTo).toBeNull();
+    },
+  );
+  test("reserved-name authorization code returns invalid_grant", async () => {
+    const { user, client } = await seed();
+    const verifier = "v".repeat(43);
+    const code = issueAuthCode(db, {
+      userId: user.id,
+      clientId: client.clientId,
+      redirectUri: "https://client.example/cb",
+      scopes: ["vault:a_b:read"],
+      codeChallenge: createHash("sha256").update(verifier).digest("base64url"),
+      codeChallengeMethod: "S256",
+    });
+    db.prepare("INSERT INTO hub_settings (key, value, updated_at) VALUES (?, ?, ?)").run(
+      "vault_rename_reserved:a_b",
+      new Date(Date.now() + 960000).toISOString(),
+      new Date().toISOString(),
+    );
+    const response = await handleToken(
+      db,
+      new Request(`${issuer}/oauth/token`, {
+        method: "POST",
+        body: new URLSearchParams({
+          grant_type: "authorization_code",
+          code: code.code,
+          client_id: client.clientId,
+          redirect_uri: "https://client.example/cb",
+          code_verifier: verifier,
+        }),
+      }),
+      { issuer, loadServicesManifest: () => ({ services: [] }) },
+    );
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({ error: "invalid_grant" });
   });
   test("restart failure reports committed rename with a warning", async () => {
     deps.restartVaultModule = async () => {

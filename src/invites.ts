@@ -499,7 +499,6 @@ export function renameInvitesForVault(db: Database, oldName: string, newName: st
  * `=` comparison — no pattern matching. Returns the number of invites
  * newly revoked.
  */
-
 export function revokeInvitesForVault(
   db: Database,
   vaultName: string,

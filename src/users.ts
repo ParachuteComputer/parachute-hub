@@ -774,7 +774,6 @@ export function renameVaultAssignments(db: Database, oldName: string, newName: s
  * Exact `=` comparison on `vault_name` — no pattern matching. Returns the
  * number of rows deleted.
  */
-
 export function removeVaultAssignments(db: Database, vaultName: string): number {
   const res = db.prepare("DELETE FROM user_vaults WHERE vault_name = ?").run(vaultName);
   return Number(res.changes);
