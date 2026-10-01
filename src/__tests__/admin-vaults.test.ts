@@ -1597,6 +1597,7 @@ describe("#478 — empty-paths vault row tolerance", () => {
         };
 
         const result = await provisionVault("default", {
+          db: db,
           issuer: ISSUER,
           manifestPath: h.manifestPath,
           runCommand,

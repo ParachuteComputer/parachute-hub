@@ -518,3 +518,13 @@ export function forcesExplicitConsent(scope: string): boolean {
 export function scopeIsAdmin(scope: string): boolean {
   return explainScope(scope)?.level === "admin";
 }
+
+/** Rename only an exact named vault segment, preserving scope order. */
+export function renameVaultScopes(scopes: string, oldName: string, newName: string): string {
+  return scopes
+    .split(" ")
+    .map((scope) =>
+      vaultScopeName(scope) === oldName ? `vault:${newName}:${scope.split(":")[2]}` : scope,
+    )
+    .join(" ");
+}

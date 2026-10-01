@@ -425,6 +425,7 @@ export async function handleAccountSetupPost(
   // still unconsumed at this point, so the invitee can retry.
   if (invite.provisionVault && vaultName !== null) {
     const provisioned = await provisionVault(vaultName, {
+      db: deps.db,
       issuer: deps.hubOrigin,
       ...(deps.manifestPath !== undefined ? { manifestPath: deps.manifestPath } : {}),
       ...(deps.runCommand !== undefined ? { runCommand: deps.runCommand } : {}),

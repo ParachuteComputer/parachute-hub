@@ -67,6 +67,7 @@
  *
  *   # Admin API + bearer-mint surfaces (must precede /admin/* SPA mount).
  *   /vaults                       (POST)       → create vault
+ *   /vaults/<name>/rename         (POST)       → rename vault with identity cascade
  *   /vaults/<name>                (DELETE)     → destroy vault + identity cascade
  *                                                 (B1: confirm body, host:admin,
  *                                                 tokens/grants/user_vaults/invites/
@@ -80,6 +81,7 @@
  *                                                (NIP-98 or account:self:* /
  *                                                host:admin Bearer)
  *   /account/vaults               (GET/POST)   → list / create vault (create returns vault_token)
+ *   /account/vaults/<name>/rename (POST)       → rename (host-admin)
  *   /account/vaults/<name>        (DELETE)     → teardown (wraps /vaults/<name> cascade)
  *   /account/vaults/<name>/token  (POST)       → per-vault scoped token mint
  *   /account/vaults/<name>/caps   (GET/PUT)    → read / set the storage cap
@@ -293,7 +295,12 @@ import { handleHostAdminToken } from "./admin-host-admin-token.ts";
 import { handleModuleToken } from "./admin-module-token.ts";
 import { routeAdminSurfaces } from "./admin-surfaces.ts";
 import { handleVaultAdminToken } from "./admin-vault-admin-token.ts";
-import { type RunResult, handleCreateVault, handleDeleteVault } from "./admin-vaults.ts";
+import {
+  type RunResult,
+  handleCreateVault,
+  handleDeleteVault,
+  handleRenameVault,
+} from "./admin-vaults.ts";
 import { handleApiAccount } from "./api-account-2fa.ts";
 import {
   handleAccountChangePasswordGet,
@@ -1304,7 +1311,7 @@ export interface HubFetchDeps {
    * at a tmpdir; production defaults to `<CONFIG_DIR>/connections.json`.
    */
   connectionsStorePath?: string;
-  /** Test seam for the vault-removal command used by DELETE route tests. */
+  /** Test seam shared by vault removal and rename route orchestration. */
   deleteVaultRunCommand?: (cmd: readonly string[]) => Promise<RunResult>;
   /**
    * Path to `agent-grants.json` (the agent-connector grant store, 4b-1). Tests
@@ -3195,7 +3202,10 @@ export function hubFetch(
       // admin-vaults.handleDeleteVault for the enumerated cascade.
       if (pathname.startsWith("/vaults/")) {
         if (!getDb) return dbNotConfigured();
-        const name = decodeURIComponent(pathname.slice("/vaults/".length));
+        const isRename = /^\/vaults\/[^/]+\/rename$/.test(pathname);
+        const name = decodeURIComponent(
+          pathname.slice("/vaults/".length, isRename ? -"/rename".length : undefined),
+        );
         const services = readManifestLenient(manifestPath).services;
         // Agent's row carries its MANIFEST name — resolve via
         // findServiceByShort (see the /admin/connections note below).
@@ -3209,7 +3219,7 @@ export function hubFetch(
           return match ? `http://127.0.0.1:${match.port}` : null;
         };
         const supervisor = deps?.supervisor;
-        return handleDeleteVault(req, name, {
+        return (isRename ? handleRenameVault : handleDeleteVault)(req, name, {
           db: getDb(),
           issuer: oauthDeps(req).issuer,
           knownIssuers: oauthDeps(req).hubBoundOrigins(),
@@ -3224,6 +3234,9 @@ export function hubFetch(
           // store handle + re-runs selfRegister (services.json path rebuild).
           ...(supervisor
             ? {
+                stopVaultModule: async () => {
+                  await supervisor.stop("vault");
+                },
                 restartVaultModule: async () => {
                   await supervisor.restart("vault");
                 },
@@ -4221,8 +4234,9 @@ export function hubFetch(
         // `handleDeleteVault`, which re-gates parachute:host:admin — the
         // superset account token carries it, so this is belt-and-suspenders,
         // not a second authorization.
-        if (req.method === "DELETE") {
-          const name = decodeURIComponent(rest);
+        if (req.method === "DELETE" || (req.method === "POST" && rest.endsWith("/rename"))) {
+          const isRename = rest.endsWith("/rename");
+          const name = decodeURIComponent(isRename ? rest.slice(0, -"/rename".length) : rest);
           if (!name || name.includes("/")) return new Response("not found", { status: 404 });
           try {
             await requireAnyScope(
@@ -4245,7 +4259,7 @@ export function hubFetch(
             return match ? `http://127.0.0.1:${match.port}` : null;
           };
           const supervisor = deps?.supervisor;
-          return handleDeleteVault(req, name, {
+          return (isRename ? handleRenameVault : handleDeleteVault)(req, name, {
             db: getDb(),
             issuer: oauthDeps(req).issuer,
             knownIssuers: oauthDeps(req).hubBoundOrigins(),
@@ -4258,6 +4272,9 @@ export function hubFetch(
             ...(deps?.deleteVaultRunCommand ? { runCommand: deps.deleteVaultRunCommand } : {}),
             ...(supervisor
               ? {
+                  stopVaultModule: async () => {
+                    await supervisor.stop("vault");
+                  },
                   restartVaultModule: async () => {
                     await supervisor.restart("vault");
                   },
