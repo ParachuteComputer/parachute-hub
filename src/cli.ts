@@ -1057,6 +1057,14 @@ async function main(argv: string[]): Promise<number> {
       // `parachute-vault remove` (mechanics-only — orphans hub-side tokens,
       // grants, user_vaults rows). `rm` is a convenience alias to the same path.
       const sub = rest[0];
+      if (sub === "rename") {
+        const rename = await loadCommand(
+          "vault-rename",
+          () => import("./commands/vault-rename.ts"),
+        );
+        if (!rename) return 1;
+        return await rename.vaultRename(rest.slice(1));
+      }
       if (sub === "remove" || sub === "rm") {
         const rm = await loadCommand("vault-remove", () => import("./commands/vault-remove.ts"));
         if (!rm) return 1;

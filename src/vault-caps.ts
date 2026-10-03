@@ -97,6 +97,14 @@ export function getVaultCapBytes(db: Database, vaultName: string): number | null
   return getVaultCap(db, vaultName)?.capBytes ?? null;
 }
 
+/** Rename the exact vault reference; called inside the rename transaction. */
+export function renameVaultCap(db: Database, oldName: string, newName: string): number {
+  return Number(
+    db.prepare("UPDATE vault_caps SET vault_name = ? WHERE vault_name = ?").run(newName, oldName)
+      .changes,
+  );
+}
+
 /**
  * Vault-delete cascade hook (parity with the other per-vault identity
  * artifacts swept in admin-vaults.ts `handleDeleteVault`): drop the cap row

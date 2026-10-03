@@ -760,6 +760,14 @@ export function removeUserVault(
   return removed;
 }
 
+/** Rename the exact vault reference; called inside the rename transaction. */
+export function renameVaultAssignments(db: Database, oldName: string, newName: string): number {
+  return Number(
+    db.prepare("UPDATE user_vaults SET vault_name = ? WHERE vault_name = ?").run(newName, oldName)
+      .changes,
+  );
+}
+
 /**
  * Vault-delete cascade step (B1, 2026-06-09 hub-module-boundary): drop every
  * `user_vaults` assignment row for the deleted vault, across all users.

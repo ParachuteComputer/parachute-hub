@@ -351,7 +351,7 @@ export function handleAccountCapabilities(
     auth: { methods: ["password"], signin_path: "/login" },
     ...(signupPath ? { signup_path: signupPath } : {}),
     vault_url_template: `${issuer}/vault/{name}`,
-    capabilities: { vault_create: true, vault_rename: false, vault_delete: true },
+    capabilities: { vault_create: true, vault_rename: true, vault_delete: true },
     plans: [],
     // Hub EXTRAS (kept — see the doc comment above).
     features: { modules: true, expose: true, import: true, export: true, billing: false },
@@ -539,6 +539,7 @@ export async function handleAccountCreateVault(
 
   const manifestPath = deps.manifestPath ?? SERVICES_MANIFEST_PATH;
   const provisioned = await provisionVault(parsed.name, {
+    db: deps.db,
     issuer: deps.issuer,
     manifestPath,
     ...(deps.runCommand ? { runCommand: deps.runCommand } : {}),

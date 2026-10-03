@@ -36,6 +36,7 @@ import {
 import { writeManifest } from "../services-manifest.ts";
 import { SESSION_COOKIE_NAME } from "../sessions.ts";
 import {
+  type SetupWizardDeps,
   deriveWizardState,
   detectAutoExposeMode,
   handleSetupAccountPost,
@@ -44,6 +45,7 @@ import {
   handleSetupInstallPost,
   handleSetupVaultPost,
   postVaultImportImpl,
+  renderVaultStep,
 } from "../setup-wizard.ts";
 import { rotateSigningKey } from "../signing-keys.ts";
 import { Supervisor } from "../supervisor.ts";
@@ -4851,5 +4853,209 @@ describe("setup-wizard JSON surface (hub#168 Cuts 2/3)", () => {
       mode: "replace",
       credentials: null,
     });
+  });
+});
+
+// --- semantic-search opt-in (hub#966) -------------------------------------
+
+describe("vault step semantic-search opt-in (hub#966)", () => {
+  let h: Harness;
+  beforeEach(() => {
+    h = makeHarness();
+    _resetOperationsRegistryForTests();
+  });
+  afterEach(() => h.cleanup());
+
+  test("vault form renders the opt-in checkbox, unchecked by default", () => {
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      const html = renderVaultStep({ csrfToken: "t" });
+      expect(html).toContain('name="semantic_search"');
+      expect(html).toContain("Semantic search — find notes by meaning");
+      expect(html).toContain("no text leaves this machine");
+      expect(html).not.toMatch(/name="semantic_search" value="on" checked/);
+      // Re-render after a validation error keeps the operator's tick.
+      const reticked = renderVaultStep({ csrfToken: "t", semanticSearch: true });
+      expect(reticked).toMatch(/name="semantic_search" value="on" checked/);
+    } finally {
+      db.close();
+    }
+  });
+
+  /**
+   * Drive the already-supervised + registered create path (the normal init'd
+   * box: vault module boot-spawned, no instance yet) with a stubbed
+   * provisioner + a stubbed `enableSemanticSearchImpl`, and return the op.
+   */
+  async function postCreate(
+    fields: Record<string, string>,
+    enableImpl: SetupWizardDeps["enableSemanticSearchImpl"],
+    provisionOk = true,
+  ) {
+    const db = openHubDb(hubDbPath(h.dir));
+    rotateSigningKey(db); // the follow-up mints a real vault-admin JWT
+    const user = await createUser(db, "owner", "pw");
+    const { createSession, SESSION_COOKIE_NAME: SC } = await import("../sessions.ts");
+    const session = createSession(db, { userId: user.id });
+    writeManifest(
+      {
+        services: [
+          { name: "parachute-vault", version: "0.7.9", port: 1940, paths: [], health: "/health" },
+        ],
+      },
+      h.manifestPath,
+    );
+    const get = handleSetupGet(req("/admin/setup"), {
+      db,
+      manifestPath: h.manifestPath,
+      configDir: h.dir,
+      readExposeStateFn: h.readExposeStateFn,
+      issuer: "https://hub.example",
+      registry: getDefaultOperationsRegistry(),
+    });
+    const csrf = setCookie(get, CSRF_COOKIE_NAME) ?? "";
+    const supervisor = makeSupervisor();
+    await supervisor.start({ short: "vault", cmd: ["bun", "noop"] });
+    const post = await handleSetupVaultPost(
+      req("/admin/setup/vault", {
+        method: "POST",
+        body: new URLSearchParams({ [CSRF_FIELD_NAME]: csrf, ...fields }).toString(),
+        headers: {
+          "content-type": "application/x-www-form-urlencoded",
+          cookie: `${CSRF_COOKIE_NAME}=${csrf}; ${SC}=${session.id}`,
+        },
+      }),
+      {
+        db,
+        manifestPath: h.manifestPath,
+        configDir: h.dir,
+        readExposeStateFn: h.readExposeStateFn,
+        issuer: "https://hub.example",
+        supervisor,
+        registry: getDefaultOperationsRegistry(),
+        run: async () => 0,
+        provisionVaultImpl: async (name: string) =>
+          provisionOk
+            ? {
+                ok: true as const,
+                created: true,
+                entry: { name, url: `https://hub.example/vault/${name}`, version: "0.7.9" },
+                createJson: null,
+              }
+            : { ok: false as const, status: 500, message: "create exploded" },
+        ...(enableImpl ? { enableSemanticSearchImpl: enableImpl } : {}),
+      },
+    );
+    await new Promise((r) => setTimeout(r, 50));
+    const location = post.headers.get("location") ?? "";
+    const opId = new URL(location, "http://x").searchParams.get("op") ?? "";
+    db.close();
+    return { post, op: getDefaultOperationsRegistry().get(opId) };
+  }
+
+  test("ticked → after the vault is created, enables it with a vault-admin JWT", async () => {
+    const calls: Array<{ vaultName: string; vaultPort: number; bearerToken: string }> = [];
+    const { post, op } = await postCreate(
+      { mode: "create", vault_name: "notes", semantic_search: "on" },
+      async (args) => {
+        calls.push(args);
+        return { ok: true, restarted: true, message: "semantic search on — vault restarted" };
+      },
+    );
+    expect(post.status).toBe(303);
+    expect(calls.length).toBe(1);
+    expect(calls[0]?.vaultName).toBe("notes");
+    expect(calls[0]?.vaultPort).toBe(1940);
+    // The Bearer is the same shape the import follow-up mints: per-vault
+    // admin scope, audience vault.<name>.
+    const payload = JSON.parse(
+      Buffer.from(calls[0]?.bearerToken.split(".")[1] ?? "", "base64url").toString(),
+    );
+    expect(payload.aud).toBe("vault.notes");
+    expect(String(payload.scope)).toContain("vault:notes:admin");
+    expect(op?.status).toBe("succeeded");
+    const log = op?.log.join("\n") ?? "";
+    expect(log).toContain('vault "notes" created');
+    expect(log).toContain("semantic search on");
+  });
+
+  test("unticked → never touches the embeddings setting", async () => {
+    let called = false;
+    const { op } = await postCreate({ mode: "create", vault_name: "notes" }, async () => {
+      called = true;
+      return { ok: true, restarted: false, message: "" };
+    });
+    expect(called).toBe(false);
+    expect(op?.status).toBe("succeeded");
+    expect(op?.log.join("\n")).not.toContain("semantic search");
+  });
+
+  test("a semantic-search failure never fails the vault op", async () => {
+    const { op } = await postCreate(
+      { mode: "create", vault_name: "notes", semantic_search: "on" },
+      async () => {
+        throw new Error("vault unreachable");
+      },
+    );
+    expect(op?.status).toBe("succeeded");
+    expect(op?.log.join("\n")).toContain("semantic search not enabled (vault unreachable)");
+  });
+
+  test("a failed vault create skips the follow-up entirely", async () => {
+    let called = false;
+    const { op } = await postCreate(
+      { mode: "create", vault_name: "notes", semantic_search: "on" },
+      async () => {
+        called = true;
+        return { ok: true, restarted: false, message: "" };
+      },
+      false,
+    );
+    expect(called).toBe(false);
+    expect(op?.status).toBe("failed");
+  });
+
+  test("skip + semantic_search (CLI JSON) → skipped, and the reply says it wasn't enabled", async () => {
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      const user = await createUser(db, "owner", "pw");
+      const { createSession, SESSION_COOKIE_NAME: SC } = await import("../sessions.ts");
+      const session = createSession(db, { userId: user.id });
+      const get = handleSetupGet(req("/admin/setup"), {
+        db,
+        manifestPath: h.manifestPath,
+        configDir: h.dir,
+        readExposeStateFn: h.readExposeStateFn,
+        issuer: "https://hub.example",
+        registry: getDefaultOperationsRegistry(),
+      });
+      const csrf = setCookie(get, CSRF_COOKIE_NAME) ?? "";
+      const res = await handleSetupVaultPost(
+        req("/admin/setup/vault", {
+          method: "POST",
+          body: JSON.stringify({ [CSRF_FIELD_NAME]: csrf, mode: "skip", semantic_search: true }),
+          headers: {
+            "content-type": "application/json",
+            accept: "application/json",
+            cookie: `${CSRF_COOKIE_NAME}=${csrf}; ${SC}=${session.id}`,
+          },
+        }),
+        {
+          db,
+          manifestPath: h.manifestPath,
+          configDir: h.dir,
+          readExposeStateFn: h.readExposeStateFn,
+          issuer: "https://hub.example",
+          registry: getDefaultOperationsRegistry(),
+        },
+      );
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as { step: string; message: string };
+      expect(body.step).toBe("expose");
+      expect(body.message).toContain("semantic search not enabled");
+      expect(getSetting(db, "setup_vault_skipped")).toBe("true");
+    } finally {
+      db.close();
+    }
   });
 });

@@ -253,6 +253,17 @@ export function removeChannelVault(db: Database, relayHost: string, channelId: s
   return Number(res.changes) > 0;
 }
 
+/** Rename the exact vault reference; called inside the rename transaction. */
+export function renameChannelVaultsForVault(
+  db: Database,
+  oldName: string,
+  newName: string,
+): number {
+  return Number(
+    db.prepare("UPDATE channel_vaults SET vault = ? WHERE vault = ?").run(newName, oldName).changes,
+  );
+}
+
 /**
  * Vault-delete cascade hook, parity with `removeVaultAssignments` /
  * `removeVaultCap`: drop every binding that points at a deleted vault so a

@@ -310,6 +310,7 @@ const createVaultTool: AccountMcpTool = {
     }
     const rawName = typeof args.name === "string" ? args.name : "";
     const provisioned = await provisionVault(rawName, {
+      db: ctx.db,
       issuer: ctx.issuer,
       manifestPath: ctx.manifestPath,
       ...(ctx.runCommand ? { runCommand: ctx.runCommand } : {}),

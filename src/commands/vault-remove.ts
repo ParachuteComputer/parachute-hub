@@ -124,7 +124,7 @@ function resolveOperatorTokenIssuer(configDir: string): string {
  * return the JWT. Closes the db before returning. Read-never-mint — no second
  * SQLite writer racing the running hub.
  */
-async function defaultResolveBearer(configDir: string): Promise<string> {
+export async function defaultResolveBearer(configDir: string): Promise<string> {
   const issuer = resolveOperatorTokenIssuer(configDir);
   const db = openHubDb(hubDbPath(configDir));
   try {
