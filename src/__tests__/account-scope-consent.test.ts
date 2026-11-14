@@ -180,6 +180,13 @@ describe("per-scope consent (granular approval)", () => {
       clientName: "App",
       scopes: ["vault:read", "account:self:admin"],
     });
+    const form = html.match(
+      /<form\b[^>]*class="auth-form consent-form"[^>]*>([\s\S]*?)<\/form>/,
+    )?.[1];
+    expect(form).toBeDefined();
+    expect(form).toContain('name="scope_selection" value="explicit"');
+    expect(form).toContain('name="granted_scope" value="vault:read"');
+    expect(form).toContain('name="granted_scope" value="account:self:admin"');
     expect(html).toMatch(/name="granted_scope" value="vault:read" checked/);
     // The account row must NOT carry `checked`.
     const acct = html.slice(html.indexOf('value="account:self:admin"'));

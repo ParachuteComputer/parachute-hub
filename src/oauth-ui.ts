@@ -482,11 +482,12 @@ export function renderConsent(props: ConsentViewProps): string {
       </div>
       ${staleBanner}
       ${noVaultsBanner}
-      <section class="scopes">
-        <h2 class="scopes-title">Permissions requested</h2>
-        <ul class="scope-list">${scopeRows}</ul>
-      </section>
       <form method="POST" action="/oauth/authorize" class="auth-form consent-form">
+        <input type="hidden" name="scope_selection" value="explicit" />
+        <section class="scopes">
+          <h2 class="scopes-title">Permissions requested</h2>
+          <ul class="scope-list">${scopeRows}</ul>
+        </section>
         <input type="hidden" name="__action" value="consent" />
         ${renderCsrfHiddenInput(csrfToken)}
         ${renderHiddenInputs(params)}

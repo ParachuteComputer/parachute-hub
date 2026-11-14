@@ -2115,15 +2115,14 @@ async function handleConsentSubmit(
   // narrower scope than requested, and the token response's `scope` tells the
   // client what it actually got. Google, GitHub and Slack all ship this.
   //
-  // Back-compatible by construction: `granted_scope` fields are only honoured
-  // when the form supplies at least one. A programmatic POST (or an older
-  // cached consent page) that omits them entirely keeps the previous
-  // approve-everything-requested behaviour, so no existing flow breaks.
+  // New consent pages mark the selection explicitly: unchecked checkboxes
+  // submit no fields, so an empty selection must not fall back to granting
+  // everything. Preserve older/programmatic forms without the marker.
   const grantedFields = form
     .getAll("granted_scope")
     .map((v) => String(v))
     .filter((v) => v.length > 0);
-  if (grantedFields.length > 0) {
+  if (form.get("scope_selection") === "explicit" || grantedFields.length > 0) {
     const kept = new Set(grantedFields);
     scopes = scopes.filter((sc) => kept.has(sc));
   }
