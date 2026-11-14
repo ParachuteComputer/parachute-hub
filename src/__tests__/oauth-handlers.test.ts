@@ -10546,7 +10546,64 @@ describe("single OAuth consent + grantable vault admin + delegate-only cap (2026
     expect(tokenRes.status).toBe(200);
     const body = (await tokenRes.json()) as { access_token: string; scope: string };
     const { payload } = await validateAccessToken(db, body.access_token, ISSUER);
+    expect(payload.scope).toBe(body.scope);
     return { scope: body.scope, aud: payload.aud };
+  }
+
+  for (const selected of [[], ["vault:work:read", "vault:work:write"]]) {
+    test(`explicit consent preserves selected scopes: ${selected.join(" ") || "none"} (#970)`, async () => {
+      const { db, cleanup } = await makeDb();
+      try {
+        const owner = await createUser(db, "owner", "pw");
+        const session = createSession(db, { userId: owner.id });
+        const reg = registerClient(db, {
+          redirectUris: ["https://app.example/cb"],
+          status: "approved",
+        });
+        const { verifier, challenge } = makePkce();
+        const form = new URLSearchParams({
+          __action: "consent",
+          __csrf: TEST_CSRF,
+          approve: "yes",
+          client_id: reg.client.clientId,
+          redirect_uri: "https://app.example/cb",
+          response_type: "code",
+          scope: "vault:work:read vault:work:write vault:work:admin",
+          resource: `${ISSUER}/vault/work/mcp`,
+          code_challenge: challenge,
+          code_challenge_method: "S256",
+          scope_selection: "explicit",
+        });
+        for (const scope of selected) form.append("granted_scope", scope);
+        const response = await handleAuthorizePost(
+          db,
+          new Request(`${ISSUER}/oauth/authorize`, {
+            method: "POST",
+            body: form,
+            headers: { cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, TTL_S)}` },
+          }),
+          capDeps,
+        );
+        expect(response.status).toBe(302);
+        const location = new URL(response.headers.get("location")!);
+        if (selected.length === 0) {
+          expect(location.searchParams.get("error")).toBe("access_denied");
+          expect(location.searchParams.has("code")).toBe(false);
+          expect(findGrant(db, owner.id, reg.client.clientId)).toBeNull();
+        } else {
+          expect(findGrant(db, owner.id, reg.client.clientId)?.scopes).toEqual(selected);
+          const { scope } = await redeemToScopeAud(
+            db,
+            location.searchParams.get("code")!,
+            reg.client.clientId,
+            verifier,
+          );
+          expect(scope.split(" ")).toEqual(selected);
+        }
+      } finally {
+        cleanup();
+      }
+    });
   }
 
   test("grantable extras suppress an already-requested named vault scope for an admin", async () => {
